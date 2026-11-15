@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -102,14 +103,21 @@ func (m *Manager) SelfHosted(ctx context.Context, namespace, name string, manage
 	if err != nil {
 		return false, "", fmt.Errorf("reading Secret %s/%s-kubeconfig: %w", namespace, name, err)
 	}
+	// Without the management CA the comparison cannot be made, and "not
+	// self-hosted" would only be a guess; refuse to guess before a delete.
+	if len(mgmtCA) == 0 {
+		return false, "", fmt.Errorf("cannot determine the management cluster's certificate authority from its kubeconfig (no certificate-authority-data, and no readable certificate-authority file), so cannot rule out that it is the cluster itself")
+	}
 	_, wlCA := kubeconfigIdentity(sec.Data["value"])
-	if len(mgmtCA) > 0 && bytes.Equal(mgmtCA, wlCA) {
+	if bytes.Equal(mgmtCA, wlCA) {
 		return true, "the management kubeconfig trusts the cluster's own certificate authority (it manages itself)", nil
 	}
 	return false, "", nil
 }
 
 // kubeconfigIdentity returns the current context's server URL and CA bytes.
+// A CA given as a file path (certificate-authority) is read from that file;
+// an unreadable one yields no CA.
 func kubeconfigIdentity(kubeconfig []byte) (string, []byte) {
 	cfg, err := clientcmd.Load(kubeconfig)
 	if err != nil {
@@ -123,7 +131,15 @@ func kubeconfigIdentity(kubeconfig []byte) (string, []byte) {
 	if !ok {
 		return "", nil
 	}
-	return cl.Server, cl.CertificateAuthorityData
+	if len(cl.CertificateAuthorityData) > 0 {
+		return cl.Server, cl.CertificateAuthorityData
+	}
+	if cl.CertificateAuthority != "" {
+		if b, err := os.ReadFile(cl.CertificateAuthority); err == nil {
+			return cl.Server, b
+		}
+	}
+	return cl.Server, nil
 }
 
 func sameHostPort(server, endpoint string) bool {

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"maps"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -307,6 +308,26 @@ func TestSelfHosted(t *testing.T) {
 	m2 := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cl).Build()}
 	if self, _, err := m2.SelfHosted(ctx, "ns", "c", kubeconfigFor("https://127.0.0.1:41234", "kind-ca"), st); err != nil || self {
 		t.Errorf("no Secret: self=%v err=%v", self, err)
+	}
+	// A management CA given as a file is read from it.
+	caFile := t.TempDir() + "/ca.crt"
+	if err := os.WriteFile(caFile, []byte("workload-ca"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fileKC := []byte(`apiVersion: v1
+kind: Config
+clusters: [{name: c, cluster: {server: "https://127.0.0.1:16443", certificate-authority: "` + caFile + `"}}]
+contexts: [{name: c, context: {cluster: c, user: u}}]
+current-context: c
+users: [{name: u, user: {token: x}}]
+`)
+	if self, _, err := m.SelfHosted(ctx, "ns", "c", fileKC, st); err != nil || !self {
+		t.Errorf("CA from a file through a tunnel: self=%v err=%v, want self-hosted", self, err)
+	}
+	// No CA at all: indeterminate, so an error rather than a guess.
+	noCA := []byte(strings.Replace(string(fileKC), `certificate-authority: "`+caFile+`"`, `insecure-skip-tls-verify: true`, 1))
+	if _, _, err := m.SelfHosted(ctx, "ns", "c", noCA, st); err == nil {
+		t.Error("an undeterminable management CA must be an error")
 	}
 	// A Secret that cannot be read is an error, never "not self-hosted".
 	m3 := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithInterceptorFuncs(interceptor.Funcs{

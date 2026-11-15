@@ -165,7 +165,12 @@ used.`,
 			if err := m.Apply(ctx, objs); err != nil {
 				return err
 			}
-			if orphans, err := m.Orphans(ctx, objs, ns, name); err == nil && len(orphans) > 0 {
+			switch orphans, err := m.Orphans(ctx, objs, ns, name); {
+			case err != nil:
+				// The apply succeeded; only the check for leftovers failed.
+				// Say so rather than imply there are none.
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not check for objects hydra.yaml no longer renders: %v\n", err)
+			case len(orphans) > 0:
 				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "not in hydra.yaml any more (left in place; delete them yourself if unused):\n  %s\n", strings.Join(orphans, "\n  "))
 			}
 			if !wait {

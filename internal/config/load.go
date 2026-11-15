@@ -63,44 +63,67 @@ func Load(path string) (*ClusterConfig, error) {
 }
 
 // LoadName reads only the cluster's name from a hydra.yaml file, for commands
-// that need nothing else (deleting or reaching the bootstrap cluster). A spec
-// that would fail Parse must not stand in the way of cleaning up.
+// that need nothing else (deleting or reaching the bootstrap cluster). Nothing
+// else is validated: a spec, or a namespace, that would fail Parse must not
+// stand in the way of cleaning up.
 func LoadName(path string) (string, error) {
-	md, err := LoadMetadata(path)
-	return md.Name, err
-}
-
-// LoadMetadata is LoadName plus the namespace (defaulted), for commands that
-// address a cluster's objects without needing the rest of the spec.
-func LoadMetadata(path string) (Metadata, error) {
-	data, err := os.ReadFile(path)
+	head, err := loadHead(path)
 	if err != nil {
-		return Metadata{}, err
-	}
-	var head struct {
-		APIVersion string   `json:"apiVersion"`
-		Kind       string   `json:"kind"`
-		Metadata   Metadata `json:"metadata"`
-	}
-	if err := yaml.Unmarshal(data, &head); err != nil {
-		return Metadata{}, fmt.Errorf("decoding hydra.yaml: %w", err)
+		return "", err
 	}
 	var errs fieldErrors
-	if head.APIVersion != APIVersion || head.Kind != Kind {
-		errs.add("apiVersion/kind", "must be %s %s, got %q %q", APIVersion, Kind, head.APIVersion, head.Kind)
+	head.validateName(&errs)
+	if err := errs.err(); err != nil {
+		return "", err
 	}
-	dnsLabel(&errs, "metadata.name", head.Metadata.Name)
-	if len(head.Metadata.Name) > maxClusterName {
-		errs.add("metadata.name", "must be at most %d characters", maxClusterName)
+	return head.Metadata.Name, nil
+}
+
+// LoadMetadata reads the name and namespace (defaulted), for commands that
+// address a cluster's objects without needing the rest of the spec.
+func LoadMetadata(path string) (Metadata, error) {
+	head, err := loadHead(path)
+	if err != nil {
+		return Metadata{}, err
 	}
 	if head.Metadata.Namespace == "" {
 		head.Metadata.Namespace = DefaultNamespace
 	}
+	var errs fieldErrors
+	head.validateName(&errs)
 	dnsLabel(&errs, "metadata.namespace", head.Metadata.Namespace)
 	if err := errs.err(); err != nil {
 		return Metadata{}, err
 	}
 	return head.Metadata, nil
+}
+
+type configHead struct {
+	APIVersion string   `json:"apiVersion"`
+	Kind       string   `json:"kind"`
+	Metadata   Metadata `json:"metadata"`
+}
+
+func loadHead(path string) (*configHead, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var head configHead
+	if err := yaml.Unmarshal(data, &head); err != nil {
+		return nil, fmt.Errorf("decoding hydra.yaml: %w", err)
+	}
+	return &head, nil
+}
+
+func (h *configHead) validateName(errs *fieldErrors) {
+	if h.APIVersion != APIVersion || h.Kind != Kind {
+		errs.add("apiVersion/kind", "must be %s %s, got %q %q", APIVersion, Kind, h.APIVersion, h.Kind)
+	}
+	dnsLabel(errs, "metadata.name", h.Metadata.Name)
+	if len(h.Metadata.Name) > maxClusterName {
+		errs.add("metadata.name", "must be at most %d characters", maxClusterName)
+	}
 }
 
 // Parse decodes, defaults and validates hydra.yaml content. Unknown fields are
