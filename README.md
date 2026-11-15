@@ -10,8 +10,8 @@ The CLI is a **stateless orchestrator**: every cluster's desired and actual stat
 Kubernetes, never on your machine. There is no local database, cache or inventory, and an
 interrupted command can always be re-run.
 
-> **Status:** early. `hydra cluster render` works today. `validate`, `bootstrap`, `cluster create`
-> and the self-hosting pivot are next.
+> **Status:** early. `hydra cluster render` and `hydra bootstrap` work today. `validate`,
+> `cluster create` and the self-hosting pivot are next.
 
 ## Install
 
@@ -78,9 +78,36 @@ rather than an in-place edit Cluster API would refuse or apply only to future ma
 review the result, diff it between versions, or commit it to your own GitOps repository. It never
 contains secrets: hypervisor credentials are referenced by Secret name only.
 
+## Bootstrap a management cluster
+
+```bash
+hydra bootstrap -f hydra.yaml --hypervisor-credentials ./pki   # cacert.pem, clientcert.pem, clientkey.pem
+hydra bootstrap kubeconfig -f hydra.yaml > bootstrap.kubeconfig
+hydra bootstrap delete -f hydra.yaml
+```
+
+`bootstrap` creates a kind cluster named `hydra-bootstrap-<name>` on this machine (Docker, Podman
+or nerdctl is needed, but no `kind` or `clusterctl` binary) and installs cert-manager, Cluster API
+and the Hydra provider at the versions this CLI pins. It then writes the hypervisor credentials
+Secret named in `spec.hypervisor`, labelled so that `clusterctl move` carries it to the cluster's
+own control plane later. It takes about 75 seconds from nothing.
+
+- `spec.hypervisor` is required: the temporary cluster has no manager-wide hypervisor settings.
+- Nothing is recorded locally. Re-running continues an interrupted run, and a run with nothing
+  left to do changes nothing. A provider installed at another version is reported, not changed.
+- Your kubeconfig and current context are left alone; use `hydra bootstrap kubeconfig`.
+- `delete` refuses while the kind cluster still manages a Cluster API Cluster, because that
+  cluster's machines would be left running with nothing managing them. `--force` overrides.
+- The controllers run on this machine, so it must reach the hypervisor (TLS, port 16514) and the
+  new cluster's API endpoint.
+- clusterctl reads release metadata from GitHub; set `GITHUB_TOKEN` if you hit the anonymous
+  API rate limit.
+
 ## Pinned components
 
-`hydra version` prints them: Kubernetes `v1.35.3` (default), Cilium `1.19.1`, kube-vip `v0.8.9`.
+`hydra version` prints them: Kubernetes `v1.35.3` (default), Cilium `1.19.1`, kube-vip `v0.8.9`;
+and for `bootstrap`, kind node `v1.35.8`, cert-manager `v1.21.1`, Cluster API `v1.14.0` and the Hydra
+provider `v0.1.0`.
 They change only in a hydra release.
 
 ## Contributing

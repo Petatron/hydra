@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/Petatron/hydra/internal/bootstrap"
 	"github.com/Petatron/hydra/internal/config"
 	"github.com/Petatron/hydra/internal/render"
 )
@@ -28,7 +29,7 @@ func NewRootCommand(out, errOut io.Writer) *cobra.Command {
 	}
 	root.SetOut(out)
 	root.SetErr(errOut)
-	root.AddCommand(newVersionCommand(), newClusterCommand())
+	root.AddCommand(newVersionCommand(), newClusterCommand(), newBootstrapCommand())
 	root.SetFlagErrorFunc(func(c *cobra.Command, err error) error {
 		return fmt.Errorf("%w\nRun '%s --help' for usage", err, c.CommandPath())
 	})
@@ -41,8 +42,11 @@ func newVersionCommand() *cobra.Command {
 		Short: "Print the CLI version and the component versions it pins",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			_, err := fmt.Fprintf(cmd.OutOrStdout(), "hydra %s\n  kubernetes (default) %s\n  cilium %s\n  kube-vip %s\n",
-				Version, config.DefaultKubernetesVersion, render.CiliumVersion, render.KubeVIPImage)
+			_, err := fmt.Fprintf(cmd.OutOrStdout(),
+				"hydra %s\n  kubernetes (default) %s\n  cilium %s\n  kube-vip %s\n"+
+					"  bootstrap: kind node %s\n  bootstrap: cert-manager %s, cluster-api %s, hydra provider %s\n",
+				Version, config.DefaultKubernetesVersion, render.CiliumVersion, render.KubeVIPImage,
+				bootstrap.NodeImage, bootstrap.CertManagerVersion, bootstrap.CAPIVersion, bootstrap.HydraVersion)
 			return err
 		},
 	}
