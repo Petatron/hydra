@@ -23,7 +23,7 @@ Commands, in delivery order (Linear project *Hydra — Reliability & Productizat
 |---|---|---|
 | `hydra cluster render` | PET-78 | implemented |
 | `hydra validate` | PET-79 | planned |
-| `hydra bootstrap` (needs the provider's clusterctl release, PET-80) | PET-81 | planned |
+| `hydra bootstrap` / `bootstrap delete` / `bootstrap kubeconfig` | PET-81 | implemented |
 | `hydra cluster create` / `plan` / `status` / `delete` | PET-82 | planned |
 | pivot (`create --self-hosted`) | PET-83 | planned |
 
@@ -35,6 +35,7 @@ Commands, in delivery order (Linear project *Hydra — Reliability & Productizat
 | `internal/cli/` | cobra command tree |
 | `internal/config/` | `hydra.yaml` types, defaults and validation (`Parse` is the only entry) |
 | `internal/render/` | `hydra.yaml` → Cluster API manifests; `templates/cluster.yaml.tmpl` |
+| `internal/bootstrap/` | the temporary kind management cluster: kind and clusterctl as Go libraries behind small interfaces, faked in tests |
 | `internal/render/assets/cilium.yaml` | **generated** by `hack/gen-cilium.sh`; never edit by hand |
 | `internal/render/testdata/*.golden.yaml` | expected output for each file in `examples/` |
 | `examples/` | user-facing `hydra.yaml` examples; every one is golden-tested |
@@ -54,7 +55,9 @@ Commands, in delivery order (Linear project *Hydra — Reliability & Productizat
    provider's `docs/examples/`, which were verified on hardware. When you change a setting there,
    find the provider ticket that proved it, and keep the two in step.
 5. **Pinned versions are code.** Kubernetes default, Cilium (`CILIUM_VERSION` in
-   `hack/gen-cilium.sh` and `render.CiliumVersion`) and kube-vip change only in a reviewed PR.
+   `hack/gen-cilium.sh` and `render.CiliumVersion`), kube-vip, and bootstrap's kind node image,
+   cert-manager, Cluster API and Hydra provider (`internal/bootstrap`) change only in a reviewed PR.
+   The kind node image is pinned by digest.
 6. **Generic over lab.** No default may encode the reference lab (its bridge, pool, addresses).
    Lab values belong in `examples/` only, marked as such.
 

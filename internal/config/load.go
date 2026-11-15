@@ -62,6 +62,36 @@ func Load(path string) (*ClusterConfig, error) {
 	return Parse(data)
 }
 
+// LoadName reads only the cluster's name from a hydra.yaml file, for commands
+// that need nothing else (deleting or reaching the bootstrap cluster). A spec
+// that would fail Parse must not stand in the way of cleaning up.
+func LoadName(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	var head struct {
+		APIVersion string   `json:"apiVersion"`
+		Kind       string   `json:"kind"`
+		Metadata   Metadata `json:"metadata"`
+	}
+	if err := yaml.Unmarshal(data, &head); err != nil {
+		return "", fmt.Errorf("decoding hydra.yaml: %w", err)
+	}
+	var errs fieldErrors
+	if head.APIVersion != APIVersion || head.Kind != Kind {
+		errs.add("apiVersion/kind", "must be %s %s, got %q %q", APIVersion, Kind, head.APIVersion, head.Kind)
+	}
+	dnsLabel(&errs, "metadata.name", head.Metadata.Name)
+	if len(head.Metadata.Name) > maxClusterName {
+		errs.add("metadata.name", "must be at most %d characters", maxClusterName)
+	}
+	if err := errs.err(); err != nil {
+		return "", err
+	}
+	return head.Metadata.Name, nil
+}
+
 // Parse decodes, defaults and validates hydra.yaml content. Unknown fields are
 // errors: a misspelt field silently ignored would render a different cluster
 // from the one the user described.
