@@ -1,0 +1,17 @@
+# The cluster the kind end-to-end test bootstraps for. Its hypervisor address
+# does not resolve on purpose: the test proves the management cluster, the
+# credentials wiring and the rendered objects, and never creates a VM.
+apiVersion: hydra.io/v1alpha1
+kind: ClusterConfig
+metadata:
+  name: e2e
+  namespace: e2e
+spec:
+  hypervisor:
+    address: hypervisor.e2e.invalid:16514
+  storagePool: pool
+  image:
+    name: img.qcow2
+  network:
+    controlPlaneEndpoint: 10.123.0.10
+    bridges: [br0]

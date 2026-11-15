@@ -2,6 +2,8 @@ module github.com/Petatron/hydra
 
 go 1.26.0
 
+toolchain go1.26.11
+
 require (
 	github.com/spf13/cobra v1.10.2
 	k8s.io/api v0.36.3

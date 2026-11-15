@@ -6,6 +6,11 @@ LDFLAGS := -X github.com/Petatron/hydra/internal/cli.Version=$(VERSION)
 LOCALBIN ?= $(shell pwd)/bin
 GOLANGCI_LINT_VERSION ?= v2.12.2
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
+GOVULNCHECK_VERSION ?= v1.9.0
+ACTIONLINT_VERSION ?= v1.7.12
+
+# Every OS/arch a release ships a binary for.
+DIST_PLATFORMS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 
 .PHONY: help
 help: ## Show this help
@@ -26,6 +31,32 @@ golden: ## Rewrite render golden files after an intended output change (review t
 .PHONY: cilium
 cilium: ## Regenerate the embedded Cilium manifest (needs helm)
 	./hack/gen-cilium.sh
+
+.PHONY: cilium-drift
+cilium-drift: cilium ## Fail if the embedded Cilium manifest differs from the pinned chart
+	git diff --exit-code internal/render/assets/cilium.yaml
+
+.PHONY: dist
+dist: ## Build release binaries for every DIST_PLATFORMS entry, with SHA256 checksums, into dist/
+	@mkdir -p dist && rm -f dist/hydra-* dist/checksums.txt
+	@for p in $(DIST_PLATFORMS); do \
+		os=$${p%/*}; arch=$${p#*/}; \
+		echo "building hydra-$$os-$$arch"; \
+		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch go build -trimpath -ldflags "$(LDFLAGS)" -o dist/hydra-$$os-$$arch ./cmd/hydra || exit 1; \
+	done
+	@cd dist && shasum -a 256 hydra-* > checksums.txt && cat checksums.txt
+
+.PHONY: e2e
+e2e: ## Bootstrap a kind management cluster and dry-run every example against it (needs Docker)
+	./hack/e2e/run.sh
+
+.PHONY: vuln
+vuln: ## Check for known vulnerabilities in the code paths hydra uses
+	go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
+
+.PHONY: actionlint
+actionlint: ## Lint the GitHub Actions workflows
+	go run github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION)
 
 .PHONY: verify
 verify: ## Fail if go.mod is untidy or gofmt would change anything
