@@ -64,6 +64,8 @@ type target struct {
 	server string
 	// bootstrapKind is true when it is the bootstrap kind cluster.
 	bootstrapKind bool
+	// kubeconfig is the management kubeconfig, for identity checks.
+	kubeconfig []byte
 }
 
 // connectManagement builds the management-cluster client; tests replace it.
@@ -84,7 +86,7 @@ func manager(cmd *cobra.Command, kubeconfigPath, clusterName string) (*target, e
 	}
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "management cluster: %s (%s)\n", source, server)
 	return &target{m: &cluster.Manager{C: c, Out: cmd.ErrOrStderr()}, source: source, server: server,
-		bootstrapKind: kubeconfigPath == ""}, nil
+		bootstrapKind: kubeconfigPath == "", kubeconfig: kc}, nil
 }
 
 func interruptible(cmd *cobra.Command) (context.Context, func()) {
@@ -245,7 +247,11 @@ func printPlan(w io.Writer, changes []cluster.Change, orphans []string) error {
 		fmt.Fprintf(&b, "? orphaned %s (labelled for this cluster, no longer rendered; create leaves it in place)\n", o)
 	}
 	if len(changes) == 0 {
-		b.WriteString("No changes: the live cluster matches hydra.yaml.\n")
+		if len(orphans) == 0 {
+			b.WriteString("No changes: the live cluster matches hydra.yaml.\n")
+		} else {
+			fmt.Fprintf(&b, "No changes to apply; %d orphaned object(s) left behind.\n", len(orphans))
+		}
 		_, err := io.WriteString(w, b.String())
 		return err
 	}
@@ -261,7 +267,11 @@ func printPlan(w io.Writer, changes []cluster.Change, orphans []string) error {
 			fmt.Fprintf(&b, "%s\n", ch.Diff)
 		}
 	}
-	fmt.Fprintf(&b, "%d change(s).\n", len(changes))
+	if len(orphans) > 0 {
+		fmt.Fprintf(&b, "%d change(s); %d orphaned object(s) left behind.\n", len(changes), len(orphans))
+	} else {
+		fmt.Fprintf(&b, "%d change(s).\n", len(changes))
+	}
 	_, err := io.WriteString(w, b.String())
 	return err
 }
@@ -336,18 +346,30 @@ metadata.namespace are read from hydra.yaml.`,
 			if err != nil {
 				return err
 			}
-			switch {
-			case !st.Exists:
-				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Cluster %s/%s does not exist there; only leftover objects labelled for it will be removed\n", md.Namespace, md.Name)
-			case st.Terminating:
-				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Cluster %s/%s is already being deleted; waiting for it\n", md.Namespace, md.Name)
-			}
-			if st.Exists {
-				if self, why := t.m.SelfHosted(ctx, md.Namespace, md.Name, t.server, st); self {
-					return fmt.Errorf("refusing to delete cluster %s/%s on itself: %s. Its controllers run on the machines being deleted, so the teardown would stop half way. Move it to another management cluster first (clusterctl move), then delete it from there", md.Namespace, md.Name, why)
+			var leftovers []string
+			if !st.Exists {
+				// An interrupted create can leave a HydraCluster, control
+				// plane or MachineDeployments with no Cluster: deleting those
+				// removes VMs, so it needs the same confirmation.
+				if leftovers, err = t.m.Labelled(ctx, md.Namespace, md.Name); err != nil {
+					return err
 				}
+				if len(leftovers) == 0 {
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Cluster %s/%s does not exist there, and nothing is labelled for it; nothing to delete\n", md.Namespace, md.Name)
+					return nil
+				}
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Cluster %s/%s does not exist there, but these objects labelled for it would be deleted:\n  %s\n", md.Namespace, md.Name, strings.Join(leftovers, "\n  "))
+			} else if st.Terminating {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Cluster %s/%s is already being deleted\n", md.Namespace, md.Name)
 			}
-			if !yes && st.Exists && !st.Terminating {
+			self, why, err := t.m.SelfHosted(ctx, md.Namespace, md.Name, t.kubeconfig, st)
+			if err != nil {
+				return fmt.Errorf("cannot tell whether %s manages itself, so not deleting: %w", md.Name, err)
+			}
+			if self {
+				return fmt.Errorf("refusing to delete cluster %s/%s on itself: %s. Its controllers run on the machines being deleted, so the teardown would stop half way. Move it to another management cluster first (clusterctl move), then delete it from there", md.Namespace, md.Name, why)
+			}
+			if !yes {
 				if err := confirm(cmd, md, t.source); err != nil {
 					return err
 				}

@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -8,13 +9,13 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Petatron/hydra/internal/render"
@@ -79,32 +80,50 @@ func (m *Manager) State(ctx context.Context, namespace, name string) (ClusterSta
 
 // SelfHosted reports whether the management cluster is the cluster itself:
 // deleting it there would delete the control plane that runs the deletion,
-// leaving half-deleted machines and no controllers to finish. It compares the
-// management API server with the Cluster's endpoint and, when the workload
-// cluster is reachable, the two clusters' kube-system namespace UIDs (the
-// check clusterctl uses for self-hosted clusters).
-func (m *Manager) SelfHosted(ctx context.Context, namespace, name, managementServer string, st ClusterState) (bool, string) {
-	if st.Endpoint != "" && sameHostPort(managementServer, st.Endpoint) {
-		return true, fmt.Sprintf("the management API server %s is the cluster's own endpoint", managementServer)
+// leaving half-deleted machines and no controllers to finish.
+//
+// Nothing is dialled. It compares the management API server with the
+// Cluster's endpoint, and the certificate authority of the management
+// kubeconfig with the one in the cluster's own kubeconfig Secret. The CA
+// matches whatever address the cluster is reached by (a tunnel, a port-forward,
+// a DNS name), and a kind management cluster never shares its workload's CA.
+// With no kubeconfig Secret there is nothing to compare, and a cluster without
+// one cannot be serving the management API.
+func (m *Manager) SelfHosted(ctx context.Context, namespace, name string, management []byte, st ClusterState) (bool, string, error) {
+	mgmtServer, mgmtCA := kubeconfigIdentity(management)
+	if st.Endpoint != "" && mgmtServer != "" && sameHostPort(mgmtServer, st.Endpoint) {
+		return true, fmt.Sprintf("the management API server %s is the cluster's own endpoint", mgmtServer), nil
 	}
-	kc, err := m.Kubeconfig(ctx, namespace, name)
+	var sec corev1.Secret
+	err := m.C.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name + "-kubeconfig"}, &sec)
+	if apierrors.IsNotFound(err) {
+		return false, "", nil
+	}
 	if err != nil {
-		return false, ""
+		return false, "", fmt.Errorf("reading Secret %s/%s-kubeconfig: %w", namespace, name, err)
 	}
-	wl, err := Connect(kc)
+	_, wlCA := kubeconfigIdentity(sec.Data["value"])
+	if len(mgmtCA) > 0 && bytes.Equal(mgmtCA, wlCA) {
+		return true, "the management kubeconfig trusts the cluster's own certificate authority (it manages itself)", nil
+	}
+	return false, "", nil
+}
+
+// kubeconfigIdentity returns the current context's server URL and CA bytes.
+func kubeconfigIdentity(kubeconfig []byte) (string, []byte) {
+	cfg, err := clientcmd.Load(kubeconfig)
 	if err != nil {
-		return false, ""
+		return "", nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	var mgmtNS, wlNS corev1.Namespace
-	if m.C.Get(ctx, client.ObjectKey{Name: "kube-system"}, &mgmtNS) != nil || wl.Get(ctx, client.ObjectKey{Name: "kube-system"}, &wlNS) != nil {
-		return false, ""
+	ctx, ok := cfg.Contexts[cfg.CurrentContext]
+	if !ok {
+		return "", nil
 	}
-	if mgmtNS.UID != "" && mgmtNS.UID == wlNS.UID {
-		return true, "the management cluster and the cluster have the same kube-system namespace (it manages itself)"
+	cl, ok := cfg.Clusters[ctx.Cluster]
+	if !ok {
+		return "", nil
 	}
-	return false, ""
+	return cl.Server, cl.CertificateAuthorityData
 }
 
 func sameHostPort(server, endpoint string) bool {

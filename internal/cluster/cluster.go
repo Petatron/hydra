@@ -316,39 +316,54 @@ func (m *Manager) Status(ctx context.Context, namespace, name string) (Summary, 
 		ready, _, _ := unstructured.NestedInt64(kcp.Object, "status", "readyReplicas")
 		s.ControlPlane = fmt.Sprintf("%d/%d ready", ready, desired)
 		s.RolledOut = s.RolledOut && upToDate(kcp)
-	} else {
+	} else if apierrors.IsNotFound(err) {
 		s.RolledOut = false
+	} else {
+		return s, fmt.Errorf("reading KubeadmControlPlane: %w", err)
 	}
 	mds := &unstructured.UnstructuredList{}
 	mds.SetGroupVersionKind(mdGVK.GroupVersion().WithKind("MachineDeploymentList"))
-	if err := m.C.List(ctx, mds, client.InNamespace(namespace), client.MatchingLabels{render.ClusterLabelKey: name}); err == nil {
-		for i := range mds.Items {
-			s.RolledOut = s.RolledOut && upToDate(&mds.Items[i])
-		}
+	// A failed read is an error, never "nothing to wait for": one refused
+	// list must not let the wait succeed before the workers are known.
+	if err := m.C.List(ctx, mds, client.InNamespace(namespace), client.MatchingLabels{render.ClusterLabelKey: name}); err != nil {
+		return s, fmt.Errorf("listing MachineDeployments: %w", err)
+	}
+	for i := range mds.Items {
+		s.RolledOut = s.RolledOut && upToDate(&mds.Items[i])
 	}
 
 	machines := &unstructured.UnstructuredList{}
 	machines.SetGroupVersionKind(machineGVK.GroupVersion().WithKind("MachineList"))
-	if err := m.C.List(ctx, machines, client.InNamespace(namespace), client.MatchingLabels{clusterNameLabel: name}); err == nil {
-		for _, mc := range machines.Items {
-			phase, _, _ := unstructured.NestedString(mc.Object, "status", "phase")
-			s.Machines[orDash(phase)]++
-		}
+	if err := m.C.List(ctx, machines, client.InNamespace(namespace), client.MatchingLabels{clusterNameLabel: name}); err != nil {
+		return s, fmt.Errorf("listing Machines: %w", err)
+	}
+	for _, mc := range machines.Items {
+		phase, _, _ := unstructured.NestedString(mc.Object, "status", "phase")
+		s.Machines[orDash(phase)]++
 	}
 
 	binding := &unstructured.Unstructured{}
 	binding.SetGroupVersionKind(bindingGVK)
-	if err := m.C.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, binding); err == nil {
+	switch err := m.C.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, binding); {
+	case err == nil:
 		s.CNIBindingPresent = true
 		s.CNIApplied = bindingApplied(binding, render.CNIName(name))
+	case apierrors.IsNotFound(err), meta.IsNoMatchError(err):
+		// No binding yet: Cluster API makes it once the API is reachable.
+	default:
+		return s, fmt.Errorf("reading ClusterResourceSetBinding: %w", err)
 	}
 	return s, nil
 }
 
 // upToDate reports whether a KubeadmControlPlane or MachineDeployment has
-// observed its latest generation and has every desired replica up to date.
-// An object without spec.replicas (an autoscaled pool) counts its own
-// status.replicas as desired.
+// observed its latest generation and has every desired replica both up to
+// date and Ready. upToDateReplicas alone is not enough: in Cluster API v1.14 a
+// Machine is UpToDate as soon as its spec matches, before its Node is Ready.
+// spec.replicas is the desired count; for an autoscaled pool Cluster API
+// defaults it to the min-size annotation when the pool is created, so that
+// minimum is what is waited for. Without spec.replicas, status.replicas is
+// used.
 func upToDate(o *unstructured.Unstructured) bool {
 	observed, _, _ := unstructured.NestedInt64(o.Object, "status", "observedGeneration")
 	if observed < o.GetGeneration() {
@@ -359,7 +374,8 @@ func upToDate(o *unstructured.Unstructured) bool {
 		desired, _, _ = unstructured.NestedInt64(o.Object, "status", "replicas")
 	}
 	upto, _, _ := unstructured.NestedInt64(o.Object, "status", "upToDateReplicas")
-	return upto >= desired
+	ready, _, _ := unstructured.NestedInt64(o.Object, "status", "readyReplicas")
+	return upto >= desired && ready >= desired
 }
 
 // condition returns the named entry of status.conditions.
@@ -466,6 +482,8 @@ func (m *Manager) Kubeconfig(ctx context.Context, namespace, name string) ([]byt
 // interrupted between applies), waiting for their finalizers; then the
 // templates and the CNI objects. A timeout ends the wait, not the deletion.
 func (m *Manager) Delete(ctx context.Context, namespace, name string, timeout time.Duration) error {
+	// One deadline for the whole command, not a fresh timeout per phase.
+	deadline := time.Now().Add(timeout)
 	cl := &unstructured.Unstructured{}
 	cl.SetGroupVersionKind(clusterGVK)
 	cl.SetNamespace(namespace)
@@ -478,7 +496,7 @@ func (m *Manager) Delete(ctx context.Context, namespace, name string, timeout ti
 		return fmt.Errorf("deleting Cluster %s/%s: %w", namespace, name, err)
 	default:
 		m.logf("deleting Cluster %s/%s; waiting for its machines and infrastructure to be removed", namespace, name)
-		if err := m.wait(ctx, namespace, name, timeout, func(s Summary) bool { return !s.Exists }); err != nil {
+		if err := m.wait(ctx, namespace, name, time.Until(deadline), func(s Summary) bool { return !s.Exists }); err != nil {
 			return err
 		}
 	}
@@ -486,11 +504,27 @@ func (m *Manager) Delete(ctx context.Context, namespace, name string, timeout ti
 	if err := m.deleteLabelled(ctx, namespace, name, ownedKinds[:3]); err != nil {
 		return err
 	}
-	if err := m.waitLabelledGone(ctx, namespace, name, ownedKinds[:3], timeout); err != nil {
+	if err := m.waitLabelledGone(ctx, namespace, name, ownedKinds[:3], time.Until(deadline)); err != nil {
 		return err
 	}
 	// Phase 2: nothing references these any more.
 	return m.deleteLabelled(ctx, namespace, name, ownedKinds[3:])
+}
+
+// Labelled lists every object labelled for the cluster, as delete would find
+// them, so the CLI can tell whether a delete would remove anything.
+func (m *Manager) Labelled(ctx context.Context, namespace, name string) ([]string, error) {
+	var out []string
+	for _, gvk := range ownedKinds {
+		items, err := m.listLabelled(ctx, namespace, name, gvk)
+		if err != nil {
+			return nil, err
+		}
+		for i := range items {
+			out = append(out, describe(&items[i]))
+		}
+	}
+	return out, nil
 }
 
 func (m *Manager) listLabelled(ctx context.Context, namespace, name string, gvk schema.GroupVersionKind) ([]unstructured.Unstructured, error) {

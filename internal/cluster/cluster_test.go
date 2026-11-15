@@ -3,6 +3,7 @@ package cluster
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"maps"
 	"strings"
@@ -268,19 +269,53 @@ func TestOrphans(t *testing.T) {
 	}
 }
 
-func TestStateAndSelfHostedByEndpoint(t *testing.T) {
+func kubeconfigFor(server, ca string) []byte {
+	return []byte(`apiVersion: v1
+kind: Config
+clusters: [{name: c, cluster: {server: "` + server + `", certificate-authority-data: "` + base64.StdEncoding.EncodeToString([]byte(ca)) + `"}}]
+contexts: [{name: c, context: {cluster: c, user: u}}]
+current-context: c
+users: [{name: u, user: {token: x}}]
+`)
+}
+
+func TestSelfHosted(t *testing.T) {
 	ctx := context.Background()
 	cl := obj(clusterGVK, "ns", "c", map[string]any{"spec": map[string]any{"controlPlaneEndpoint": map[string]any{"host": "10.0.0.5", "port": int64(6443)}}})
-	m := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cl).Build()}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "c-kubeconfig"},
+		Data: map[string][]byte{"value": kubeconfigFor("https://10.0.0.5:6443", "workload-ca")}}
+	m := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cl, secret).Build()}
 	st, err := m.State(ctx, "ns", "c")
 	if err != nil || !st.Exists || st.Terminating || st.Endpoint != "10.0.0.5:6443" {
 		t.Fatalf("state %+v %v", st, err)
 	}
-	if self, _ := m.SelfHosted(ctx, "ns", "c", "https://10.0.0.5:6443", st); !self {
-		t.Error("management server == cluster endpoint must be self-hosted")
+	for _, tc := range []struct {
+		name string
+		mgmt []byte
+		want bool
+	}{
+		{"same endpoint", kubeconfigFor("https://10.0.0.5:6443", "other-ca"), true},
+		{"same CA through a tunnel", kubeconfigFor("https://127.0.0.1:16443", "workload-ca"), true},
+		{"kind management cluster", kubeconfigFor("https://127.0.0.1:41234", "kind-ca"), false},
+	} {
+		self, _, err := m.SelfHosted(ctx, "ns", "c", tc.mgmt, st)
+		if err != nil || self != tc.want {
+			t.Errorf("%s: self=%v err=%v, want %v", tc.name, self, err, tc.want)
+		}
 	}
-	if self, _ := m.SelfHosted(ctx, "ns", "c", "https://127.0.0.1:41234", st); self {
-		t.Error("a kind management cluster is not the cluster itself")
+	// No kubeconfig Secret: nothing to compare, not self-hosted.
+	m2 := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cl).Build()}
+	if self, _, err := m2.SelfHosted(ctx, "ns", "c", kubeconfigFor("https://127.0.0.1:41234", "kind-ca"), st); err != nil || self {
+		t.Errorf("no Secret: self=%v err=%v", self, err)
+	}
+	// A Secret that cannot be read is an error, never "not self-hosted".
+	m3 := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithInterceptorFuncs(interceptor.Funcs{
+		Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
+			return errors.New("forbidden")
+		},
+	}).Build()}
+	if _, _, err := m3.SelfHosted(ctx, "ns", "c", kubeconfigFor("https://127.0.0.1:1", "x"), ClusterState{Exists: true}); err == nil {
+		t.Error("an unreadable Secret must be an error")
 	}
 }
 
@@ -293,7 +328,7 @@ func TestUpToDate(t *testing.T) {
 		}
 		return u
 	}
-	if !upToDate(mk(2, 2, 3, 3, true)) {
+	if !upToDate(withReady(mk(2, 2, 3, 3, true), 3)) {
 		t.Error("all up to date")
 	}
 	if upToDate(mk(3, 2, 3, 3, true)) {
@@ -302,8 +337,29 @@ func TestUpToDate(t *testing.T) {
 	if upToDate(mk(2, 2, 3, 1, true)) {
 		t.Error("replicas not yet up to date")
 	}
+	if upToDate(mk(2, 2, 3, 3, true)) {
+		t.Error("up to date but not Ready must keep waiting")
+	}
 	if !upToDate(mk(1, 1, 0, 0, false)) {
 		t.Error("an autoscaled pool at zero is up to date")
+	}
+}
+
+func withReady(u *unstructured.Unstructured, n int64) *unstructured.Unstructured {
+	_ = unstructured.SetNestedField(u.Object, n, "status", "readyReplicas")
+	return u
+}
+
+func TestStatusReadErrorsAreErrors(t *testing.T) {
+	cl := obj(clusterGVK, "ns", "c", nil)
+	kcp := obj(kcpGVK, "ns", "c-cp", nil)
+	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cl, kcp).WithInterceptorFuncs(interceptor.Funcs{
+		List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
+			return errors.New("connection refused")
+		},
+	}).Build()
+	if _, err := (&Manager{C: c}).Status(context.Background(), "ns", "c"); err == nil {
+		t.Error("a failed MachineDeployment list must fail the status read, not report the workers done")
 	}
 }
 

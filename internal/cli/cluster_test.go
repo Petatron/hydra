@@ -133,3 +133,42 @@ func TestWriteKubeconfig(t *testing.T) {
 		t.Errorf("temporary files left behind: %v", entries)
 	}
 }
+
+func TestDeleteConfirmsWhenOnlyLeftoversExist(t *testing.T) {
+	// An interrupted create: a labelled HydraCluster and no Cluster.
+	hc := &unstructured.Unstructured{Object: map[string]any{}}
+	hc.SetAPIVersion("infrastructure.cluster.x-k8s.io/v1alpha1")
+	hc.SetKind("HydraCluster")
+	hc.SetNamespace("default")
+	hc.SetName("hydra-mgmt")
+	hc.SetLabels(map[string]string{"hydra.io/cluster": "hydra-mgmt"})
+	withFakeManagement(t, hc)
+	origIn := confirmIn
+	t.Cleanup(func() { confirmIn = origIn })
+	confirmIn = strings.NewReader("nope\n")
+	_, errOut, err := run(t, "cluster", "delete", "-f", "../../examples/hydra-mgmt.yaml")
+	if err == nil || !strings.Contains(err.Error(), "did not match") {
+		t.Fatalf("leftovers must still need confirmation: %v", err)
+	}
+	if !strings.Contains(errOut, "HydraCluster default/hydra-mgmt") {
+		t.Errorf("the leftovers must be listed before asking:\n%s", errOut)
+	}
+}
+
+func TestDeleteNothingToDo(t *testing.T) {
+	withFakeManagement(t)
+	_, errOut, err := run(t, "cluster", "delete", "-f", "../../examples/hydra-mgmt.yaml")
+	if err != nil || !strings.Contains(errOut, "nothing to delete") {
+		t.Errorf("err=%v out=%s", err, errOut)
+	}
+}
+
+func TestPlanWordingWithOrphans(t *testing.T) {
+	var b bytes.Buffer
+	if err := printPlan(&b, nil, []string{"MachineDeployment ns/c-old"}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(b.String(), "matches hydra.yaml") || !strings.Contains(b.String(), "1 orphaned object(s) left behind") {
+		t.Errorf("orphans must not read as a clean plan:\n%s", b.String())
+	}
+}
