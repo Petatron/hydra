@@ -32,8 +32,11 @@ import (
 )
 
 const (
-	// FieldManager owns everything this CLI applies.
-	FieldManager = "hydra"
+	// FieldManagerPrefix starts the field manager that owns a cluster's
+	// objects: "hydra-<cluster>". One manager per cluster makes the API server
+	// itself refuse, atomically, an apply that would take a field another
+	// cluster's manager owns (see FieldManagerFor).
+	FieldManagerPrefix = "hydra-"
 
 	capiGroup        = "cluster.x-k8s.io"
 	capiVersion      = "v1beta2"
@@ -116,20 +119,40 @@ func (m *Manager) CheckCredentials(ctx context.Context, namespace, name string) 
 	return nil
 }
 
-// Apply server-side applies every object, after making sure their namespace
-// exists. Reapplying the same objects changes nothing.
-func (m *Manager) Apply(ctx context.Context, objs []*unstructured.Unstructured) error {
+// FieldManagerFor is the server-side apply field manager for a cluster.
+func FieldManagerFor(cluster string) string { return FieldManagerPrefix + cluster }
+
+// applyOptions are the server-side apply options for a cluster's objects.
+// Ownership is not forced unless asked: a field another manager set to a
+// different value -- another cluster's hydra, or a hand edit -- is a conflict
+// the API server reports, instead of being silently taken over. That makes
+// the ownership check atomic, where CheckOwnership is only a preflight.
+func applyOptions(cluster string, forceConflicts bool) []client.ApplyOption {
+	opts := []client.ApplyOption{client.FieldOwner(FieldManagerFor(cluster))}
+	if forceConflicts {
+		opts = append(opts, client.ForceOwnership)
+	}
+	return opts
+}
+
+// Apply server-side applies every object as the cluster's field manager,
+// after making sure their namespace exists. Reapplying the same objects
+// changes nothing. forceConflicts takes over fields other managers own.
+func (m *Manager) Apply(ctx context.Context, objs []*unstructured.Unstructured, cluster string, forceConflicts bool) error {
 	namespaces := map[string]bool{}
 	for _, o := range objs {
 		if ns := o.GetNamespace(); ns != "" && !namespaces[ns] {
 			namespaces[ns] = true
-			if err := m.C.Apply(ctx, corev1ac.Namespace(ns), client.FieldOwner(FieldManager)); err != nil {
+			if err := m.C.Apply(ctx, corev1ac.Namespace(ns), client.FieldOwner(FieldManagerFor(cluster))); err != nil {
 				return fmt.Errorf("namespace %s: %w", ns, err)
 			}
 		}
 	}
 	for _, o := range objs {
-		if err := m.C.Apply(ctx, client.ApplyConfigurationFromUnstructured(o.DeepCopy()), client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
+		if err := m.C.Apply(ctx, client.ApplyConfigurationFromUnstructured(o.DeepCopy()), applyOptions(cluster, forceConflicts)...); err != nil {
+			if apierrors.IsConflict(err) {
+				return fmt.Errorf("applying %s: another manager owns fields hydra.yaml sets differently (another cluster, or a hand edit); nothing of theirs was changed. Inspect it, or rerun with --force-conflicts to take them over: %w", describe(o), err)
+			}
 			return fmt.Errorf("applying %s: %w", describe(o), err)
 		}
 	}
@@ -156,7 +179,7 @@ const cniNote = "the CNI ClusterResourceSet applies once: this updates the Confi
 // Plan server-side dry-runs every object and compares the result with the
 // live object. Nothing is written, and nothing local is consulted: the live
 // cluster is the only "state" (ADR-001).
-func (m *Manager) Plan(ctx context.Context, objs []*unstructured.Unstructured) ([]Change, error) {
+func (m *Manager) Plan(ctx context.Context, objs []*unstructured.Unstructured, cluster string, forceConflicts bool) ([]Change, error) {
 	var changes []Change
 	for _, o := range objs {
 		live := &unstructured.Unstructured{}
@@ -170,7 +193,15 @@ func (m *Manager) Plan(ctx context.Context, objs []*unstructured.Unstructured) (
 			return nil, fmt.Errorf("reading %s: %w", describe(o), err)
 		}
 		dry := o.DeepCopy()
-		if err := m.C.Patch(ctx, dry, client.Apply, client.FieldOwner(FieldManager), client.ForceOwnership, client.DryRunAll); err != nil { //nolint:staticcheck // Patch fills dry with the server's result; Apply does not for unstructured.
+		popts := []client.PatchOption{client.FieldOwner(FieldManagerFor(cluster)), client.DryRunAll}
+		if forceConflicts {
+			popts = append(popts, client.ForceOwnership)
+		}
+		if err := m.C.Patch(ctx, dry, client.Apply, popts...); err != nil { //nolint:staticcheck // Patch fills dry with the server's result; Apply does not for unstructured.
+			if apierrors.IsConflict(err) {
+				changes = append(changes, Change{Object: describe(o), Action: "conflict", Diff: err.Error()})
+				continue
+			}
 			return nil, fmt.Errorf("dry-run applying %s: %w", describe(o), err)
 		}
 		before, after := comparable(live), comparable(dry)
@@ -481,20 +512,29 @@ func (m *Manager) Kubeconfig(ctx context.Context, namespace, name string) ([]byt
 // plane and MachineDeployments a Cluster never came to own (a create
 // interrupted between applies), waiting for their finalizers; then the
 // templates and the CNI objects. A timeout ends the wait, not the deletion.
-func (m *Manager) Delete(ctx context.Context, namespace, name string, timeout time.Duration) error {
+//
+// The Cluster must be labelled for this cluster, or unlabelled with adopt
+// (one built by hand); one labelled for another cluster is never deleted, and
+// the delete carries the UID and resourceVersion it checked, so an object
+// changed in between is not deleted either.
+func (m *Manager) Delete(ctx context.Context, namespace, name string, timeout time.Duration, adopt bool) error {
 	// One deadline for the whole command, not a fresh timeout per phase.
 	deadline := time.Now().Add(timeout)
 	cl := &unstructured.Unstructured{}
 	cl.SetGroupVersionKind(clusterGVK)
-	cl.SetNamespace(namespace)
-	cl.SetName(name)
-	err := m.C.Delete(ctx, cl)
+	err := m.C.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, cl)
 	switch {
 	case apierrors.IsNotFound(err), meta.IsNoMatchError(err):
 		m.logf("Cluster %s/%s does not exist", namespace, name)
 	case err != nil:
-		return fmt.Errorf("deleting Cluster %s/%s: %w", namespace, name, err)
+		return fmt.Errorf("reading Cluster %s/%s: %w", namespace, name, err)
 	default:
+		if err := checkOwner(cl, name, adopt); err != nil {
+			return err
+		}
+		if err := m.deleteExactly(ctx, cl); err != nil {
+			return err
+		}
 		m.logf("deleting Cluster %s/%s; waiting for its machines and infrastructure to be removed", namespace, name)
 		if err := m.wait(ctx, namespace, name, time.Until(deadline), func(s Summary) bool { return !s.Exists }); err != nil {
 			return err
@@ -551,11 +591,45 @@ func (m *Manager) deleteLabelled(ctx context.Context, namespace, name string, ki
 			if o.GetDeletionTimestamp() != nil {
 				continue
 			}
-			if err := m.C.Delete(ctx, o); err != nil && !apierrors.IsNotFound(err) {
-				return fmt.Errorf("deleting %s: %w", describe(o), err)
+			switch err := m.deleteExactly(ctx, o); {
+			case errors.Is(err, errChanged):
+				m.logf("skipped %s: it changed after it was listed", describe(o))
+			case err != nil:
+				return err
+			default:
+				m.logf("deleted %s", describe(o))
 			}
-			m.logf("deleted %s", describe(o))
 		}
+	}
+	return nil
+}
+
+// errChanged means an object was modified between being checked and deleted.
+var errChanged = errors.New("object changed since it was checked")
+
+// deleteExactly deletes the object only if it is still the version that was
+// read (same UID and resourceVersion), so ownership checked on that version
+// still holds. An object already gone is not an error.
+func (m *Manager) deleteExactly(ctx context.Context, o *unstructured.Unstructured) error {
+	uid, rv := o.GetUID(), o.GetResourceVersion()
+	err := m.C.Delete(ctx, o, client.Preconditions{UID: &uid, ResourceVersion: &rv})
+	switch {
+	case err == nil, apierrors.IsNotFound(err):
+		return nil
+	case apierrors.IsConflict(err):
+		return fmt.Errorf("%s: %w", describe(o), errChanged)
+	}
+	return fmt.Errorf("deleting %s: %w", describe(o), err)
+}
+
+// checkOwner applies the ownership rule to a live object about to be deleted.
+func checkOwner(o *unstructured.Unstructured, cluster string, adopt bool) error {
+	owner, labelled := o.GetLabels()[render.ClusterLabelKey]
+	switch {
+	case labelled && owner != cluster:
+		return fmt.Errorf("refusing to delete %s: it belongs to cluster %q", describe(o), owner)
+	case !labelled && !adopt:
+		return fmt.Errorf("refusing to delete %s: hydra did not make it (no %s label); pass --adopt to delete a cluster built some other way", describe(o), render.ClusterLabelKey)
 	}
 	return nil
 }

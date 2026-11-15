@@ -106,7 +106,7 @@ func renderObjects(cfg *config.ClusterConfig) ([]*unstructured.Unstructured, err
 func newCreateCommand() *cobra.Command {
 	var file, mgmt, kubeconfigOut string
 	var timeout time.Duration
-	var wait, adopt bool
+	var wait, adopt, forceConflicts bool
 	c := &cobra.Command{
 		Use:   "create",
 		Short: "Create the cluster hydra.yaml describes and wait for it to be Available",
@@ -162,7 +162,7 @@ used.`,
 			if err := m.CheckOwnership(ctx, objs, name, adopt); err != nil {
 				return err
 			}
-			if err := m.Apply(ctx, objs); err != nil {
+			if err := m.Apply(ctx, objs, name, forceConflicts); err != nil {
 				return err
 			}
 			switch orphans, err := m.Orphans(ctx, objs, ns, name); {
@@ -204,11 +204,13 @@ used.`,
 	c.Flags().DurationVar(&timeout, "timeout", 30*time.Minute, "how long to wait for the cluster to be Available")
 	c.Flags().BoolVar(&wait, "wait", true, "wait for the cluster to be Available")
 	c.Flags().BoolVar(&adopt, "adopt", false, "take over existing objects of the same names that hydra did not make (never ones labelled for another cluster)")
+	c.Flags().BoolVar(&forceConflicts, "force-conflicts", false, "take over fields another field manager owns (e.g. a hand edit) instead of failing")
 	return c
 }
 
 func newPlanCommand() *cobra.Command {
 	var file, mgmt string
+	var forceConflicts bool
 	c := &cobra.Command{
 		Use:   "plan",
 		Short: "Show what create would change, against the live management cluster",
@@ -230,7 +232,7 @@ anything stored locally.`,
 			if err != nil {
 				return err
 			}
-			changes, err := t.m.Plan(contextOf(cmd), objs)
+			changes, err := t.m.Plan(contextOf(cmd), objs, cfg.Metadata.Name, forceConflicts)
 			if err != nil {
 				return err
 			}
@@ -243,6 +245,7 @@ anything stored locally.`,
 	}
 	c.Flags().StringVarP(&file, "file", "f", "hydra.yaml", "path to hydra.yaml")
 	c.Flags().StringVar(&mgmt, "management-kubeconfig", "", "kubeconfig of the management cluster (default: the cluster's bootstrap kind cluster)")
+	c.Flags().BoolVar(&forceConflicts, "force-conflicts", false, "plan as create --force-conflicts would apply")
 	return c
 }
 
@@ -264,6 +267,8 @@ func printPlan(w io.Writer, changes []cluster.Change, orphans []string) error {
 		switch ch.Action {
 		case "create":
 			fmt.Fprintf(&b, "+ create %s\n", ch.Object)
+		case "conflict":
+			fmt.Fprintf(&b, "! conflict %s: another field manager owns fields hydra.yaml sets differently; create would fail (use --force-conflicts to take them over)\n  %s\n", ch.Object, ch.Diff)
 		default:
 			fmt.Fprintf(&b, "~ update %s\n", ch.Object)
 			if ch.Note != "" {
@@ -318,7 +323,7 @@ var confirmIn io.Reader = os.Stdin
 
 func newDeleteCommand() *cobra.Command {
 	var file, mgmt string
-	var yes bool
+	var yes, adopt bool
 	var timeout time.Duration
 	c := &cobra.Command{
 		Use:   "delete",
@@ -351,6 +356,10 @@ metadata.namespace are read from hydra.yaml.`,
 			if err != nil {
 				return err
 			}
+			// Ownership first: never offer to delete another cluster's Cluster.
+			if err := st.CheckOwner(md.Name, adopt); err != nil {
+				return err
+			}
 			var leftovers []string
 			if !st.Exists {
 				// An interrupted create can leave a HydraCluster, control
@@ -379,12 +388,13 @@ metadata.namespace are read from hydra.yaml.`,
 					return err
 				}
 			}
-			return t.m.Delete(ctx, md.Namespace, md.Name, timeout)
+			return t.m.Delete(ctx, md.Namespace, md.Name, timeout, adopt)
 		},
 	}
 	c.Flags().StringVarP(&file, "file", "f", "hydra.yaml", "path to hydra.yaml")
 	c.Flags().StringVar(&mgmt, "management-kubeconfig", "", "kubeconfig of the management cluster (default: the cluster's bootstrap kind cluster)")
 	c.Flags().BoolVar(&yes, "yes", false, "do not ask for confirmation")
+	c.Flags().BoolVar(&adopt, "adopt", false, "delete a Cluster hydra did not make (unlabelled); one labelled for another cluster is always refused")
 	c.Flags().DurationVar(&timeout, "timeout", 20*time.Minute, "how long to wait for the teardown")
 	return c
 }

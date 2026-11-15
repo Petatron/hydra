@@ -57,6 +57,17 @@ type ClusterState struct {
 	Terminating bool
 	// Endpoint is spec.controlPlaneEndpoint as host:port, if set.
 	Endpoint string
+	// object is the Cluster as read, for ownership checks.
+	object *unstructured.Unstructured
+}
+
+// CheckOwner reports whether this CLI may delete the Cluster as cluster:
+// labelled for it, or unlabelled with adopt.
+func (st ClusterState) CheckOwner(cluster string, adopt bool) error {
+	if !st.Exists || st.object == nil {
+		return nil
+	}
+	return checkOwner(st.object, cluster, adopt)
 }
 
 // State reads the Cluster object's existence, deletion and endpoint.
@@ -70,7 +81,7 @@ func (m *Manager) State(ctx context.Context, namespace, name string) (ClusterSta
 	if err != nil {
 		return ClusterState{}, err
 	}
-	st := ClusterState{Exists: true, Terminating: cl.GetDeletionTimestamp() != nil}
+	st := ClusterState{Exists: true, Terminating: cl.GetDeletionTimestamp() != nil, object: cl}
 	host, _, _ := unstructured.NestedString(cl.Object, "spec", "controlPlaneEndpoint", "host")
 	port, _, _ := unstructured.NestedInt64(cl.Object, "spec", "controlPlaneEndpoint", "port")
 	if host != "" {
@@ -109,6 +120,9 @@ func (m *Manager) SelfHosted(ctx context.Context, namespace, name string, manage
 		return false, "", fmt.Errorf("cannot determine the management cluster's certificate authority from its kubeconfig (no certificate-authority-data, and no readable certificate-authority file), so cannot rule out that it is the cluster itself")
 	}
 	_, wlCA := kubeconfigIdentity(sec.Data["value"])
+	if len(wlCA) == 0 {
+		return false, "", fmt.Errorf("the kubeconfig Secret %s/%s-kubeconfig holds no readable certificate authority, so cannot rule out that the management cluster is the cluster itself", namespace, name)
+	}
 	if bytes.Equal(mgmtCA, wlCA) {
 		return true, "the management kubeconfig trusts the cluster's own certificate authority (it manages itself)", nil
 	}

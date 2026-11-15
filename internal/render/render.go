@@ -142,6 +142,9 @@ func Render(c *config.ClusterConfig, opts Options) ([]byte, error) {
 		}
 		d.HasEndpoint, d.EndpointHost, d.EndpointPort = true, host, port
 	}
+	// The hash inputs are part of the naming contract: changing them renames
+	// every template, which rolls every existing cluster's machines on its next
+	// create. Change them only with a migration note in the release.
 	d.CPTemplateName = d.CPName + "-" + contentHash(c.Metadata.Name+" "+machineShape(c.Spec.ControlPlane.MachineSize))
 	for _, p := range c.Spec.NodePools {
 		pl := pool{

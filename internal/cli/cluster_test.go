@@ -43,6 +43,7 @@ func capiCluster(ns, name, endpointHost string, port int64) *unstructured.Unstru
 	u.SetKind("Cluster")
 	u.SetNamespace(ns)
 	u.SetName(name)
+	u.SetLabels(map[string]string{"hydra.io/cluster": name})
 	if endpointHost != "" {
 		_ = unstructured.SetNestedField(u.Object, endpointHost, "spec", "controlPlaneEndpoint", "host")
 		_ = unstructured.SetNestedField(u.Object, port, "spec", "controlPlaneEndpoint", "port")
@@ -170,5 +171,25 @@ func TestPlanWordingWithOrphans(t *testing.T) {
 	}
 	if strings.Contains(b.String(), "matches hydra.yaml") || !strings.Contains(b.String(), "1 orphaned object(s) left behind") {
 		t.Errorf("orphans must not read as a clean plan:\n%s", b.String())
+	}
+}
+
+func TestDeleteRefusesAnotherClustersCluster(t *testing.T) {
+	cl := capiCluster("default", "hydra-mgmt", "", 0)
+	cl.SetLabels(map[string]string{"hydra.io/cluster": "someone-else"})
+	withFakeManagement(t, cl)
+	_, _, err := run(t, "cluster", "delete", "-f", "../../examples/hydra-mgmt.yaml", "--yes", "--adopt")
+	if err == nil || !strings.Contains(err.Error(), `belongs to cluster "someone-else"`) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestDeleteHandBuiltClusterNeedsAdopt(t *testing.T) {
+	cl := capiCluster("default", "hydra-mgmt", "", 0)
+	cl.SetLabels(nil)
+	withFakeManagement(t, cl)
+	_, _, err := run(t, "cluster", "delete", "-f", "../../examples/hydra-mgmt.yaml", "--yes")
+	if err == nil || !strings.Contains(err.Error(), "--adopt") {
+		t.Fatalf("got %v", err)
 	}
 }

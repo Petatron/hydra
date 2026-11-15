@@ -166,7 +166,7 @@ func TestPlanCreateUpdateAndNoChange(t *testing.T) {
 	desired := live.DeepCopy()
 	_ = unstructured.SetNestedField(desired.Object, "a: 1\nmtu: \"1450\"\n", "data", "cilium.yaml")
 	newObj := obj(clusterGVK, "ns", "c", nil)
-	changes, err := (&Manager{C: c}).Plan(ctx, []*unstructured.Unstructured{desired, same.DeepCopy(), newObj})
+	changes, err := (&Manager{C: c}).Plan(ctx, []*unstructured.Unstructured{desired, same.DeepCopy(), newObj}, "c", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +202,7 @@ func TestDeleteRemovesLeftoversByLabel(t *testing.T) {
 	}).Build()
 	var out bytes.Buffer
 	m := &Manager{C: c, Out: &out, Poll: time.Millisecond}
-	if err := m.Delete(ctx, "ns", "c", time.Second); err != nil {
+	if err := m.Delete(ctx, "ns", "c", time.Second, false); err != nil {
 		t.Fatal(err)
 	}
 	var cms corev1.ConfigMapList
@@ -329,6 +329,12 @@ users: [{name: u, user: {token: x}}]
 	if _, _, err := m.SelfHosted(ctx, "ns", "c", noCA, st); err == nil {
 		t.Error("an undeterminable management CA must be an error")
 	}
+	// A workload kubeconfig Secret without a readable CA: indeterminate.
+	broken := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "c-kubeconfig"}, Data: map[string][]byte{"value": []byte("not a kubeconfig")}}
+	m4 := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cl, broken).Build()}
+	if _, _, err := m4.SelfHosted(ctx, "ns", "c", kubeconfigFor("https://127.0.0.1:41234", "kind-ca"), st); err == nil {
+		t.Error("a workload kubeconfig without a CA must be an error")
+	}
 	// A Secret that cannot be read is an error, never "not self-hosted".
 	m3 := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithInterceptorFuncs(interceptor.Funcs{
 		Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
@@ -399,11 +405,86 @@ func TestDeleteRemovesUnownedInfrastructureFirst(t *testing.T) {
 		},
 	}).Build()
 	var out bytes.Buffer
-	if err := (&Manager{C: c, Out: &out, Poll: time.Millisecond}).Delete(ctx, "ns", "c", time.Second); err != nil {
+	if err := (&Manager{C: c, Out: &out, Poll: time.Millisecond}).Delete(ctx, "ns", "c", time.Second, false); err != nil {
 		t.Fatalf("%v\n%s", err, out.String())
 	}
 	got := strings.Join(order, ",")
-	if !strings.HasPrefix(got, "Cluster,HydraCluster,") || !strings.Contains(got, "HydraMachineTemplate") || !strings.Contains(got, "ConfigMap") {
+	if !strings.HasPrefix(got, "HydraCluster,") || !strings.Contains(got, "HydraMachineTemplate") || !strings.Contains(got, "ConfigMap") {
 		t.Errorf("delete order %s: the HydraCluster must go before the templates", got)
+	}
+}
+
+func TestApplyDoesNotForceOwnershipByDefault(t *testing.T) {
+	for _, o := range applyOptions("c", false) {
+		if o == client.ForceOwnership {
+			t.Error("ownership must not be forced unless --force-conflicts")
+		}
+	}
+	if got := FieldManagerFor("c"); got != "hydra-c" {
+		t.Errorf("field manager %q", got)
+	}
+	forced := false
+	for _, o := range applyOptions("c", true) {
+		forced = forced || o == client.ForceOwnership
+	}
+	if !forced {
+		t.Error("--force-conflicts must force ownership")
+	}
+}
+
+func TestDeleteChecksClusterOwnership(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name    string
+		label   string
+		adopt   bool
+		wantErr string
+	}{
+		{"another cluster's", "d", true, `belongs to cluster "d"`},
+		{"unlabelled without adopt", "", false, "--adopt"},
+		{"unlabelled with adopt", "", true, ""},
+		{"ours", "c", false, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cl := labelled(clusterGVK, "c", tc.label)
+			c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cl).Build()
+			err := (&Manager{C: c, Out: &bytes.Buffer{}, Poll: time.Millisecond}).Delete(ctx, "ns", "c", time.Second, tc.adopt)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("want %q, got %v", tc.wantErr, err)
+				}
+				if c.Get(ctx, client.ObjectKey{Namespace: "ns", Name: "c"}, labelled(clusterGVK, "", "")) != nil {
+					t.Error("a refused Cluster must still exist")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestDeleteExactlySkipsChangedObjects(t *testing.T) {
+	ctx := context.Background()
+	cm := labelled(schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}, "c-cilium", "c")
+	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cm).Build()
+	m := &Manager{C: c}
+	var live unstructured.Unstructured
+	live.SetGroupVersionKind(cm.GroupVersionKind())
+	if err := c.Get(ctx, client.ObjectKeyFromObject(cm), &live); err != nil {
+		t.Fatal(err)
+	}
+	stale := live.DeepCopy()
+	// Someone relabels it after it was listed.
+	live.SetLabels(map[string]string{render.ClusterLabelKey: "d"})
+	if err := c.Update(ctx, &live); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.deleteExactly(ctx, stale); !errors.Is(err, errChanged) {
+		t.Fatalf("want errChanged for a changed object, got %v", err)
+	}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(cm), &live); err != nil {
+		t.Error("the relabelled object must survive")
 	}
 }
