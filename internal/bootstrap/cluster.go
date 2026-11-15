@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"os"
@@ -14,9 +15,11 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/clientcmd"
@@ -268,16 +271,31 @@ func clusterctlReader() (*clusterctlconfig.MemoryReader, func(), error) {
 	return reader, func() { _ = os.RemoveAll(noOverrides) }, nil
 }
 
-// SecretExists reports whether the Secret exists.
-func (k *KubeCluster) SecretExists(ctx context.Context, namespace, name string) (bool, error) {
-	err := k.c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &corev1.Secret{})
-	switch {
-	case err == nil:
-		return true, nil
-	case apierrors.IsNotFound(err):
-		return false, nil
+// GetSecret reads the Secret's keys, labels and deletion state.
+func (k *KubeCluster) GetSecret(ctx context.Context, namespace, name string) (*SecretInfo, error) {
+	var sec corev1.Secret
+	err := k.c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &sec)
+	if apierrors.IsNotFound(err) {
+		return nil, nil
 	}
-	return false, err
+	if err != nil {
+		return nil, err
+	}
+	return &SecretInfo{
+		Keys:        slices.Sorted(maps.Keys(sec.Data)),
+		Labels:      sec.Labels,
+		Terminating: sec.DeletionTimestamp != nil,
+	}, nil
+}
+
+// LabelSecret merge-patches one label onto the Secret; its data is untouched.
+func (k *KubeCluster) LabelSecret(ctx context.Context, namespace, name, key, value string) error {
+	patch, err := json.Marshal(map[string]any{"metadata": map[string]any{"labels": map[string]string{key: value}}})
+	if err != nil {
+		return err
+	}
+	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name}}
+	return k.c.Patch(ctx, sec, client.RawPatch(types.MergePatchType, patch), client.FieldOwner(FieldManager))
 }
 
 // ApplySecret server-side applies the namespace and an Opaque Secret.

@@ -38,8 +38,10 @@ exists. A provider already installed at another version is reported and left
 alone. Your kubeconfig and current context are not changed; use
 'hydra bootstrap kubeconfig' to reach the cluster.
 
-The machine running hydra must reach the hypervisor (libvirt TLS, port 16514)
-and the new cluster's API endpoint, because the controllers run here.`,
+The controllers run in the kind node container on this machine, so the
+hypervisor (libvirt TLS, port 16514) and the new cluster's API endpoint must be
+reachable from inside that container, not only from this host: an address on
+127.0.0.1, or one only this host can route, will not work.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, err := config.Load(file)
@@ -83,7 +85,8 @@ keep running with nothing managing them; pivot or delete them first, or pass
 --force.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := config.Load(file)
+			// Only the name: an invalid spec must not block cleanup.
+			name, err := config.LoadName(file)
 			if err != nil {
 				return err
 			}
@@ -91,7 +94,7 @@ keep running with nothing managing them; pivot or delete them first, or pass
 			if err != nil {
 				return err
 			}
-			return b.Delete(contextOf(cmd), cfg, force)
+			return b.Delete(contextOf(cmd), name, force)
 		},
 	}
 	c.Flags().StringVarP(&file, "file", "f", "hydra.yaml", "path to hydra.yaml")
@@ -110,7 +113,7 @@ func newBootstrapKubeconfigCommand() *cobra.Command {
   kubectl --kubeconfig bootstrap.kubeconfig get providers -A`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := config.Load(file)
+			name, err := config.LoadName(file)
 			if err != nil {
 				return err
 			}
@@ -118,7 +121,7 @@ func newBootstrapKubeconfigCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			kc, err := b.KubeConfig(cfg)
+			kc, err := b.KubeConfig(name)
 			if err != nil {
 				return err
 			}

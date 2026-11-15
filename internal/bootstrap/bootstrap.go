@@ -96,14 +96,24 @@ type Cluster interface {
 	// provider, and cert-manager's, is Available. Being in clusterctl's
 	// inventory only means a provider was applied, not that it runs.
 	WaitProvidersAvailable(ctx context.Context) error
-	// SecretExists reports whether namespace/name exists.
-	SecretExists(ctx context.Context, namespace, name string) (bool, error)
+	// GetSecret returns what bootstrap needs to judge an existing Secret, or
+	// nil when there is none. Values are never returned.
+	GetSecret(ctx context.Context, namespace, name string) (*SecretInfo, error)
+	// LabelSecret adds one label to an existing Secret without touching data.
+	LabelSecret(ctx context.Context, namespace, name, key, value string) error
 	// ApplySecret creates or updates an Opaque Secret, and its namespace.
 	ApplySecret(ctx context.Context, namespace, name string, data map[string][]byte, labels map[string]string) error
 	// Clusters lists every object showing machines are still managed here:
 	// Clusters, Machines, HydraClusters and HydraMachines, as "Kind ns/name".
 	// It errors rather than answering "none" when it cannot tell.
 	Clusters(ctx context.Context) ([]string, error)
+}
+
+// SecretInfo describes an existing Secret without its values.
+type SecretInfo struct {
+	Keys        []string
+	Labels      map[string]string
+	Terminating bool
 }
 
 // ClusterFactory connects to a management cluster from its kubeconfig.
@@ -118,9 +128,9 @@ type Bootstrapper struct {
 	ProviderFn func() []Provider
 }
 
-// ClusterName is the kind cluster's name for a Hydra cluster.
-func ClusterName(c *config.ClusterConfig) string {
-	return "hydra-bootstrap-" + c.Metadata.Name
+// KindName is the bootstrap kind cluster's name for a Hydra cluster.
+func KindName(cluster string) string {
+	return "hydra-bootstrap-" + cluster
 }
 
 func (b *Bootstrapper) logf(format string, args ...any) {
@@ -151,7 +161,7 @@ func (b *Bootstrapper) Create(ctx context.Context, c *config.ClusterConfig, opts
 	if h == nil {
 		return ErrNoHypervisor
 	}
-	name := ClusterName(c)
+	name := KindName(c.Metadata.Name)
 
 	exists, err := b.Kind.Exists(name)
 	if err != nil {
@@ -259,29 +269,52 @@ func (b *Bootstrapper) install(ctx context.Context, cl Cluster, missing []Provid
 
 func (b *Bootstrapper) ensureCredentials(ctx context.Context, cl Cluster, c *config.ClusterConfig, opts Options) error {
 	ns, secret := c.Metadata.Namespace, c.Spec.Hypervisor.CredentialsSecretName
-	if opts.Credentials == nil {
-		ok, err := cl.SecretExists(ctx, ns, secret)
-		if err != nil {
-			return fmt.Errorf("reading Secret %s/%s: %w", ns, secret, err)
+	if opts.Credentials != nil {
+		if err := cl.ApplySecret(ctx, ns, secret, opts.Credentials.Data(), map[string]string{MoveLabel: ""}); err != nil {
+			return fmt.Errorf("writing Secret %s/%s: %w", ns, secret, err)
 		}
-		if !ok {
-			return fmt.Errorf("hypervisor credentials Secret %s/%s does not exist; pass --hypervisor-credentials <dir> holding cacert.pem, clientcert.pem and clientkey.pem", ns, secret)
-		}
-		b.logf("hypervisor credentials Secret %s/%s exists", ns, secret)
+		b.logf("hypervisor credentials written to Secret %s/%s (labelled for clusterctl move)", ns, secret)
 		return nil
 	}
-	if err := cl.ApplySecret(ctx, ns, secret, opts.Credentials.Data(), map[string]string{MoveLabel: ""}); err != nil {
-		return fmt.Errorf("writing Secret %s/%s: %w", ns, secret, err)
+	// No files given: the Secret already there must be usable as it is.
+	// Existing is not enough -- one made by hand lacks the move label, and
+	// one missing a key or being deleted would fail later, after the pivot.
+	again := fmt.Sprintf("pass --hypervisor-credentials <dir> holding %s, %s and %s", CACertFile, ClientCertFile, ClientKeyFile)
+	info, err := cl.GetSecret(ctx, ns, secret)
+	if err != nil {
+		return fmt.Errorf("reading Secret %s/%s: %w", ns, secret, err)
 	}
-	b.logf("hypervisor credentials written to Secret %s/%s (labelled for clusterctl move)", ns, secret)
+	switch {
+	case info == nil:
+		return fmt.Errorf("hypervisor credentials Secret %s/%s does not exist; %s", ns, secret, again)
+	case info.Terminating:
+		return fmt.Errorf("hypervisor credentials Secret %s/%s is being deleted; wait for it to go, then %s", ns, secret, again)
+	}
+	var missing []string
+	for _, k := range []string{CACertFile, ClientCertFile, ClientKeyFile} {
+		if !slices.Contains(info.Keys, k) {
+			missing = append(missing, k)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("hypervisor credentials Secret %s/%s lacks %s; %s", ns, secret, strings.Join(missing, ", "), again)
+	}
+	if _, ok := info.Labels[MoveLabel]; !ok {
+		if err := cl.LabelSecret(ctx, ns, secret, MoveLabel, ""); err != nil {
+			return fmt.Errorf("labelling Secret %s/%s for clusterctl move: %w", ns, secret, err)
+		}
+		b.logf("hypervisor credentials Secret %s/%s exists; added the clusterctl move label", ns, secret)
+		return nil
+	}
+	b.logf("hypervisor credentials Secret %s/%s exists and is labelled for clusterctl move", ns, secret)
 	return nil
 }
 
 // Delete removes the temporary management cluster. It refuses while the
 // cluster still holds Cluster API Clusters, because deleting it would leave
 // their machines running with nothing managing them -- unless force is set.
-func (b *Bootstrapper) Delete(ctx context.Context, c *config.ClusterConfig, force bool) error {
-	name := ClusterName(c)
+func (b *Bootstrapper) Delete(ctx context.Context, cluster string, force bool) error {
+	name := KindName(cluster)
 	exists, err := b.Kind.Exists(name)
 	if err != nil {
 		return fmt.Errorf("looking for kind cluster %s: %w", name, err)
@@ -312,8 +345,8 @@ func (b *Bootstrapper) Delete(ctx context.Context, c *config.ClusterConfig, forc
 }
 
 // KubeConfig returns the temporary management cluster's kubeconfig.
-func (b *Bootstrapper) KubeConfig(c *config.ClusterConfig) (string, error) {
-	name := ClusterName(c)
+func (b *Bootstrapper) KubeConfig(cluster string) (string, error) {
+	name := KindName(cluster)
 	exists, err := b.Kind.Exists(name)
 	if err != nil {
 		return "", fmt.Errorf("looking for kind cluster %s: %w", name, err)

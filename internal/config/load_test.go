@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -174,5 +175,32 @@ func TestPodCIDRSizedForAutoscaledPools(t *testing.T) {
 	cfg := valid + "  nodePools:\n    - {name: w, vcpus: 1, memory: 2Gi, diskSize: 20Gi, autoscaling: {min: 0, max: 300}}\n"
 	if _, err := Parse([]byte(cfg)); err == nil || !strings.Contains(err.Error(), "303 nodes") {
 		t.Errorf("a /16 holds 256 nodes; 3 + 300 must be refused, got %v", err)
+	}
+}
+
+func TestLoadNameIgnoresTheSpec(t *testing.T) {
+	dir := t.TempDir()
+	write := func(content string) string {
+		p := dir + "/hydra.yaml"
+		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	// A spec Parse refuses (even replicas, bad CIDR, unknown field) still yields its name.
+	broken := strings.Replace(valid, "    bridges: [br0]", "    bridges: [br0]\n    podCIDR: nonsense\n  controlPlane:\n    replicas: 2\n  typo: x", 1)
+	if _, err := Parse([]byte(broken)); err == nil {
+		t.Fatal("test bug: the broken config should fail Parse")
+	}
+	if name, err := LoadName(write(broken)); err != nil || name != "c1" {
+		t.Errorf("got %q %v", name, err)
+	}
+	for _, bad := range []string{
+		strings.Replace(valid, "name: c1", "name: Not_A_Name", 1),
+		strings.Replace(valid, "kind: ClusterConfig", "kind: Other", 1),
+	} {
+		if _, err := LoadName(write(bad)); err == nil {
+			t.Errorf("accepted:\n%s", bad)
+		}
 	}
 }

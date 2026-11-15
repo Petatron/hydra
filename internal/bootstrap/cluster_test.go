@@ -166,7 +166,7 @@ func TestDeleteNeverDeletesWhenItCannotTell(t *testing.T) {
 			k, _, b, _ := newFakes()
 			k.clusters["hydra-bootstrap-lab"] = true
 			tc.setup(k, b)
-			if err := b.Delete(ctx, cfg(t, cfgYAML), false); err == nil {
+			if err := b.Delete(ctx, "lab", false); err == nil {
 				t.Fatal("want a refusal")
 			}
 			if len(k.deleted) != 0 {
@@ -248,5 +248,36 @@ func TestClusterctlReaderIsolatesConfig(t *testing.T) {
 	cleanup()
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Error("cleanup must remove the overrides folder")
+	}
+}
+
+func TestGetAndLabelSecret(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	sec := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "pki"},
+		Data:       map[string][]byte{CACertFile: []byte("a"), ClientCertFile: []byte("b"), ClientKeyFile: []byte("c")},
+	}
+	k := newKubeCluster(fake.NewClientBuilder().WithScheme(scheme).WithObjects(sec).Build())
+
+	if info, err := k.GetSecret(ctx, "ns", "absent"); err != nil || info != nil {
+		t.Fatalf("absent Secret: %v %v", info, err)
+	}
+	info, err := k.GetSecret(ctx, "ns", "pki")
+	if err != nil || strings.Join(info.Keys, ",") != "cacert.pem,clientcert.pem,clientkey.pem" || info.Terminating {
+		t.Fatalf("got %+v %v", info, err)
+	}
+	if err := k.LabelSecret(ctx, "ns", "pki", MoveLabel, ""); err != nil {
+		t.Fatal(err)
+	}
+	var got corev1.Secret
+	if err := k.c.Get(ctx, client.ObjectKey{Namespace: "ns", Name: "pki"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got.Labels[MoveLabel]; !ok || string(got.Data[ClientKeyFile]) != "c" {
+		t.Errorf("label not added, or data changed: %v %v", got.Labels, got.Data)
 	}
 }

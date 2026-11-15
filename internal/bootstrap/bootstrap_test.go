@@ -49,6 +49,9 @@ type fakeCluster struct {
 	clusters  []string
 	waits     int
 	waitErr   error
+	// secretInfo overrides what GetSecret reports for a Secret.
+	secretInfo map[string]*SecretInfo
+	labelled   []string
 }
 
 func (f *fakeCluster) WaitProvidersAvailable(context.Context) error {
@@ -69,9 +72,30 @@ func (f *fakeCluster) Init(_ context.Context, ps []Provider) error {
 	}
 	return nil
 }
-func (f *fakeCluster) SecretExists(_ context.Context, ns, name string) (bool, error) {
-	_, ok := f.secrets[ns+"/"+name]
-	return ok, nil
+func (f *fakeCluster) GetSecret(_ context.Context, ns, name string) (*SecretInfo, error) {
+	if info, ok := f.secretInfo[ns+"/"+name]; ok {
+		return info, nil
+	}
+	data, ok := f.secrets[ns+"/"+name]
+	if !ok {
+		return nil, nil
+	}
+	info := &SecretInfo{Labels: f.labels[ns+"/"+name]}
+	for k := range data {
+		info.Keys = append(info.Keys, k)
+	}
+	return info, nil
+}
+
+func (f *fakeCluster) LabelSecret(_ context.Context, ns, name, key, value string) error {
+	f.labelled = append(f.labelled, ns+"/"+name+":"+key)
+	if info, ok := f.secretInfo[ns+"/"+name]; ok {
+		if info.Labels == nil {
+			info.Labels = map[string]string{}
+		}
+		info.Labels[key] = value
+	}
+	return nil
 }
 func (f *fakeCluster) ApplySecret(_ context.Context, ns, name string, data map[string][]byte, labels map[string]string) error {
 	f.secrets[ns+"/"+name] = data
@@ -218,14 +242,14 @@ func TestDeleteRefusesWhileManagingClusters(t *testing.T) {
 	k, c, b, _ := newFakes()
 	k.clusters["hydra-bootstrap-lab"] = true
 	c.clusters = []string{"Cluster clusters/lab"}
-	err := b.Delete(context.Background(), cfg(t, cfgYAML), false)
+	err := b.Delete(context.Background(), "lab", false)
 	if err == nil || !strings.Contains(err.Error(), "clusters/lab") {
 		t.Fatalf("want a refusal naming the cluster, got %v", err)
 	}
 	if len(k.deleted) != 0 {
 		t.Error("must not delete")
 	}
-	if err := b.Delete(context.Background(), cfg(t, cfgYAML), true); err != nil {
+	if err := b.Delete(context.Background(), "lab", true); err != nil {
 		t.Fatal(err)
 	}
 	if len(k.deleted) != 1 {
@@ -235,7 +259,7 @@ func TestDeleteRefusesWhileManagingClusters(t *testing.T) {
 
 func TestDeleteAbsentIsANoOp(t *testing.T) {
 	k, _, b, out := newFakes()
-	if err := b.Delete(context.Background(), cfg(t, cfgYAML), false); err != nil {
+	if err := b.Delete(context.Background(), "lab", false); err != nil {
 		t.Fatal(err)
 	}
 	if len(k.deleted) != 0 || !strings.Contains(out.String(), "nothing to delete") {
@@ -245,11 +269,11 @@ func TestDeleteAbsentIsANoOp(t *testing.T) {
 
 func TestKubeConfigNeedsCluster(t *testing.T) {
 	k, _, b, _ := newFakes()
-	if _, err := b.KubeConfig(cfg(t, cfgYAML)); err == nil {
+	if _, err := b.KubeConfig("lab"); err == nil {
 		t.Error("no cluster: want an error")
 	}
 	k.clusters["hydra-bootstrap-lab"] = true
-	if kc, err := b.KubeConfig(cfg(t, cfgYAML)); err != nil || kc != "kubeconfig-for-hydra-bootstrap-lab" {
+	if kc, err := b.KubeConfig("lab"); err != nil || kc != "kubeconfig-for-hydra-bootstrap-lab" {
 		t.Errorf("%q %v", kc, err)
 	}
 }
@@ -365,5 +389,40 @@ func TestWaitsForProvidersEvenWhenInstalled(t *testing.T) {
 	}
 	if c.waits != 1 || len(c.inited) != 0 || len(c.secrets) != 0 {
 		t.Errorf("waits %d inits %d secrets %d", c.waits, len(c.inited), len(c.secrets))
+	}
+}
+
+func TestExistingSecretIsChecked(t *testing.T) {
+	all := []string{CACertFile, ClientCertFile, ClientKeyFile}
+	for _, tc := range []struct {
+		name      string
+		info      *SecretInfo
+		wantErr   string
+		wantLabel bool
+	}{
+		{"labelled and complete", &SecretInfo{Keys: all, Labels: map[string]string{MoveLabel: ""}}, "", false},
+		{"made by hand without the move label", &SecretInfo{Keys: all}, "", true},
+		{"missing a key", &SecretInfo{Keys: []string{CACertFile, ClientCertFile}, Labels: map[string]string{MoveLabel: ""}}, "lacks clientkey.pem", false},
+		{"being deleted", &SecretInfo{Keys: all, Terminating: true}, "being deleted", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			k, c, b, _ := newFakes()
+			k.clusters["hydra-bootstrap-lab"] = true
+			for _, p := range Providers() {
+				c.installed[p.Name] = p.Version
+			}
+			c.secretInfo = map[string]*SecretInfo{"clusters/lab-libvirt-pki": tc.info}
+			err := b.Create(context.Background(), cfg(t, cfgYAML), Options{})
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) || !strings.Contains(err.Error(), "--hypervisor-credentials") {
+					t.Fatalf("want error %q asking for credentials, got %v", tc.wantErr, err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if got := len(c.labelled) == 1; got != tc.wantLabel {
+				t.Errorf("labelled: %v, want %v", c.labelled, tc.wantLabel)
+			}
+		})
 	}
 }

@@ -98,8 +98,11 @@ own control plane later. It takes about 75 seconds from nothing.
 - Your kubeconfig and current context are left alone; use `hydra bootstrap kubeconfig`.
 - `delete` refuses while the kind cluster still manages a Cluster API Cluster, because that
   cluster's machines would be left running with nothing managing them. `--force` overrides.
-- The controllers run on this machine, so it must reach the hypervisor (TLS, port 16514) and the
-  new cluster's API endpoint.
+- The controllers run inside the kind node container on this machine, so the hypervisor (TLS, port
+  16514) and the new cluster's API endpoint must be reachable from that container, not only from
+  this host. An address on `127.0.0.1`, or one only this host can route, will not work.
+- `delete` and `kubeconfig` read only `metadata.name`, so a config that fails validation never
+  blocks cleanup.
 - clusterctl reads release metadata from GitHub; set `GITHUB_TOKEN` if you hit the anonymous
   API rate limit.
 
