@@ -10,8 +10,8 @@ The CLI is a **stateless orchestrator**: every cluster's desired and actual stat
 Kubernetes, never on your machine. There is no local database, cache or inventory, and an
 interrupted command can always be re-run.
 
-> **Status:** early. `hydra cluster render` and `hydra bootstrap` work today. `validate`,
-> `cluster create` and the self-hosting pivot are next.
+> **Status:** early. `render`, `bootstrap` and `cluster create/plan/status/delete` work today.
+> `validate` and the self-hosting pivot are next.
 
 ## Install
 
@@ -105,6 +105,29 @@ own control plane later. It takes about 75 seconds from nothing.
   blocks cleanup.
 - clusterctl reads release metadata from GitHub; set `GITHUB_TOKEN` if you hit the anonymous
   API rate limit.
+
+## Create, inspect and delete a cluster
+
+```bash
+hydra cluster plan   -f hydra.yaml   # what create would change, against the live management cluster
+hydra cluster create -f hydra.yaml   # apply, wait for Available, write ./<name>.kubeconfig
+hydra cluster status -f hydra.yaml
+hydra cluster delete -f hydra.yaml   # asks for the cluster name; --yes skips that
+```
+
+These act on `--management-kubeconfig`, or else on the cluster's bootstrap kind cluster; your
+current kubectl context is never used.
+
+- `create` server-side applies the rendered objects (field manager `hydra`) and reports the
+  controllers' own conditions until the cluster is Available, its CNI applied, and any rollout
+  finished. `--timeout` ends the wait, not the creation; rerunning is always safe.
+- It refuses to take over objects of the same name that another cluster owns, or that hydra did
+  not make (`--adopt` allows the latter), and refuses while the cluster is being deleted.
+- `plan` diffs against the live cluster only, and lists objects labelled for the cluster that
+  `hydra.yaml` no longer produces (a removed pool, an old template). Neither command deletes them.
+- `delete` shows which management cluster it will act on before asking, refuses to delete a
+  cluster from itself (a self-hosted management cluster), and then removes everything labelled
+  for the cluster once Cluster API has torn down its machines. The credentials Secret is kept.
 
 ## Pinned components
 

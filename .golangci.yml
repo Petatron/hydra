@@ -23,7 +23,7 @@ linters:
   settings:
     goconst:
       # Map keys of hand-built Kubernetes objects are not magic strings.
-      ignore-string-values: ["^name$", "^kind$"]
+      ignore-string-values: ["^name$", "^kind$", "^cluster$"]
     depguard:
       rules:
         forbid-sort-pkg:

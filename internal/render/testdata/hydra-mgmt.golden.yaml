@@ -6,6 +6,8 @@ kind: HydraCluster
 metadata:
   name: "hydra-mgmt"
   namespace: "default"
+  labels:
+    hydra.io/cluster: "hydra-mgmt"
 spec:
   # Held by kube-vip on the leading control-plane node. It must be outside
   # every DHCP range on its network, and it is immutable.
@@ -24,6 +26,7 @@ metadata:
   name: "hydra-mgmt"
   namespace: "default"
   labels:
+    hydra.io/cluster: "hydra-mgmt"
     # Selects the ClusterResourceSet that installs Cilium.
     cni.hydra.io/cilium: "hydra-mgmt"
 spec:
@@ -48,8 +51,10 @@ kind: HydraMachineTemplate
 metadata:
   # Named after its content: the spec is immutable, so a new machine shape is a
   # new template, and KCP rolls the control plane onto it.
-  name: "hydra-mgmt-cp-4128274b"
+  name: "hydra-mgmt-cp-f05ae81e"
   namespace: "default"
+  labels:
+    hydra.io/cluster: "hydra-mgmt"
 spec:
   template:
     spec:
@@ -62,6 +67,8 @@ kind: KubeadmControlPlane
 metadata:
   name: "hydra-mgmt-cp"
   namespace: "default"
+  labels:
+    hydra.io/cluster: "hydra-mgmt"
 spec:
   replicas: 3
   version: "v1.35.3"
@@ -70,7 +77,7 @@ spec:
       infrastructureRef:
         apiGroup: infrastructure.cluster.x-k8s.io
         kind: HydraMachineTemplate
-        name: "hydra-mgmt-cp-4128274b"
+        name: "hydra-mgmt-cp-f05ae81e"
       deletion:
         # Removing the VIP holder spends ~40s before its Node delete runs; the
         # 10s default left orphan Nodes behind (PET-22).
@@ -268,6 +275,8 @@ kind: MachineHealthCheck
 metadata:
   name: "hydra-mgmt-cp-unhealthy"
   namespace: "default"
+  labels:
+    hydra.io/cluster: "hydra-mgmt"
 spec:
   clusterName: "hydra-mgmt"
   selector:
@@ -971,6 +980,7 @@ kind: ConfigMap
 metadata:
   labels:
     cni.hydra.io/cilium: hydra-mgmt
+    hydra.io/cluster: hydra-mgmt
   name: hydra-mgmt-cilium
   namespace: default
 ---
@@ -978,6 +988,8 @@ metadata:
 apiVersion: addons.cluster.x-k8s.io/v1beta2
 kind: ClusterResourceSet
 metadata:
+  labels:
+    hydra.io/cluster: hydra-mgmt
   name: hydra-mgmt-cilium
   namespace: default
 spec:

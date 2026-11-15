@@ -66,9 +66,16 @@ func Load(path string) (*ClusterConfig, error) {
 // that need nothing else (deleting or reaching the bootstrap cluster). A spec
 // that would fail Parse must not stand in the way of cleaning up.
 func LoadName(path string) (string, error) {
+	md, err := LoadMetadata(path)
+	return md.Name, err
+}
+
+// LoadMetadata is LoadName plus the namespace (defaulted), for commands that
+// address a cluster's objects without needing the rest of the spec.
+func LoadMetadata(path string) (Metadata, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return "", err
+		return Metadata{}, err
 	}
 	var head struct {
 		APIVersion string   `json:"apiVersion"`
@@ -76,7 +83,7 @@ func LoadName(path string) (string, error) {
 		Metadata   Metadata `json:"metadata"`
 	}
 	if err := yaml.Unmarshal(data, &head); err != nil {
-		return "", fmt.Errorf("decoding hydra.yaml: %w", err)
+		return Metadata{}, fmt.Errorf("decoding hydra.yaml: %w", err)
 	}
 	var errs fieldErrors
 	if head.APIVersion != APIVersion || head.Kind != Kind {
@@ -86,10 +93,14 @@ func LoadName(path string) (string, error) {
 	if len(head.Metadata.Name) > maxClusterName {
 		errs.add("metadata.name", "must be at most %d characters", maxClusterName)
 	}
-	if err := errs.err(); err != nil {
-		return "", err
+	if head.Metadata.Namespace == "" {
+		head.Metadata.Namespace = DefaultNamespace
 	}
-	return head.Metadata.Name, nil
+	dnsLabel(&errs, "metadata.namespace", head.Metadata.Namespace)
+	if err := errs.err(); err != nil {
+		return Metadata{}, err
+	}
+	return head.Metadata, nil
 }
 
 // Parse decodes, defaults and validates hydra.yaml content. Unknown fields are

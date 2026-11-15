@@ -24,7 +24,7 @@ Commands, in delivery order (Linear project *Hydra — Reliability & Productizat
 | `hydra cluster render` | PET-78 | implemented |
 | `hydra validate` | PET-79 | planned |
 | `hydra bootstrap` / `bootstrap delete` / `bootstrap kubeconfig` | PET-81 | implemented |
-| `hydra cluster create` / `plan` / `status` / `delete` | PET-82 | planned |
+| `hydra cluster create` / `plan` / `status` / `delete` | PET-82 | implemented |
 | pivot (`create --self-hosted`) | PET-83 | planned |
 
 ## Layout
@@ -35,6 +35,7 @@ Commands, in delivery order (Linear project *Hydra — Reliability & Productizat
 | `internal/cli/` | cobra command tree |
 | `internal/config/` | `hydra.yaml` types, defaults and validation (`Parse` is the only entry) |
 | `internal/render/` | `hydra.yaml` → Cluster API manifests; `templates/cluster.yaml.tmpl` |
+| `internal/cluster/` | create/plan/status/delete against a management cluster: SSA apply, live dry-run diff, controller-reported status, label-scoped teardown, safety checks |
 | `internal/bootstrap/` | the temporary kind management cluster: kind and clusterctl as Go libraries behind small interfaces, faked in tests |
 | `internal/render/assets/cilium.yaml` | **generated** by `hack/gen-cilium.sh`; never edit by hand |
 | `internal/render/testdata/*.golden.yaml` | expected output for each file in `examples/` |
