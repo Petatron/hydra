@@ -1,0 +1,450 @@
+{{- /*
+  Cluster API manifests for one Hydra cluster.
+
+  Derived from cluster-api-provider-hydra docs/examples/cluster-with-kubeadm-control-plane.yaml
+  and nodepool-*.yaml, which were proven on hardware (PET-16, PET-22, PET-37, PET-69). The long
+  explanations behind each setting live there; the comments rendered below keep only what an
+  operator reading the output needs. Every value comes from hydra.yaml or a constant pinned in
+  this CLI, and nothing here may depend on anything else: render is deterministic (ADR-001).
+*/ -}}
+# Rendered by hydra {{ .CLIVersion }} from hydra.yaml for cluster {{ q .Name }}.
+# Do not edit and re-apply by hand: change hydra.yaml and render again.
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: HydraCluster
+metadata:
+  name: {{ q .Name }}
+  namespace: {{ q .Namespace }}
+spec:
+{{- if .HasEndpoint }}
+  # Held by kube-vip on the leading control-plane node. It must be outside
+  # every DHCP range on its network, and it is immutable.
+  controlPlaneEndpoint:
+    host: {{ q .EndpointHost }}
+    port: {{ .EndpointPort }}
+{{- end }}
+  storagePool: {{ q .Spec.StoragePool }}
+  baseImage:
+    name: {{ q .Spec.Image.Name }}
+  networks:
+{{- range .Spec.Network.Bridges }}
+    - name: {{ q . }}
+{{- end }}
+{{- with .Spec.Network.ManagedNetwork }}
+  # Hydra creates and owns this network; machines get an interface on it in
+  # addition to the networks above.{{ if not $.HasEndpoint }} Hydra chooses the endpoint on it.{{ end }}
+  managedNetwork:
+    name: {{ q .Name }}
+    subnet: {{ q .Subnet }}
+    dhcpStart: {{ q .DHCPStart }}
+    dhcpEnd: {{ q .DHCPEnd }}
+{{- end }}
+{{- with .Spec.Hypervisor }}
+  hypervisor:
+    address: {{ q .Address }}
+    # Holds cacert.pem, clientcert.pem and clientkey.pem. Not rendered: key
+    # material never appears in render output. It must carry the label
+    # clusterctl.cluster.x-k8s.io/move so clusterctl move takes it along.
+    credentialsSecretRef:
+      name: {{ q .CredentialsSecretName }}
+{{- end }}
+---
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: Cluster
+metadata:
+  name: {{ q .Name }}
+  namespace: {{ q .Namespace }}
+  labels:
+    # Selects the ClusterResourceSet that installs Cilium.
+    {{ .CNILabelKey }}: {{ q .Name }}
+spec:
+  clusterNetwork:
+    # Propagated by KCP into kubeadm's config, and the same value is Cilium's
+    # IPAM pool, so kubeadm and the CNI cannot disagree.
+    pods:
+      cidrBlocks: [{{ q .Spec.Network.PodCIDR }}]
+    services:
+      cidrBlocks: [{{ q .Spec.Network.ServiceCIDR }}]
+  infrastructureRef:
+    apiGroup: infrastructure.cluster.x-k8s.io
+    kind: HydraCluster
+    name: {{ q .Name }}
+  controlPlaneRef:
+    apiGroup: controlplane.cluster.x-k8s.io
+    kind: KubeadmControlPlane
+    name: {{ q .CPName }}
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: HydraMachineTemplate
+metadata:
+  # Named after its content: the spec is immutable, so a new machine shape is a
+  # new template, and KCP rolls the control plane onto it.
+  name: {{ q .CPTemplateName }}
+  namespace: {{ q .Namespace }}
+spec:
+  template:
+    spec:
+      vcpus: {{ .Spec.ControlPlane.VCPUs }}
+      memory: {{ q .Spec.ControlPlane.Memory.String }}
+      diskSize: {{ q .Spec.ControlPlane.DiskSize.String }}
+---
+apiVersion: controlplane.cluster.x-k8s.io/v1beta2
+kind: KubeadmControlPlane
+metadata:
+  name: {{ q .CPName }}
+  namespace: {{ q .Namespace }}
+spec:
+  replicas: {{ .Spec.ControlPlane.Replicas }}
+  version: {{ q .Spec.KubernetesVersion }}
+  machineTemplate:
+    spec:
+      infrastructureRef:
+        apiGroup: infrastructure.cluster.x-k8s.io
+        kind: HydraMachineTemplate
+        name: {{ q .CPTemplateName }}
+      deletion:
+        # Removing the VIP holder spends ~40s before its Node delete runs; the
+        # 10s default left orphan Nodes behind (PET-22).
+        nodeDeletionTimeoutSeconds: 300
+  # Stop after three failed replacements instead of looping (PET-22).
+  remediation:
+    maxRetry: 3
+  kubeadmConfigSpec:
+    files:
+{{- template "nodeFiles" . }}
+      # Kubelet graceful node shutdown (PET-69), applied as a kubeadm patch;
+      # patches.directory below must name this file's directory.
+      - path: /etc/kubeadm/patches/kubeletconfiguration0+merge.yaml
+        owner: root:root
+        permissions: "0644"
+        content: |
+          shutdownGracePeriod: 60s
+          shutdownGracePeriodCriticalPods: 30s
+      # Lets the kubelet's shutdown delay lock last shutdownGracePeriod; the
+      # zz- prefix sorts after unattended-upgrades' 30s drop-in (PET-69).
+      - path: /etc/systemd/logind.conf.d/zz-hydra-graceful-shutdown.conf
+        owner: root:root
+        permissions: "0644"
+        content: |
+          [Login]
+          InhibitDelayMaxSec=60
+      - path: /etc/kubernetes/manifests/kube-vip.yaml
+        owner: root:root
+        permissions: "0644"
+        content: |
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: kube-vip
+            namespace: kube-system
+          spec:
+            containers:
+              - name: kube-vip
+                image: {{ .KubeVIPImage }}
+                imagePullPolicy: IfNotPresent
+                args: ["manager"]
+                env:
+                  - name: vip_arp
+                    value: "true"
+                  # Filled in at boot from the cluster's endpoint, like
+                  # `address` below.
+                  - name: port
+                    value: "@CONTROL_PLANE_PORT@"
+                  - name: vip_interface
+                    value: {{ q .Spec.Network.VIPInterface }}
+                  - name: vip_cidr
+                    value: "32"
+                  - name: cp_enable
+                    value: "true"
+                  - name: cp_namespace
+                    value: "kube-system"
+                  - name: vip_ddns
+                    value: "false"
+                  - name: svc_enable
+                    value: "false"
+                  - name: vip_leaderelection
+                    value: "true"
+                  # kube-vip's own defaults. A CP that is destroyed outright --
+                  # a crash, or KCP removing its machine -- never releases the
+                  # lease, so the others wait out the lease before claiming the
+                  # VIP: at 15/10/2 that was a 10-20s API outage (PET-22).
+                  - name: vip_leaseduration
+                    value: "5"
+                  - name: vip_renewdeadline
+                    value: "3"
+                  - name: vip_retryperiod
+                    value: "1"
+                  # The address this node claims when it leads. Filled in at boot
+                  # from the cluster's endpoint by preKubeadmCommands below, so
+                  # it is the HydraCluster's value whether that was stated or
+                  # chosen by Hydra.
+                  - name: address
+                    value: "@CONTROL_PLANE_HOST@"
+                securityContext:
+                  capabilities:
+                    add: ["NET_ADMIN", "NET_RAW", "SYS_TIME"]
+                volumeMounts:
+                  - mountPath: /etc/kubernetes/admin.conf
+                    name: kubeconfig
+            hostAliases:
+              - hostnames: ["kubernetes"]
+                ip: 127.0.0.1
+            hostNetwork: true
+            volumes:
+              - name: kubeconfig
+                hostPath:
+                  path: /etc/kubernetes/admin.conf
+    initConfiguration:
+      nodeRegistration:
+        criSocket: unix:///run/containerd/containerd.sock
+{{- if .CPSchedulable }}
+        # No node pools: the control plane runs workloads.
+        taints: []
+{{- end }}
+      patches:
+        directory: /etc/kubeadm/patches
+    joinConfiguration:
+      nodeRegistration:
+        criSocket: unix:///run/containerd/containerd.sock
+{{- if .CPSchedulable }}
+        taints: []
+{{- end }}
+      patches:
+        directory: /etc/kubeadm/patches
+    preKubeadmCommands:
+      # providerID from the SMBIOS UUID libvirt published as the domain UUID.
+      - |
+        # --node-ip is not optional here, and the reason is kube-vip.
+        #
+        # The VIP is added as a second address on {{ .Spec.Network.VIPInterface }} of whichever node holds
+        # leadership. Left to itself the kubelet picked that address and
+        # registered the VIP as the node's InternalIP -- so the node's
+        # identity was an address that moves to a different machine on failover.
+        # Captured here, before kubeadm starts the kubelet and kube-vip with it,
+        # while {{ .Spec.Network.NodeInterface }} still has only its own DHCP address.
+{{- if eq .Spec.Network.NodeInterface .Spec.Network.VIPInterface }}
+        # {{ .Spec.Network.NodeInterface }} here MUST be the same interface as kube-vip's vip_interface.
+{{- end }}
+        NODE_IP=$(ip -4 -o addr show {{ .Spec.Network.NodeInterface }} | awk '{print $4}' | cut -d/ -f1 | head -1)
+        printf 'KUBELET_EXTRA_ARGS=--provider-id=hydra://libvirt/%s --node-ip=%s\n' \
+          "$(tr 'A-Z' 'a-z' < /sys/class/dmi/id/product_uuid)" \
+          "$NODE_IP" \
+          > /etc/default/kubelet
+{{- template "nodeSetup" (nodeSetupArgs . true) }}
+      # Give kube-vip the endpoint CABPK wrote into kubeadm's own config, so it
+      # is stated once (on the HydraCluster) and covers a Hydra-chosen endpoint.
+      # No endpoint found stops cloud-init before kubeadm waits on a dead VIP.
+      - |
+        if [ -f /etc/kubernetes/manifests/kube-vip.yaml ]; then
+          for f in /run/kubeadm/kubeadm.yaml /run/kubeadm/kubeadm-join-config.yaml; do
+            [ -z "${ENDPOINT:-}" ] && [ -f "$f" ] &&
+              ENDPOINT=$(awk '$1 == "controlPlaneEndpoint:" || $1 == "apiServerEndpoint:" { gsub(/["\047]/, "", $2); print $2; exit }' "$f")
+          done
+          case "${ENDPOINT:-}" in
+            ?*:?*) ;;
+            *) echo "kube-vip: no control-plane endpoint in /run/kubeadm" >&2; exit 1 ;;
+          esac
+          HOST=${ENDPOINT%:*}
+          HOST=${HOST#\[}
+          HOST=${HOST%\]}
+          sed -i -e "s/@CONTROL_PLANE_HOST@/$HOST/" -e "s/@CONTROL_PLANE_PORT@/${ENDPOINT##*:}/" \
+            /etc/kubernetes/manifests/kube-vip.yaml
+        fi
+      # kubeadm 1.29+ admin.conf is not cluster-admin; kube-vip needs
+      # super-admin.conf during init, and gets admin.conf back afterwards.
+      - |
+        if [ -f /etc/kubernetes/manifests/kube-vip.yaml ]; then
+          sed -i 's#path: /etc/kubernetes/admin.conf#path: /etc/kubernetes/super-admin.conf#' \
+            /etc/kubernetes/manifests/kube-vip.yaml
+        fi
+    postKubeadmCommands:
+      - |
+        if [ -f /etc/kubernetes/manifests/kube-vip.yaml ]; then
+          sed -i 's#path: /etc/kubernetes/super-admin.conf#path: /etc/kubernetes/admin.conf#' \
+            /etc/kubernetes/manifests/kube-vip.yaml
+        fi
+---
+# Replaces a failed control-plane machine; KCP remediates one at a time and
+# never at the cost of etcd quorum (PET-22).
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: MachineHealthCheck
+metadata:
+  name: {{ q (printf "%s-unhealthy" .CPName) }}
+  namespace: {{ q .Namespace }}
+spec:
+  clusterName: {{ q .Name }}
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/cluster-name: {{ q .Name }}
+      cluster.x-k8s.io/control-plane: ""
+  checks:
+    # Ten minutes. With bootstrap: packages a slow package mirror can exceed
+    # it and loop replacements (PET-77); bootstrap: prebaked removes that.
+    nodeStartupTimeoutSeconds: 600
+    # Five minutes absorbs a reboot or a network blip and still replaces a
+    # dead machine promptly.
+    unhealthyNodeConditions:
+      - type: Ready
+        status: Unknown
+        timeoutSeconds: 300
+      - type: Ready
+        status: "False"
+        timeoutSeconds: 300
+  remediation:
+    triggerIf:
+      # Stand down, visibly, once more members are unhealthy than etcd can lose
+      # and keep quorum ((replicas-1)/2, at least 1). Several failing at once
+      # usually share a cause that replacing machines will not fix.
+      unhealthyLessThanOrEqualTo: {{ .MHCMaxUnhealthy }}
+{{- range .Pools }}
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: HydraMachineTemplate
+metadata:
+  # Named after its content (immutable spec; a change rolls the pool).
+  name: {{ q .HMTName }}
+  namespace: {{ q $.Namespace }}
+spec:
+  template:
+    spec:
+      vcpus: {{ .Spec.VCPUs }}
+      memory: {{ q .Spec.Memory.String }}
+      diskSize: {{ q .Spec.DiskSize.String }}
+---
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
+kind: KubeadmConfigTemplate
+metadata:
+  # Named after its content, so a change rolls the pool instead of reaching
+  # only machines created later.
+  name: {{ q .KCTName }}
+  namespace: {{ q $.Namespace }}
+{{- template "kctSpec" . }}
+---
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: MachineDeployment
+metadata:
+  name: {{ q .ObjName }}
+  namespace: {{ q $.Namespace }}
+{{- if .Spec.Autoscaling }}
+  annotations:
+    cluster.x-k8s.io/cluster-api-autoscaler-node-group-min-size: {{ q (printf "%d" .Spec.Autoscaling.Min) }}
+    cluster.x-k8s.io/cluster-api-autoscaler-node-group-max-size: {{ q (printf "%d" .Spec.Autoscaling.Max) }}
+{{- if .NodeLabels }}
+    # Lets Cluster Autoscaler match pods to this pool while it is at zero.
+    capacity.cluster-autoscaler.kubernetes.io/labels: {{ q .NodeLabels }}
+{{- end }}
+{{- end }}
+spec:
+  clusterName: {{ q $.Name }}
+{{- if .Spec.Autoscaling }}
+  # No replicas: Cluster Autoscaler owns the count, and Cluster API starts the
+  # pool at the min-size annotation. A rendered count would be reset on every
+  # re-apply.
+{{- else }}
+  replicas: {{ .Spec.Replicas }}
+{{- end }}
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/deployment-name: {{ q .ObjName }}
+  template:
+    metadata:
+      labels:
+        cluster.x-k8s.io/cluster-name: {{ q $.Name }}
+        cluster.x-k8s.io/deployment-name: {{ q .ObjName }}
+    spec:
+      clusterName: {{ q $.Name }}
+      version: {{ q $.Spec.KubernetesVersion }}
+      bootstrap:
+        configRef:
+          apiGroup: bootstrap.cluster.x-k8s.io
+          kind: KubeadmConfigTemplate
+          name: {{ q .KCTName }}
+      infrastructureRef:
+        apiGroup: infrastructure.cluster.x-k8s.io
+        kind: HydraMachineTemplate
+        name: {{ q .HMTName }}
+{{- end }}
+{{- define "nodeFiles" }}
+      # kubeadm's preflight needs these on disk; `sysctl --system` only applies
+      # what is there.
+      - path: /etc/modules-load.d/k8s.conf
+        owner: root:root
+        permissions: "0644"
+        content: |
+          overlay
+          br_netfilter
+      - path: /etc/sysctl.d/k8s.conf
+        owner: root:root
+        permissions: "0644"
+        content: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward                 = 1
+{{- end }}
+{{- define "nodeSetup" }}
+{{- $i := .Indent }}
+{{ $i }}- modprobe overlay
+{{ $i }}- modprobe br_netfilter
+{{ $i }}- sysctl --system
+{{- if eq .Spec.Image.Bootstrap "packages" }}
+{{ $i }}# bootstrap: packages -- needs the distribution mirror and pkgs.k8s.io
+{{ $i }}# reachable from every node at boot (PET-77).
+{{ $i }}- DEBIAN_FRONTEND=noninteractive apt-get update
+{{ $i }}- DEBIAN_FRONTEND=noninteractive apt-get install -y containerd apt-transport-https ca-certificates curl gpg qemu-guest-agent
+{{ $i }}- systemctl enable --now qemu-guest-agent
+{{ $i }}- mkdir -p /etc/containerd
+{{ $i }}- containerd config default > /etc/containerd/config.toml
+{{ $i }}- sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+{{ $i }}- systemctl restart containerd
+{{ $i }}- mkdir -p /etc/apt/keyrings
+{{ $i }}- curl -fsSL https://pkgs.k8s.io/core:/stable:/{{ .Spec.KubernetesMinor }}/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+{{ $i }}- echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/{{ .Spec.KubernetesMinor }}/deb/ /" > /etc/apt/sources.list.d/kubernetes.list
+{{ $i }}- DEBIAN_FRONTEND=noninteractive apt-get update
+{{- if .ControlPlane }}
+{{ $i }}- DEBIAN_FRONTEND=noninteractive apt-get install -y kubelet={{ .Spec.KubernetesPackageVersion }}-* kubeadm={{ .Spec.KubernetesPackageVersion }}-* kubectl={{ .Spec.KubernetesPackageVersion }}-*
+{{ $i }}- apt-mark hold kubelet kubeadm kubectl
+{{- else }}
+{{ $i }}- DEBIAN_FRONTEND=noninteractive apt-get install -y kubelet={{ .Spec.KubernetesPackageVersion }}-* kubeadm={{ .Spec.KubernetesPackageVersion }}-*
+{{ $i }}- apt-mark hold kubelet kubeadm
+{{- end }}
+{{- else }}
+{{ $i }}# bootstrap: prebaked -- the image carries containerd (systemd cgroups),
+{{ $i }}# kubelet/kubeadm/kubectl {{ .Spec.KubernetesVersion }} and qemu-guest-agent (PET-77).
+{{ $i }}# No package mirror is contacted at boot.
+{{- end }}
+{{ $i }}# Enable, not start: kubeadm starts the kubelet, but never enables it, and
+{{ $i }}# a node that reboots must rejoin (PET-56).
+{{ $i }}- systemctl enable kubelet
+{{- end }}
+{{- define "kctSpec" }}
+spec:
+  template:
+    spec:
+      files:
+{{- template "nodeFiles" .Root }}
+      joinConfiguration:
+        nodeRegistration:
+          criSocket: unix:///run/containerd/containerd.sock
+{{- if .NodeLabels }}
+          kubeletExtraArgs:
+            - name: node-labels
+              value: {{ q .NodeLabels }}
+{{- end }}
+      preKubeadmCommands:
+{{- if .Root.Spec.Network.MultipleNICs }}
+        # More than one NIC, each on DHCP: pin the Node address to
+        # {{ .Root.Spec.Network.NodeInterface }}, as the control plane does, instead of whichever wins.
+        - |
+          NODE_IP=$(ip -4 -o addr show {{ .Root.Spec.Network.NodeInterface }} | awk '{print $4}' | cut -d/ -f1 | head -1)
+          printf 'KUBELET_EXTRA_ARGS=--provider-id=hydra://libvirt/%s --node-ip=%s\n' \
+            "$(tr 'A-Z' 'a-z' < /sys/class/dmi/id/product_uuid)" \
+            "$NODE_IP" \
+            > /etc/default/kubelet
+{{- else }}
+        - |
+          printf 'KUBELET_EXTRA_ARGS=--provider-id=hydra://libvirt/%s\n' \
+            "$(tr 'A-Z' 'a-z' < /sys/class/dmi/id/product_uuid)" \
+            > /etc/default/kubelet
+{{- end }}
+{{- template "nodeSetup" (nodeSetupArgs .Root false) }}
+{{- end }}

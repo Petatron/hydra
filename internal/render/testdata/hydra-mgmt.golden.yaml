@@ -1,0 +1,990 @@
+# Rendered by hydra test from hydra.yaml for cluster "hydra-mgmt".
+# Do not edit and re-apply by hand: change hydra.yaml and render again.
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: HydraCluster
+metadata:
+  name: "hydra-mgmt"
+  namespace: "default"
+spec:
+  # Held by kube-vip on the leading control-plane node. It must be outside
+  # every DHCP range on its network, and it is immutable.
+  controlPlaneEndpoint:
+    host: "192.168.15.11"
+    port: 6443
+  storagePool: "k8s-workers"
+  baseImage:
+    name: "ubuntu-24.04-server-cloudimg-amd64.img"
+  networks:
+    - name: "br0"
+---
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: Cluster
+metadata:
+  name: "hydra-mgmt"
+  namespace: "default"
+  labels:
+    # Selects the ClusterResourceSet that installs Cilium.
+    cni.hydra.io/cilium: "hydra-mgmt"
+spec:
+  clusterNetwork:
+    # Propagated by KCP into kubeadm's config, and the same value is Cilium's
+    # IPAM pool, so kubeadm and the CNI cannot disagree.
+    pods:
+      cidrBlocks: ["10.244.0.0/16"]
+    services:
+      cidrBlocks: ["10.96.0.0/12"]
+  infrastructureRef:
+    apiGroup: infrastructure.cluster.x-k8s.io
+    kind: HydraCluster
+    name: "hydra-mgmt"
+  controlPlaneRef:
+    apiGroup: controlplane.cluster.x-k8s.io
+    kind: KubeadmControlPlane
+    name: "hydra-mgmt-cp"
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: HydraMachineTemplate
+metadata:
+  # Named after its content: the spec is immutable, so a new machine shape is a
+  # new template, and KCP rolls the control plane onto it.
+  name: "hydra-mgmt-cp-4128274b"
+  namespace: "default"
+spec:
+  template:
+    spec:
+      vcpus: 2
+      memory: "6Gi"
+      diskSize: "40Gi"
+---
+apiVersion: controlplane.cluster.x-k8s.io/v1beta2
+kind: KubeadmControlPlane
+metadata:
+  name: "hydra-mgmt-cp"
+  namespace: "default"
+spec:
+  replicas: 3
+  version: "v1.35.3"
+  machineTemplate:
+    spec:
+      infrastructureRef:
+        apiGroup: infrastructure.cluster.x-k8s.io
+        kind: HydraMachineTemplate
+        name: "hydra-mgmt-cp-4128274b"
+      deletion:
+        # Removing the VIP holder spends ~40s before its Node delete runs; the
+        # 10s default left orphan Nodes behind (PET-22).
+        nodeDeletionTimeoutSeconds: 300
+  # Stop after three failed replacements instead of looping (PET-22).
+  remediation:
+    maxRetry: 3
+  kubeadmConfigSpec:
+    files:
+      # kubeadm's preflight needs these on disk; `sysctl --system` only applies
+      # what is there.
+      - path: /etc/modules-load.d/k8s.conf
+        owner: root:root
+        permissions: "0644"
+        content: |
+          overlay
+          br_netfilter
+      - path: /etc/sysctl.d/k8s.conf
+        owner: root:root
+        permissions: "0644"
+        content: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward                 = 1
+      # Kubelet graceful node shutdown (PET-69), applied as a kubeadm patch;
+      # patches.directory below must name this file's directory.
+      - path: /etc/kubeadm/patches/kubeletconfiguration0+merge.yaml
+        owner: root:root
+        permissions: "0644"
+        content: |
+          shutdownGracePeriod: 60s
+          shutdownGracePeriodCriticalPods: 30s
+      # Lets the kubelet's shutdown delay lock last shutdownGracePeriod; the
+      # zz- prefix sorts after unattended-upgrades' 30s drop-in (PET-69).
+      - path: /etc/systemd/logind.conf.d/zz-hydra-graceful-shutdown.conf
+        owner: root:root
+        permissions: "0644"
+        content: |
+          [Login]
+          InhibitDelayMaxSec=60
+      - path: /etc/kubernetes/manifests/kube-vip.yaml
+        owner: root:root
+        permissions: "0644"
+        content: |
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: kube-vip
+            namespace: kube-system
+          spec:
+            containers:
+              - name: kube-vip
+                image: ghcr.io/kube-vip/kube-vip:v0.8.9
+                imagePullPolicy: IfNotPresent
+                args: ["manager"]
+                env:
+                  - name: vip_arp
+                    value: "true"
+                  # Filled in at boot from the cluster's endpoint, like
+                  # `address` below.
+                  - name: port
+                    value: "@CONTROL_PLANE_PORT@"
+                  - name: vip_interface
+                    value: "enp1s0"
+                  - name: vip_cidr
+                    value: "32"
+                  - name: cp_enable
+                    value: "true"
+                  - name: cp_namespace
+                    value: "kube-system"
+                  - name: vip_ddns
+                    value: "false"
+                  - name: svc_enable
+                    value: "false"
+                  - name: vip_leaderelection
+                    value: "true"
+                  # kube-vip's own defaults. A CP that is destroyed outright --
+                  # a crash, or KCP removing its machine -- never releases the
+                  # lease, so the others wait out the lease before claiming the
+                  # VIP: at 15/10/2 that was a 10-20s API outage (PET-22).
+                  - name: vip_leaseduration
+                    value: "5"
+                  - name: vip_renewdeadline
+                    value: "3"
+                  - name: vip_retryperiod
+                    value: "1"
+                  # The address this node claims when it leads. Filled in at boot
+                  # from the cluster's endpoint by preKubeadmCommands below, so
+                  # it is the HydraCluster's value whether that was stated or
+                  # chosen by Hydra.
+                  - name: address
+                    value: "@CONTROL_PLANE_HOST@"
+                securityContext:
+                  capabilities:
+                    add: ["NET_ADMIN", "NET_RAW", "SYS_TIME"]
+                volumeMounts:
+                  - mountPath: /etc/kubernetes/admin.conf
+                    name: kubeconfig
+            hostAliases:
+              - hostnames: ["kubernetes"]
+                ip: 127.0.0.1
+            hostNetwork: true
+            volumes:
+              - name: kubeconfig
+                hostPath:
+                  path: /etc/kubernetes/admin.conf
+    initConfiguration:
+      nodeRegistration:
+        criSocket: unix:///run/containerd/containerd.sock
+        # No node pools: the control plane runs workloads.
+        taints: []
+      patches:
+        directory: /etc/kubeadm/patches
+    joinConfiguration:
+      nodeRegistration:
+        criSocket: unix:///run/containerd/containerd.sock
+        taints: []
+      patches:
+        directory: /etc/kubeadm/patches
+    preKubeadmCommands:
+      # providerID from the SMBIOS UUID libvirt published as the domain UUID.
+      - |
+        # --node-ip is not optional here, and the reason is kube-vip.
+        #
+        # The VIP is added as a second address on enp1s0 of whichever node holds
+        # leadership. Left to itself the kubelet picked that address and
+        # registered the VIP as the node's InternalIP -- so the node's
+        # identity was an address that moves to a different machine on failover.
+        # Captured here, before kubeadm starts the kubelet and kube-vip with it,
+        # while enp1s0 still has only its own DHCP address.
+        # enp1s0 here MUST be the same interface as kube-vip's vip_interface.
+        NODE_IP=$(ip -4 -o addr show enp1s0 | awk '{print $4}' | cut -d/ -f1 | head -1)
+        printf 'KUBELET_EXTRA_ARGS=--provider-id=hydra://libvirt/%s --node-ip=%s\n' \
+          "$(tr 'A-Z' 'a-z' < /sys/class/dmi/id/product_uuid)" \
+          "$NODE_IP" \
+          > /etc/default/kubelet
+      - modprobe overlay
+      - modprobe br_netfilter
+      - sysctl --system
+      # bootstrap: packages -- needs the distribution mirror and pkgs.k8s.io
+      # reachable from every node at boot (PET-77).
+      - DEBIAN_FRONTEND=noninteractive apt-get update
+      - DEBIAN_FRONTEND=noninteractive apt-get install -y containerd apt-transport-https ca-certificates curl gpg qemu-guest-agent
+      - systemctl enable --now qemu-guest-agent
+      - mkdir -p /etc/containerd
+      - containerd config default > /etc/containerd/config.toml
+      - sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+      - systemctl restart containerd
+      - mkdir -p /etc/apt/keyrings
+      - curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.35/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      - echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.35/deb/ /" > /etc/apt/sources.list.d/kubernetes.list
+      - DEBIAN_FRONTEND=noninteractive apt-get update
+      - DEBIAN_FRONTEND=noninteractive apt-get install -y kubelet=1.35.3-* kubeadm=1.35.3-* kubectl=1.35.3-*
+      - apt-mark hold kubelet kubeadm kubectl
+      # Enable, not start: kubeadm starts the kubelet, but never enables it, and
+      # a node that reboots must rejoin (PET-56).
+      - systemctl enable kubelet
+      # Give kube-vip the endpoint CABPK wrote into kubeadm's own config, so it
+      # is stated once (on the HydraCluster) and covers a Hydra-chosen endpoint.
+      # No endpoint found stops cloud-init before kubeadm waits on a dead VIP.
+      - |
+        if [ -f /etc/kubernetes/manifests/kube-vip.yaml ]; then
+          for f in /run/kubeadm/kubeadm.yaml /run/kubeadm/kubeadm-join-config.yaml; do
+            [ -z "${ENDPOINT:-}" ] && [ -f "$f" ] &&
+              ENDPOINT=$(awk '$1 == "controlPlaneEndpoint:" || $1 == "apiServerEndpoint:" { gsub(/["\047]/, "", $2); print $2; exit }' "$f")
+          done
+          case "${ENDPOINT:-}" in
+            ?*:?*) ;;
+            *) echo "kube-vip: no control-plane endpoint in /run/kubeadm" >&2; exit 1 ;;
+          esac
+          HOST=${ENDPOINT%:*}
+          HOST=${HOST#\[}
+          HOST=${HOST%\]}
+          sed -i -e "s/@CONTROL_PLANE_HOST@/$HOST/" -e "s/@CONTROL_PLANE_PORT@/${ENDPOINT##*:}/" \
+            /etc/kubernetes/manifests/kube-vip.yaml
+        fi
+      # kubeadm 1.29+ admin.conf is not cluster-admin; kube-vip needs
+      # super-admin.conf during init, and gets admin.conf back afterwards.
+      - |
+        if [ -f /etc/kubernetes/manifests/kube-vip.yaml ]; then
+          sed -i 's#path: /etc/kubernetes/admin.conf#path: /etc/kubernetes/super-admin.conf#' \
+            /etc/kubernetes/manifests/kube-vip.yaml
+        fi
+    postKubeadmCommands:
+      - |
+        if [ -f /etc/kubernetes/manifests/kube-vip.yaml ]; then
+          sed -i 's#path: /etc/kubernetes/super-admin.conf#path: /etc/kubernetes/admin.conf#' \
+            /etc/kubernetes/manifests/kube-vip.yaml
+        fi
+---
+# Replaces a failed control-plane machine; KCP remediates one at a time and
+# never at the cost of etcd quorum (PET-22).
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: MachineHealthCheck
+metadata:
+  name: "hydra-mgmt-cp-unhealthy"
+  namespace: "default"
+spec:
+  clusterName: "hydra-mgmt"
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/cluster-name: "hydra-mgmt"
+      cluster.x-k8s.io/control-plane: ""
+  checks:
+    # Ten minutes. With bootstrap: packages a slow package mirror can exceed
+    # it and loop replacements (PET-77); bootstrap: prebaked removes that.
+    nodeStartupTimeoutSeconds: 600
+    # Five minutes absorbs a reboot or a network blip and still replaces a
+    # dead machine promptly.
+    unhealthyNodeConditions:
+      - type: Ready
+        status: Unknown
+        timeoutSeconds: 300
+      - type: Ready
+        status: "False"
+        timeoutSeconds: 300
+  remediation:
+    triggerIf:
+      # Stand down, visibly, once more members are unhealthy than etcd can lose
+      # and keep quorum ((replicas-1)/2, at least 1). Several failing at once
+      # usually share a cause that replacing machines will not fix.
+      unhealthyLessThanOrEqualTo: 1
+---
+# Cilium 1.19.1 for this cluster, applied by the ClusterResourceSet below.
+apiVersion: v1
+data:
+  cilium.yaml: "---\n# Source: cilium/templates/cilium-secrets-namespace.yaml\napiVersion:
+    v1\nkind: Namespace\nmetadata:\n  name: \"cilium-secrets\"\n  labels:\n    app.kubernetes.io/part-of:
+    cilium\n  annotations:\n\n---\n# Source: cilium/templates/cilium-agent/serviceaccount.yaml\napiVersion:
+    v1\nkind: ServiceAccount\nmetadata:\n  name: \"cilium\"\n  namespace: kube-system\n\n---\n#
+    Source: cilium/templates/cilium-envoy/serviceaccount.yaml\napiVersion: v1\nkind:
+    ServiceAccount\nmetadata:\n  name: \"cilium-envoy\"\n  namespace: kube-system\n\n---\n#
+    Source: cilium/templates/cilium-operator/serviceaccount.yaml\napiVersion: v1\nkind:
+    ServiceAccount\nmetadata:\n  name: \"cilium-operator\"\n  namespace: kube-system\n\n---\n#
+    Source: cilium/templates/hubble/tls-cronjob/serviceaccount.yaml\napiVersion: v1\nkind:
+    ServiceAccount\nmetadata:\n  name: \"hubble-generate-certs\"\n  namespace: kube-system\n\n---\n#
+    Source: cilium/templates/cilium-configmap.yaml\napiVersion: v1\nkind: ConfigMap\nmetadata:\n
+    \ name: cilium-config\n  namespace: kube-system\ndata:\n\n  # Identity allocation
+    mode selects how identities are shared between cilium\n  # nodes by setting how
+    they are stored. The options are \"crd\", \"kvstore\" or\n  # \"doublewrite-readkvstore\"
+    / \"doublewrite-readcrd\".\n  # - \"crd\" stores identities in kubernetes as CRDs
+    (custom resource definition).\n  #   These can be queried with:\n  #     kubectl
+    get ciliumid\n  # - \"kvstore\" stores identities in an etcd kvstore, that is\n
+    \ #   configured below. Cilium versions before 1.6 supported only the kvstore\n
+    \ #   backend. Upgrades from these older cilium versions should continue using\n
+    \ #   the kvstore by commenting out the identity-allocation-mode below, or\n  #
+    \  setting it to \"kvstore\".\n  # - \"doublewrite\" modes store identities in
+    both the kvstore and CRDs. This is useful\n  #   for seamless migrations from
+    the kvstore mode to the crd mode. Consult the\n  #   documentation for more information
+    on how to perform the migration.\n  identity-allocation-mode: crd\n\n  identity-heartbeat-timeout:
+    \"30m0s\"\n  identity-gc-interval: \"15m0s\"\n  cilium-endpoint-gc-interval: \"5m0s\"\n
+    \ nodes-gc-interval: \"5m0s\"\n\n  # If you want to run cilium in debug mode change
+    this value to true\n  debug: \"false\"\n  metrics-sampling-interval: \"5m\"\n
+    \ # The agent can be put into the following three policy enforcement modes\n  #
+    default, always and never.\n  # https://docs.cilium.io/en/latest/security/policy/intro/#policy-enforcement-modes\n
+    \ enable-policy: \"default\"\n  # If you want metrics enabled in cilium-operator,
+    set the port for\n  # which the Cilium Operator will have their metrics exposed.\n
+    \ # NOTE that this will open the port on the nodes where Cilium operator pod\n
+    \ # is scheduled.\n  operator-prometheus-serve-addr: \":9963\"\n  enable-metrics:
+    \"true\"\n  enable-policy-secrets-sync: \"true\"\n  policy-secrets-only-from-secrets-namespace:
+    \"true\"\n  policy-secrets-namespace: \"cilium-secrets\"\n\n  # Enable IPv4 addressing.
+    If enabled, all endpoints are allocated an IPv4\n  # address.\n  enable-ipv4:
+    \"true\"\n\n  # Enable IPv6 addressing. If enabled, all endpoints are allocated
+    an IPv6\n  # address.\n  enable-ipv6: \"false\"\n  # Users who wish to specify
+    their own custom CNI configuration file must set\n  # custom-cni-conf to \"true\",
+    otherwise Cilium may overwrite the configuration.\n  custom-cni-conf: \"false\"\n
+    \ enable-bpf-clock-probe: \"false\"\n  # If you want cilium monitor to aggregate
+    tracing for packets, set this level\n  # to \"low\", \"medium\", or \"maximum\".
+    The higher the level, the less packets\n  # that will be seen in monitor output.\n
+    \ monitor-aggregation: medium\n\n  # The monitor aggregation interval governs
+    the typical time between monitor\n  # notification events for each allowed connection.\n
+    \ #\n  # Only effective when monitor aggregation is set to \"medium\" or higher.\n
+    \ monitor-aggregation-interval: \"5s\"\n\n  # The monitor aggregation flags determine
+    which TCP flags which, upon the\n  # first observation, cause monitor notifications
+    to be generated.\n  #\n  # Only effective when monitor aggregation is set to \"medium\"
+    or higher.\n  monitor-aggregation-flags: all\n  # Specifies the ratio (0.0-1.0]
+    of total system memory to use for dynamic\n  # sizing of the TCP CT, non-TCP CT,
+    NAT and policy BPF maps.\n  bpf-map-dynamic-size-ratio: \"0.0025\"\n  # bpf-policy-map-max
+    specifies the maximum number of entries in endpoint\n  # policy map (per endpoint)\n
+    \ bpf-policy-map-max: \"16384\"\n  # bpf-policy-stats-map-max specifies the maximum
+    number of entries in global\n  # policy stats map\n  bpf-policy-stats-map-max:
+    \"65536\"\n  # bpf-lb-map-max specifies the maximum number of entries in bpf lb
+    service,\n  # backend and affinity maps.\n  bpf-lb-map-max: \"65536\"\n  bpf-lb-external-clusterip:
+    \"false\"\n  bpf-lb-source-range-all-types: \"false\"\n  bpf-lb-algorithm-annotation:
+    \"false\"\n  bpf-lb-mode-annotation: \"false\"\n\n  bpf-distributed-lru: \"false\"\n
+    \ bpf-events-drop-enabled: \"true\"\n  bpf-events-policy-verdict-enabled: \"true\"\n
+    \ bpf-events-trace-enabled: \"true\"\n\n  # Pre-allocation of map entries allows
+    per-packet latency to be reduced, at\n  # the expense of up-front memory allocation
+    for the entries in the maps. The\n  # default value below will minimize memory
+    usage in the default installation;\n  # users who are sensitive to latency may
+    consider setting this to \"true\".\n  #\n  # This option was introduced in Cilium
+    1.4. Cilium 1.3 and earlier ignore\n  # this option and behave as though it is
+    set to \"true\".\n  #\n  # If this value is modified, then during the next Cilium
+    startup the restore\n  # of existing endpoints and tracking of ongoing connections
+    may be disrupted.\n  # As a result, reply packets may be dropped and the load-balancing
+    decisions\n  # for established connections may change.\n  #\n  # If this option
+    is set to \"false\" during an upgrade from 1.3 or earlier to\n  # 1.4 or later,
+    then it may cause one-time disruptions during the upgrade.\n  preallocate-bpf-maps:
+    \"false\"\n\n  # Name of the cluster. Only relevant when building a mesh of clusters.\n
+    \ cluster-name: \"hydra-mgmt\"\n  # Unique ID of the cluster. Must be unique across
+    all connected clusters and\n  # in the range of 1 and 255. Only relevant when
+    building a mesh of clusters.\n  cluster-id: \"0\"\n\n  # Encapsulation mode for
+    communication between nodes\n  # Possible values:\n  #   - disabled\n  #   - vxlan
+    (default)\n  #   - geneve\n\n  routing-mode: \"tunnel\"\n  tunnel-protocol: \"vxlan\"\n
+    \ tunnel-source-port-range: \"0-0\"\n  service-no-backend-response: \"reject\"\n
+    \ policy-deny-response: \"none\"\n  mtu: \"1500\"\n\n\n  # Enables L7 proxy for
+    L7 policy enforcement and visibility\n  enable-l7-proxy: \"true\"\n  enable-ipv4-masquerade:
+    \"true\"\n  enable-ipv4-big-tcp: \"false\"\n  enable-ipv6-big-tcp: \"false\"\n
+    \ enable-ipv6-masquerade: \"true\"\n  enable-tunnel-big-tcp: \"false\"\n  enable-tcx:
+    \"true\"\n  datapath-mode: \"veth\"\n  enable-masquerade-to-route-source: \"false\"\n\n
+    \ enable-xt-socket-fallback: \"true\"\n  install-no-conntrack-iptables-rules:
+    \"false\"\n  iptables-random-fully: \"false\"\n\n  auto-direct-node-routes: \"false\"\n
+    \ direct-routing-skip-unreachable: \"false\"\n\n\n\n  kube-proxy-replacement:
+    \"false\"\n  enable-no-service-endpoints-routable: \"true\"\n  bpf-lb-sock: \"false\"\n
+    \ enable-health-check-nodeport: \"true\"\n  enable-health-check-loadbalancer-ip:
+    \"false\"\n  node-port-bind-protection: \"true\"\n  enable-auto-protect-node-port-range:
+    \"true\"\n  bpf-lb-acceleration: \"disabled\"\n  enable-l2-neigh-discovery: \"false\"\n
+    \ k8s-require-ipv4-pod-cidr: \"false\"\n  k8s-require-ipv6-pod-cidr: \"false\"\n
+    \ enable-k8s-networkpolicy: \"true\"\n  enable-endpoint-lockdown-on-policy-overflow:
+    \"false\"\n  # Tell the agent to generate and write a CNI configuration file\n
+    \ write-cni-conf-when-ready: /host/etc/cni/net.d/05-cilium.conflist\n  cni-exclusive:
+    \"true\"\n  cni-log-file: \"/var/run/cilium/cilium-cni.log\"\n  enable-endpoint-health-checking:
+    \"true\"\n  enable-health-checking: \"true\"\n  health-check-icmp-failure-threshold:
+    \"3\"\n  enable-well-known-identities: \"false\"\n  enable-node-selector-labels:
+    \"false\"\n  synchronize-k8s-nodes: \"true\"\n  operator-api-serve-addr: \"127.0.0.1:9234\"\n\n
+    \ enable-hubble: \"true\"\n  # UNIX domain socket for Hubble server to listen
+    to.\n  hubble-socket-path: \"/var/run/cilium/hubble.sock\"\n  hubble-network-policy-correlation-enabled:
+    \"true\"\n  # An additional address for Hubble server to listen to (e.g. \":4244\").\n
+    \ hubble-listen-address: \":4244\"\n  hubble-disable-tls: \"false\"\n  hubble-tls-cert-file:
+    /var/lib/cilium/tls/hubble/server.crt\n  hubble-tls-key-file: /var/lib/cilium/tls/hubble/server.key\n
+    \ hubble-tls-client-ca-files: /var/lib/cilium/tls/hubble/client-ca.crt\n  ipam:
+    \"cluster-pool\"\n  ipam-cilium-node-update-rate: \"15s\"\n  cluster-pool-ipv4-cidr:
+    \"10.244.0.0/16\"\n  cluster-pool-ipv4-mask-size: \"24\"\n\n  default-lb-service-ipam:
+    \"lbipam\"\n  egress-gateway-reconciliation-trigger-interval: \"1s\"\n  enable-vtep:
+    \"false\"\n  vtep-endpoint: \"\"\n  vtep-cidr: \"\"\n  vtep-mask: \"\"\n  vtep-mac:
+    \"\"\n\n  packetization-layer-pmtud-mode: \"blackhole\"\n  procfs: \"/host/proc\"\n
+    \ bpf-root: \"/sys/fs/bpf\"\n  cgroup-root: \"/run/cilium/cgroupv2\"\n\n  identity-management-mode:
+    \"agent\"\n  enable-sctp: \"false\"\n  remove-cilium-node-taints: \"true\"\n  set-cilium-node-taints:
+    \"true\"\n  set-cilium-is-up-condition: \"true\"\n  unmanaged-pod-watcher-interval:
+    \"15s\"\n  # default DNS proxy to transparent mode in non-chaining modes\n  dnsproxy-enable-transparent-mode:
+    \"true\"\n  dnsproxy-socket-linger-timeout: \"10\"\n  tofqdns-dns-reject-response-code:
+    \"refused\"\n  tofqdns-enable-dns-compression: \"true\"\n  tofqdns-endpoint-max-ip-per-hostname:
+    \"1000\"\n  tofqdns-idle-connection-grace-period: \"0s\"\n  tofqdns-max-deferred-connection-deletes:
+    \"10000\"\n  tofqdns-proxy-response-max-delay: \"100ms\"\n  tofqdns-preallocate-identities:
+    \ \"true\"\n  agent-not-ready-taint-key: \"node.cilium.io/agent-not-ready\"\n\n
+    \ mesh-auth-enabled: \"false\"\n  mesh-auth-queue-size: \"1024\"\n  mesh-auth-rotated-identities-queue-size:
+    \"1024\"\n  mesh-auth-gc-interval: \"5m0s\"\n\n  proxy-xff-num-trusted-hops-ingress:
+    \"0\"\n  proxy-xff-num-trusted-hops-egress: \"0\"\n  proxy-connect-timeout: \"2\"\n
+    \ proxy-initial-fetch-timeout: \"30\"\n  proxy-max-active-downstream-connections:
+    \"50000\"\n  proxy-max-requests-per-connection: \"0\"\n  proxy-max-connection-duration-seconds:
+    \"0\"\n  proxy-idle-timeout-seconds: \"60\"\n  proxy-max-concurrent-retries: \"128\"\n
+    \ proxy-use-original-source-address: \"true\"\n  proxy-cluster-max-connections:
+    \"1024\"\n  proxy-cluster-max-requests: \"1024\"\n  http-retry-count: \"3\"\n
+    \ http-stream-idle-timeout: \"300\"\n\n  external-envoy-proxy: \"true\"\n  envoy-base-id:
+    \"0\"\n  envoy-access-log-buffer-size: \"4096\"\n  envoy-keep-cap-netbindservice:
+    \"false\"\n  max-connected-clusters: \"255\"\n  clustermesh-cache-ttl: \"0s\"\n
+    \ clustermesh-enable-endpoint-sync: \"false\"\n  clustermesh-enable-mcs-api: \"false\"\n
+    \ clustermesh-mcs-api-install-crds: \"true\"\n  policy-default-local-cluster:
+    \"true\"\n\n  nat-map-stats-entries: \"32\"\n  nat-map-stats-interval: \"30s\"\n
+    \ enable-lb-ipam: \"true\"\n  enable-non-default-deny-policies: \"true\"\n  enable-source-ip-verification:
+    \"true\"\n\n# Extra config allows adding arbitrary properties to the cilium config.\n#
+    By putting it at the end of the ConfigMap, it's also possible to override existing
+    properties.\n\n---\n# Source: cilium/templates/cilium-envoy/configmap.yaml\napiVersion:
+    v1\nkind: ConfigMap\nmetadata:\n  name: cilium-envoy-config\n  namespace: kube-system\ndata:\n
+    \ # Keep the key name as bootstrap-config.json to avoid breaking changes\n  bootstrap-config.json:
+    |\n    {\"admin\":{\"address\":{\"pipe\":{\"path\":\"/var/run/cilium/envoy/sockets/admin.sock\"}}},\"applicationLogConfig\":{\"logFormat\":{\"textFormat\":\"[%Y-%m-%d
+    %T.%e][%t][%l][%n] [%g:%#] %v\"}},\"bootstrapExtensions\":[{\"name\":\"envoy.bootstrap.internal_listener\",\"typedConfig\":{\"@type\":\"type.googleapis.com/envoy.extensions.bootstrap.internal_listener.v3.InternalListener\"}}],\"dynamicResources\":{\"cdsConfig\":{\"apiConfigSource\":{\"apiType\":\"GRPC\",\"grpcServices\":[{\"envoyGrpc\":{\"clusterName\":\"xds-grpc-cilium\"}}],\"setNodeOnFirstMessageOnly\":true,\"transportApiVersion\":\"V3\"},\"initialFetchTimeout\":\"30s\",\"resourceApiVersion\":\"V3\"},\"ldsConfig\":{\"apiConfigSource\":{\"apiType\":\"GRPC\",\"grpcServices\":[{\"envoyGrpc\":{\"clusterName\":\"xds-grpc-cilium\"}}],\"setNodeOnFirstMessageOnly\":true,\"transportApiVersion\":\"V3\"},\"initialFetchTimeout\":\"30s\",\"resourceApiVersion\":\"V3\"}},\"node\":{\"cluster\":\"ingress-cluster\",\"id\":\"host~127.0.0.1~no-id~localdomain\"},\"overloadManager\":{\"resourceMonitors\":[{\"name\":\"envoy.resource_monitors.global_downstream_max_connections\",\"typedConfig\":{\"@type\":\"type.googleapis.com/envoy.extensions.resource_monitors.downstream_connections.v3.DownstreamConnectionsConfig\",\"max_active_downstream_connections\":\"50000\"}}]},\"staticResources\":{\"clusters\":[{\"circuitBreakers\":{\"thresholds\":[{\"maxRetries\":128}]},\"cleanupInterval\":\"2.500s\",\"connectTimeout\":\"2s\",\"lbPolicy\":\"CLUSTER_PROVIDED\",\"name\":\"ingress-cluster\",\"type\":\"ORIGINAL_DST\",\"typedExtensionProtocolOptions\":{\"envoy.extensions.upstreams.http.v3.HttpProtocolOptions\":{\"@type\":\"type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions\",\"commonHttpProtocolOptions\":{\"idleTimeout\":\"60s\",\"maxConnectionDuration\":\"0s\",\"maxRequestsPerConnection\":0},\"useDownstreamProtocolConfig\":{}}}},{\"circuitBreakers\":{\"thresholds\":[{\"maxRetries\":128}]},\"cleanupInterval\":\"2.500s\",\"connectTimeout\":\"2s\",\"lbPolicy\":\"CLUSTER_PROVIDED\",\"name\":\"egress-cluster-tls\",\"transportSocket\":{\"name\":\"cilium.tls_wrapper\",\"typedConfig\":{\"@type\":\"type.googleapis.com/cilium.UpstreamTlsWrapperContext\"}},\"type\":\"ORIGINAL_DST\",\"typedExtensionProtocolOptions\":{\"envoy.extensions.upstreams.http.v3.HttpProtocolOptions\":{\"@type\":\"type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions\",\"commonHttpProtocolOptions\":{\"idleTimeout\":\"60s\",\"maxConnectionDuration\":\"0s\",\"maxRequestsPerConnection\":0},\"upstreamHttpProtocolOptions\":{},\"useDownstreamProtocolConfig\":{}}}},{\"circuitBreakers\":{\"thresholds\":[{\"maxRetries\":128}]},\"cleanupInterval\":\"2.500s\",\"connectTimeout\":\"2s\",\"lbPolicy\":\"CLUSTER_PROVIDED\",\"name\":\"egress-cluster\",\"type\":\"ORIGINAL_DST\",\"typedExtensionProtocolOptions\":{\"envoy.extensions.upstreams.http.v3.HttpProtocolOptions\":{\"@type\":\"type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions\",\"commonHttpProtocolOptions\":{\"idleTimeout\":\"60s\",\"maxConnectionDuration\":\"0s\",\"maxRequestsPerConnection\":0},\"useDownstreamProtocolConfig\":{}}}},{\"circuitBreakers\":{\"thresholds\":[{\"maxRetries\":128}]},\"cleanupInterval\":\"2.500s\",\"connectTimeout\":\"2s\",\"lbPolicy\":\"CLUSTER_PROVIDED\",\"name\":\"ingress-cluster-tls\",\"transportSocket\":{\"name\":\"cilium.tls_wrapper\",\"typedConfig\":{\"@type\":\"type.googleapis.com/cilium.UpstreamTlsWrapperContext\"}},\"type\":\"ORIGINAL_DST\",\"typedExtensionProtocolOptions\":{\"envoy.extensions.upstreams.http.v3.HttpProtocolOptions\":{\"@type\":\"type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions\",\"commonHttpProtocolOptions\":{\"idleTimeout\":\"60s\",\"maxConnectionDuration\":\"0s\",\"maxRequestsPerConnection\":0},\"upstreamHttpProtocolOptions\":{},\"useDownstreamProtocolConfig\":{}}}},{\"connectTimeout\":\"2s\",\"loadAssignment\":{\"clusterName\":\"xds-grpc-cilium\",\"endpoints\":[{\"lbEndpoints\":[{\"endpoint\":{\"address\":{\"pipe\":{\"path\":\"/var/run/cilium/envoy/sockets/xds.sock\"}}}}]}]},\"name\":\"xds-grpc-cilium\",\"type\":\"STATIC\",\"typedExtensionProtocolOptions\":{\"envoy.extensions.upstreams.http.v3.HttpProtocolOptions\":{\"@type\":\"type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions\",\"explicitHttpConfig\":{\"http2ProtocolOptions\":{}}}}},{\"connectTimeout\":\"2s\",\"loadAssignment\":{\"clusterName\":\"/envoy-admin\",\"endpoints\":[{\"lbEndpoints\":[{\"endpoint\":{\"address\":{\"pipe\":{\"path\":\"/var/run/cilium/envoy/sockets/admin.sock\"}}}}]}]},\"name\":\"/envoy-admin\",\"type\":\"STATIC\"}],\"listeners\":[{\"address\":{\"socketAddress\":{\"address\":\"0.0.0.0\",\"portValue\":9964}},\"filterChains\":[{\"filters\":[{\"name\":\"envoy.filters.network.http_connection_manager\",\"typedConfig\":{\"@type\":\"type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager\",\"httpFilters\":[{\"name\":\"envoy.filters.http.router\",\"typedConfig\":{\"@type\":\"type.googleapis.com/envoy.extensions.filters.http.router.v3.Router\"}}],\"internalAddressConfig\":{\"cidrRanges\":[{\"addressPrefix\":\"10.0.0.0\",\"prefixLen\":8},{\"addressPrefix\":\"172.16.0.0\",\"prefixLen\":12},{\"addressPrefix\":\"192.168.0.0\",\"prefixLen\":16},{\"addressPrefix\":\"127.0.0.1\",\"prefixLen\":32}]},\"routeConfig\":{\"virtualHosts\":[{\"domains\":[\"*\"],\"name\":\"prometheus_metrics_route\",\"routes\":[{\"match\":{\"prefix\":\"/metrics\"},\"name\":\"prometheus_metrics_route\",\"route\":{\"cluster\":\"/envoy-admin\",\"prefixRewrite\":\"/stats/prometheus\"}}]}]},\"statPrefix\":\"envoy-prometheus-metrics-listener\",\"streamIdleTimeout\":\"300s\"}}]}],\"name\":\"envoy-prometheus-metrics-listener\"},{\"address\":{\"socketAddress\":{\"address\":\"127.0.0.1\",\"portValue\":9878}},\"filterChains\":[{\"filters\":[{\"name\":\"envoy.filters.network.http_connection_manager\",\"typedConfig\":{\"@type\":\"type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager\",\"httpFilters\":[{\"name\":\"envoy.filters.http.router\",\"typedConfig\":{\"@type\":\"type.googleapis.com/envoy.extensions.filters.http.router.v3.Router\"}}],\"internalAddressConfig\":{\"cidrRanges\":[{\"addressPrefix\":\"10.0.0.0\",\"prefixLen\":8},{\"addressPrefix\":\"172.16.0.0\",\"prefixLen\":12},{\"addressPrefix\":\"192.168.0.0\",\"prefixLen\":16},{\"addressPrefix\":\"127.0.0.1\",\"prefixLen\":32}]},\"routeConfig\":{\"virtual_hosts\":[{\"domains\":[\"*\"],\"name\":\"health\",\"routes\":[{\"match\":{\"prefix\":\"/healthz\"},\"name\":\"health\",\"route\":{\"cluster\":\"/envoy-admin\",\"prefixRewrite\":\"/ready\"}}]}]},\"statPrefix\":\"envoy-health-listener\",\"streamIdleTimeout\":\"300s\"}}]}],\"name\":\"envoy-health-listener\"}]}}\n\n---\n#
+    Source: cilium/templates/cilium-agent/clusterrole.yaml\napiVersion: rbac.authorization.k8s.io/v1\nkind:
+    ClusterRole\nmetadata:\n  name: cilium\n  labels:\n    app.kubernetes.io/part-of:
+    cilium\nrules:\n- apiGroups:\n  - networking.k8s.io\n  resources:\n  - networkpolicies\n
+    \ verbs:\n  - get\n  - list\n  - watch\n- apiGroups:\n  - discovery.k8s.io\n  resources:\n
+    \ - endpointslices\n  verbs:\n  - get\n  - list\n  - watch\n- apiGroups:\n  -
+    \"\"\n  resources:\n  - namespaces\n  - services\n  - pods\n  - endpoints\n  -
+    nodes\n  verbs:\n  - get\n  - list\n  - watch\n- apiGroups:\n  - apiextensions.k8s.io\n
+    \ resources:\n  - customresourcedefinitions\n  verbs:\n  - list\n  - watch\n  #
+    This is used when validating policies in preflight. This will need to stay\n  #
+    until we figure out how to avoid \"get\" inside the preflight, and then\n  # should
+    be removed ideally.\n  - get\n- apiGroups:\n  - cilium.io\n  resources:\n  - ciliumloadbalancerippools\n
+    \ - ciliumbgpnodeconfigs\n  - ciliumbgpadvertisements\n  - ciliumbgppeerconfigs\n
+    \ - ciliumclusterwideenvoyconfigs\n  - ciliumclusterwidenetworkpolicies\n  - ciliumegressgatewaypolicies\n
+    \ - ciliumendpoints\n  - ciliumendpointslices\n  - ciliumenvoyconfigs\n  - ciliumidentities\n
+    \ - ciliumlocalredirectpolicies\n  - ciliumnetworkpolicies\n  - ciliumnodes\n
+    \ - ciliumnodeconfigs\n  - ciliumcidrgroups\n  - ciliuml2announcementpolicies\n
+    \ - ciliumpodippools\n  verbs:\n  - list\n  - watch\n- apiGroups:\n  - cilium.io\n
+    \ resources:\n  - ciliumidentities\n  - ciliumendpoints\n  - ciliumnodes\n  verbs:\n
+    \ - create\n- apiGroups:\n  - cilium.io\n  # To synchronize garbage collection
+    of such resources\n  resources:\n  - ciliumidentities\n  verbs:\n  - update\n-
+    apiGroups:\n  - cilium.io\n  resources:\n  - ciliumendpoints\n  verbs:\n  - delete\n
+    \ - get\n- apiGroups:\n  - cilium.io\n  resources:\n  - ciliumnodes\n  - ciliumnodes/status\n
+    \ verbs:\n  - get\n  - update\n- apiGroups:\n  - cilium.io\n  resources:\n  -
+    ciliumendpoints/status\n  - ciliumendpoints\n  - ciliuml2announcementpolicies/status\n
+    \ - ciliumbgpnodeconfigs/status\n  verbs:\n  - patch\n\n---\n# Source: cilium/templates/cilium-operator/clusterrole.yaml\napiVersion:
+    rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata:\n  name: cilium-operator\n
+    \ labels:\n    app.kubernetes.io/part-of: cilium\nrules:\n- apiGroups:\n  - \"\"\n
+    \ resources:\n  - pods\n  verbs:\n  - get\n  - list\n  - watch\n  # to automatically
+    delete [core|kube]dns pods so that are starting to being\n  # managed by Cilium\n
+    \ - delete\n- apiGroups:\n  - \"\"\n  resources:\n  - configmaps\n  resourceNames:\n
+    \ - cilium-config\n  verbs:\n   # allow patching of the configmap to set annotations\n
+    \ - patch\n- apiGroups:\n  - \"\"\n  resources:\n  - nodes\n  verbs:\n  - list\n
+    \ - watch\n- apiGroups:\n  - \"\"\n  resources:\n  # To remove node taints\n  -
+    nodes\n  # To set NetworkUnavailable false on startup\n  - nodes/status\n  verbs:\n
+    \ - patch\n- apiGroups:\n  - discovery.k8s.io\n  resources:\n  - endpointslices\n
+    \ verbs:\n  - get\n  - list\n  - watch\n- apiGroups:\n  - \"\"\n  resources:\n
+    \ # to perform LB IP allocation for BGP\n  - services/status\n  verbs:\n  - update\n
+    \ - patch\n- apiGroups:\n  - \"\"\n  resources:\n  # to check apiserver connectivity\n
+    \ - namespaces\n  - secrets\n  verbs:\n  - get\n  - list\n  - watch\n- apiGroups:\n
+    \ - \"\"\n  resources:\n  # to perform the translation of a CNP that contains
+    `ToGroup` to its endpoints\n  - services\n  - endpoints\n  verbs:\n  - get\n  -
+    list\n  - watch\n- apiGroups:\n  - cilium.io\n  resources:\n  - ciliumnetworkpolicies\n
+    \ - ciliumclusterwidenetworkpolicies\n  verbs:\n  # Create auto-generated CNPs
+    and CCNPs from Policies that have 'toGroups'\n  - create\n  - update\n  - deletecollection\n
+    \ # To update the status of the CNPs and CCNPs\n  - patch\n  - get\n  - list\n
+    \ - watch\n- apiGroups:\n  - cilium.io\n  resources:\n  - ciliumnetworkpolicies/status\n
+    \ - ciliumclusterwidenetworkpolicies/status\n  verbs:\n  # Update the auto-generated
+    CNPs and CCNPs status.\n  - patch\n  - update\n- apiGroups:\n  - cilium.io\n  resources:\n
+    \ - ciliumendpoints\n  - ciliumidentities\n  verbs:\n  # To perform garbage collection
+    of such resources\n  - delete\n  - list\n  - watch\n- apiGroups:\n  - cilium.io\n
+    \ resources:\n  - ciliumidentities\n  verbs:\n  # To synchronize garbage collection
+    of such resources\n  - update\n- apiGroups:\n  - cilium.io\n  resources:\n  -
+    ciliumnodes\n  verbs:\n  - create\n  - update\n  - get\n  - list\n  - watch\n
+    \   # To perform CiliumNode garbage collector\n  - delete\n- apiGroups:\n  - cilium.io\n
+    \ resources:\n  - ciliumnodes/status\n  verbs:\n  - update\n- apiGroups:\n  -
+    cilium.io\n  resources:\n  - ciliumendpointslices\n  - ciliumenvoyconfigs\n  -
+    ciliumbgppeerconfigs\n  - ciliumbgpadvertisements\n  - ciliumbgpnodeconfigs\n
+    \ verbs:\n  - create\n  - update\n  - get\n  - list\n  - watch\n  - delete\n  -
+    patch\n- apiGroups:\n  - cilium.io\n  resources:\n  - ciliumbgpclusterconfigs/status\n
+    \ - ciliumbgppeerconfigs/status\n  verbs:\n  - update\n- apiGroups:\n  - apiextensions.k8s.io\n
+    \ resources:\n  - customresourcedefinitions\n  verbs:\n  - create\n  - get\n  -
+    list\n  - watch\n- apiGroups:\n  - apiextensions.k8s.io\n  resources:\n  - customresourcedefinitions\n
+    \ verbs:\n  - update\n  resourceNames:\n  - ciliumloadbalancerippools.cilium.io\n
+    \ - ciliumbgpclusterconfigs.cilium.io\n  - ciliumbgppeerconfigs.cilium.io\n  -
+    ciliumbgpadvertisements.cilium.io\n  - ciliumbgpnodeconfigs.cilium.io\n  - ciliumbgpnodeconfigoverrides.cilium.io\n
+    \ - ciliumclusterwideenvoyconfigs.cilium.io\n  - ciliumclusterwidenetworkpolicies.cilium.io\n
+    \ - ciliumegressgatewaypolicies.cilium.io\n  - ciliumendpoints.cilium.io\n  -
+    ciliumendpointslices.cilium.io\n  - ciliumenvoyconfigs.cilium.io\n  - ciliumidentities.cilium.io\n
+    \ - ciliumlocalredirectpolicies.cilium.io\n  - ciliumnetworkpolicies.cilium.io\n
+    \ - ciliumnodes.cilium.io\n  - ciliumnodeconfigs.cilium.io\n  - ciliumcidrgroups.cilium.io\n
+    \ - ciliuml2announcementpolicies.cilium.io\n  - ciliumpodippools.cilium.io\n  -
+    ciliumgatewayclassconfigs.cilium.io\n- apiGroups:\n  - cilium.io\n  resources:\n
+    \ - ciliumloadbalancerippools\n  - ciliumpodippools\n  - ciliumbgpclusterconfigs\n
+    \ - ciliumbgpnodeconfigoverrides\n  - ciliumbgppeerconfigs\n  verbs:\n  - get\n
+    \ - list\n  - watch\n- apiGroups:\n    - cilium.io\n  resources:\n    - ciliumpodippools\n
+    \ verbs:\n    - create\n- apiGroups:\n  - cilium.io\n  resources:\n  - ciliumloadbalancerippools/status\n
+    \ verbs:\n  - patch\n# For cilium-operator running in HA mode.\n#\n# Cilium operator
+    running in HA mode requires the use of ResourceLock for Leader Election\n# between
+    multiple running instances.\n# The preferred way of doing this is to use LeasesResourceLock
+    as edits to Leases are less\n# common and fewer objects in the cluster watch \"all
+    Leases\".\n- apiGroups:\n  - coordination.k8s.io\n  resources:\n  - leases\n  verbs:\n
+    \ - create\n  - get\n  - update\n- apiGroups:\n  - cilium.io\n  resources:\n  -
+    ciliumendpointslices\n  verbs:\n  - deletecollection\n\n---\n# Source: cilium/templates/cilium-agent/clusterrolebinding.yaml\napiVersion:
+    rbac.authorization.k8s.io/v1\nkind: ClusterRoleBinding\nmetadata:\n  name: cilium\n
+    \ labels:\n    app.kubernetes.io/part-of: cilium\nroleRef:\n  apiGroup: rbac.authorization.k8s.io\n
+    \ kind: ClusterRole\n  name: cilium\nsubjects:\n- kind: ServiceAccount\n  name:
+    \"cilium\"\n  namespace: kube-system\n\n---\n# Source: cilium/templates/cilium-operator/clusterrolebinding.yaml\napiVersion:
+    rbac.authorization.k8s.io/v1\nkind: ClusterRoleBinding\nmetadata:\n  name: cilium-operator\n
+    \ labels:\n    app.kubernetes.io/part-of: cilium\nroleRef:\n  apiGroup: rbac.authorization.k8s.io\n
+    \ kind: ClusterRole\n  name: cilium-operator\nsubjects:\n- kind: ServiceAccount\n
+    \ name: \"cilium-operator\"\n  namespace: kube-system\n\n---\n# Source: cilium/templates/cilium-agent/role.yaml\napiVersion:
+    rbac.authorization.k8s.io/v1\nkind: Role\nmetadata:\n  name: cilium-config-agent\n
+    \ namespace: kube-system\n  labels:\n    app.kubernetes.io/part-of: cilium\nrules:\n-
+    apiGroups:\n  - \"\"\n  resources:\n  - configmaps\n  verbs:\n  - get\n  - list\n
+    \ - watch\n\n---\n# Source: cilium/templates/cilium-agent/role.yaml\napiVersion:
+    rbac.authorization.k8s.io/v1\nkind: Role\nmetadata:\n  name: cilium-tlsinterception-secrets\n
+    \ namespace: \"cilium-secrets\"\n  labels:\n    app.kubernetes.io/part-of: cilium\nrules:\n-
+    apiGroups:\n  - \"\"\n  resources:\n  - secrets\n  verbs:\n  - get\n  - list\n
+    \ - watch\n\n---\n# Source: cilium/templates/cilium-operator/role.yaml\napiVersion:
+    rbac.authorization.k8s.io/v1\nkind: Role\nmetadata:\n  name: cilium-operator-tlsinterception-secrets\n
+    \ namespace: \"cilium-secrets\"\n  labels:\n    app.kubernetes.io/part-of: cilium\nrules:\n-
+    apiGroups:\n  - \"\"\n  resources:\n  - secrets\n  verbs:\n  - create\n  - delete\n
+    \ - update\n  - patch\n\n---\n# Source: cilium/templates/cilium-operator/role.yaml\napiVersion:
+    rbac.authorization.k8s.io/v1\nkind: Role\nmetadata:\n  name: cilium-operator-ztunnel\n
+    \ namespace: kube-system\n  labels:\n    app.kubernetes.io/part-of: cilium\nrules:\n#
+    ZTunnel DaemonSet management permissions\n# Note: These permissions must always
+    be granted (not conditional on encryption.type)\n# because the controller needs
+    to clean up stale DaemonSets when ztunnel is disabled.\n- apiGroups:\n  - apps\n
+    \ resources:\n  - daemonsets\n  verbs:\n  - create\n  - delete\n  - get\n  - list\n
+    \ - watch\n\n---\n# Source: cilium/templates/hubble/tls-cronjob/role.yaml\napiVersion:
+    rbac.authorization.k8s.io/v1\nkind: Role\nmetadata:\n  name: hubble-generate-certs\n
+    \ namespace: kube-system\n  labels:\n    app.kubernetes.io/part-of: cilium\n\nrules:\n
+    \ - apiGroups:\n      - \"\"\n    resources:\n      - secrets\n    verbs:\n      -
+    create\n  - apiGroups:\n      - \"\"\n    resources:\n      - secrets\n    resourceNames:\n
+    \     - hubble-server-certs\n      - hubble-relay-client-certs\n      - hubble-relay-server-certs\n
+    \     - hubble-metrics-server-certs\n      - hubble-ui-client-certs\n    verbs:\n
+    \     - update\n  - apiGroups:\n      - \"\"\n    resources:\n      - secrets\n
+    \   resourceNames:\n      - cilium-ca\n    verbs:\n      - get\n      - update\n\n---\n#
+    Source: cilium/templates/cilium-agent/rolebinding.yaml\napiVersion: rbac.authorization.k8s.io/v1\nkind:
+    RoleBinding\nmetadata:\n  name: cilium-config-agent\n  namespace: kube-system\n
+    \ labels:\n    app.kubernetes.io/part-of: cilium\nroleRef:\n  apiGroup: rbac.authorization.k8s.io\n
+    \ kind: Role\n  name: cilium-config-agent\nsubjects:\n  - kind: ServiceAccount\n
+    \   name: \"cilium\"\n    namespace: kube-system\n\n---\n# Source: cilium/templates/cilium-agent/rolebinding.yaml\napiVersion:
+    rbac.authorization.k8s.io/v1\nkind: RoleBinding\nmetadata:\n  name: cilium-tlsinterception-secrets\n
+    \ namespace: \"cilium-secrets\"\n  labels:\n    app.kubernetes.io/part-of: cilium\nroleRef:\n
+    \ apiGroup: rbac.authorization.k8s.io\n  kind: Role\n  name: cilium-tlsinterception-secrets\nsubjects:\n-
+    kind: ServiceAccount\n  name: \"cilium\"\n  namespace: kube-system\n\n---\n# Source:
+    cilium/templates/cilium-operator/rolebinding.yaml\napiVersion: rbac.authorization.k8s.io/v1\nkind:
+    RoleBinding\nmetadata:\n  name: cilium-operator-tlsinterception-secrets\n  namespace:
+    \"cilium-secrets\"\n  labels:\n    app.kubernetes.io/part-of: cilium\nroleRef:\n
+    \ apiGroup: rbac.authorization.k8s.io\n  kind: Role\n  name: cilium-operator-tlsinterception-secrets\nsubjects:\n-
+    kind: ServiceAccount\n  name: \"cilium-operator\"\n  namespace: kube-system\n\n---\n#
+    Source: cilium/templates/cilium-operator/rolebinding.yaml\napiVersion: rbac.authorization.k8s.io/v1\nkind:
+    RoleBinding\nmetadata:\n  name: cilium-operator-ztunnel\n  namespace: kube-system\n
+    \ labels:\n    app.kubernetes.io/part-of: cilium\nroleRef:\n  apiGroup: rbac.authorization.k8s.io\n
+    \ kind: Role\n  name: cilium-operator-ztunnel\nsubjects:\n- kind: ServiceAccount\n
+    \ name: \"cilium-operator\"\n  namespace: kube-system\n\n---\n# Source: cilium/templates/hubble/tls-cronjob/rolebinding.yaml\napiVersion:
+    rbac.authorization.k8s.io/v1\nkind: RoleBinding\nmetadata:\n  name: hubble-generate-certs\n
+    \ namespace: kube-system\n  labels:\n    app.kubernetes.io/part-of: cilium\n\nroleRef:\n
+    \ apiGroup: rbac.authorization.k8s.io\n  kind: Role\n  name: hubble-generate-certs\nsubjects:\n-
+    kind: ServiceAccount\n  name: \"hubble-generate-certs\"\n  namespace: kube-system\n\n---\n#
+    Source: cilium/templates/cilium-envoy/service.yaml\napiVersion: v1\nkind: Service\nmetadata:\n
+    \ name: cilium-envoy\n  namespace: kube-system\n  annotations:\n    prometheus.io/scrape:
+    \"true\"\n    prometheus.io/port: \"9964\"\n  labels:\n    k8s-app: cilium-envoy\n
+    \   app.kubernetes.io/name: cilium-envoy\n    app.kubernetes.io/part-of: cilium\n
+    \   io.cilium/app: proxy\nspec:\n  clusterIP: None\n  type: ClusterIP\n  selector:\n
+    \   k8s-app: cilium-envoy\n  ports:\n  - name: envoy-metrics\n    port: 9964\n
+    \   protocol: TCP\n    targetPort: 9964\n\n---\n# Source: cilium/templates/hubble/peer-service.yaml\napiVersion:
+    v1\nkind: Service\nmetadata:\n  name: hubble-peer\n  namespace: kube-system\n
+    \ labels:\n    k8s-app: cilium\n    app.kubernetes.io/part-of: cilium\n    app.kubernetes.io/name:
+    hubble-peer\n\nspec:\n  selector:\n    k8s-app: cilium\n  ports:\n  - name: peer-service\n
+    \   port: 443\n    protocol: TCP\n    targetPort: 4244\n  internalTrafficPolicy:
+    Local\n\n---\n# Source: cilium/templates/cilium-agent/daemonset.yaml\napiVersion:
+    apps/v1\nkind: DaemonSet\nmetadata:\n  name: cilium\n  namespace: kube-system\n
+    \ labels:\n    k8s-app: cilium\n    app.kubernetes.io/part-of: cilium\n    app.kubernetes.io/name:
+    cilium-agent\nspec:\n  selector:\n    matchLabels:\n      k8s-app: cilium\n  updateStrategy:\n
+    \   rollingUpdate:\n      maxUnavailable: 2\n    type: RollingUpdate\n  template:\n
+    \   metadata:\n      annotations:\n        kubectl.kubernetes.io/default-container:
+    cilium-agent\n      labels:\n        k8s-app: cilium\n        app.kubernetes.io/name:
+    cilium-agent\n        app.kubernetes.io/part-of: cilium\n    spec:\n      securityContext:\n
+    \       appArmorProfile:\n          type: Unconfined\n        seccompProfile:\n
+    \         type: Unconfined\n      containers:\n      - name: cilium-agent\n        image:
+    \"quay.io/cilium/cilium:v1.19.1@sha256:41f1f74a0000de8656f1de4088ea00c8f2d49d6edea579034c73c5fd5fe01792\"\n
+    \       imagePullPolicy: IfNotPresent\n        command:\n        - cilium-agent\n
+    \       args:\n        - --config-dir=/tmp/cilium/config-map\n        startupProbe:\n
+    \         httpGet:\n            host: \"127.0.0.1\"\n            path: /healthz\n
+    \           port: health\n            scheme: HTTP\n            httpHeaders:\n
+    \           - name: \"brief\"\n              value: \"true\"\n          failureThreshold:
+    300\n          periodSeconds: 2\n          successThreshold: 1\n          initialDelaySeconds:
+    5\n        livenessProbe:\n          httpGet:\n            host: \"127.0.0.1\"\n
+    \           path: /healthz\n            port: health\n            scheme: HTTP\n
+    \           httpHeaders:\n            - name: \"brief\"\n              value:
+    \"true\"\n            - name: \"require-k8s-connectivity\"\n              value:
+    \"false\"\n          periodSeconds: 30\n          successThreshold: 1\n          failureThreshold:
+    10\n          timeoutSeconds: 5\n        readinessProbe:\n          httpGet:\n
+    \           host: \"127.0.0.1\"\n            path: /healthz\n            port:
+    health\n            scheme: HTTP\n            httpHeaders:\n            - name:
+    \"brief\"\n              value: \"true\"\n          periodSeconds: 30\n          successThreshold:
+    1\n          failureThreshold: 3\n          timeoutSeconds: 5\n        env:\n
+    \       - name: K8S_NODE_NAME\n          valueFrom:\n            fieldRef:\n              apiVersion:
+    v1\n              fieldPath: spec.nodeName\n        - name: CILIUM_K8S_NAMESPACE\n
+    \         valueFrom:\n            fieldRef:\n              apiVersion: v1\n              fieldPath:
+    metadata.namespace\n        - name: CILIUM_CLUSTERMESH_CONFIG\n          value:
+    /var/lib/cilium/clustermesh/\n        - name: GOMEMLIMIT\n          valueFrom:\n
+    \           resourceFieldRef:\n              resource: limits.memory\n              divisor:
+    '1'\n        - name: KUBE_CLIENT_BACKOFF_BASE\n          value: \"1\"\n        -
+    name: KUBE_CLIENT_BACKOFF_DURATION\n          value: \"120\"\n        lifecycle:\n
+    \         postStart:\n            exec:\n              command:\n              -
+    \"bash\"\n              - \"-c\"\n              - |\n                    set -o
+    errexit\n                    set -o pipefail\n                    set -o nounset\n
+    \                   \n                    # When running in AWS ENI mode, it's
+    likely that 'aws-node' has\n                    # had a chance to install SNAT
+    iptables rules. These can result\n                    # in dropped traffic, so
+    we should attempt to remove them.\n                    # We do it using a 'postStart'
+    hook since this may need to run\n                    # for nodes which might have
+    already been init'ed but may still\n                    # have dangling rules.
+    This is safe because there are no\n                    # dependencies on anything
+    that is part of the startup script\n                    # itself, and can be safely
+    run multiple times per node (e.g. in\n                    # case of a restart).\n
+    \                   if [[ \"$(iptables-save | grep -E -c 'AWS-SNAT-CHAIN|AWS-CONNMARK-CHAIN')\"
+    != \"0\" ]];\n                    then\n                        echo 'Deleting
+    iptables rules created by the AWS CNI VPC plugin'\n                        iptables-save
+    | grep -E -v 'AWS-SNAT-CHAIN|AWS-CONNMARK-CHAIN' | iptables-restore\n                    fi\n
+    \                   echo 'Done!'\n                    \n          preStop:\n            exec:\n
+    \             command:\n              - /cni-uninstall.sh\n        ports:\n        -
+    name: health\n          containerPort: 9879\n          hostPort: 9879\n          protocol:
+    TCP\n        - name: peer-service\n          containerPort: 4244\n          hostPort:
+    4244\n          protocol: TCP\n        securityContext:\n          seLinuxOptions:\n
+    \           level: s0\n            type: spc_t\n          capabilities:\n            add:\n
+    \             - CHOWN\n              - KILL\n              - NET_ADMIN\n              -
+    NET_RAW\n              - IPC_LOCK\n              - SYS_MODULE\n              -
+    SYS_ADMIN\n              - SYS_RESOURCE\n              - DAC_OVERRIDE\n              -
+    FOWNER\n              - SETGID\n              - SETUID\n              - SYSLOG\n
+    \           drop:\n              - ALL\n        terminationMessagePolicy: FallbackToLogsOnError\n
+    \       volumeMounts:\n        - name: envoy-sockets\n          mountPath: /var/run/cilium/envoy/sockets\n
+    \         readOnly: false\n        # Unprivileged containers need to mount /proc/sys/net
+    from the host\n        # to have write access\n        - mountPath: /host/proc/sys/net\n
+    \         name: host-proc-sys-net\n        # Unprivileged containers need to mount
+    /proc/sys/kernel from the host\n        # to have write access\n        - mountPath:
+    /host/proc/sys/kernel\n          name: host-proc-sys-kernel\n        - name: bpf-maps\n
+    \         mountPath: /sys/fs/bpf\n          # Unprivileged containers can't set
+    mount propagation to bidirectional\n          # in this case we will mount the
+    bpf fs from an init container that\n          # is privileged and set the mount
+    propagation from host to container\n          # in Cilium.\n          mountPropagation:
+    HostToContainer\n        - name: cilium-run\n          mountPath: /var/run/cilium\n
+    \       - name: cilium-netns\n          mountPath: /var/run/cilium/netns\n          mountPropagation:
+    HostToContainer\n        - name: etc-cni-netd\n          mountPath: /host/etc/cni/net.d\n
+    \       - name: clustermesh-secrets\n          mountPath: /var/lib/cilium/clustermesh\n
+    \         readOnly: true\n          # Needed to be able to load kernel modules\n
+    \       - name: lib-modules\n          mountPath: /lib/modules\n          readOnly:
+    true\n        - name: xtables-lock\n          mountPath: /run/xtables.lock\n        -
+    name: hubble-tls\n          mountPath: /var/lib/cilium/tls/hubble\n          readOnly:
+    true\n        - name: tmp\n          mountPath: /tmp\n        \n      initContainers:\n
+    \     - name: config\n        image: \"quay.io/cilium/cilium:v1.19.1@sha256:41f1f74a0000de8656f1de4088ea00c8f2d49d6edea579034c73c5fd5fe01792\"\n
+    \       imagePullPolicy: IfNotPresent\n        command:\n        - cilium-dbg\n
+    \       - build-config\n        env:\n        - name: K8S_NODE_NAME\n          valueFrom:\n
+    \           fieldRef:\n              apiVersion: v1\n              fieldPath:
+    spec.nodeName\n        - name: CILIUM_K8S_NAMESPACE\n          valueFrom:\n            fieldRef:\n
+    \             apiVersion: v1\n              fieldPath: metadata.namespace\n        volumeMounts:\n
+    \       - name: tmp\n          mountPath: /tmp\n        terminationMessagePolicy:
+    FallbackToLogsOnError\n        securityContext:\n          capabilities:\n            add:\n
+    \             - NET_ADMIN\n            drop:\n              - ALL\n      # Required
+    to mount cgroup2 filesystem on the underlying Kubernetes node.\n      # We use
+    nsenter command with host's cgroup and mount namespaces enabled.\n      - name:
+    mount-cgroup\n        image: \"quay.io/cilium/cilium:v1.19.1@sha256:41f1f74a0000de8656f1de4088ea00c8f2d49d6edea579034c73c5fd5fe01792\"\n
+    \       imagePullPolicy: IfNotPresent\n        env:\n        - name: CGROUP_ROOT\n
+    \         value: /run/cilium/cgroupv2\n        - name: BIN_PATH\n          value:
+    /opt/cni/bin\n        command:\n        - sh\n        - -ec\n        # The statically
+    linked Go program binary is invoked to avoid any\n        # dependency on utilities
+    like sh and mount that can be missing on certain\n        # distros installed
+    on the underlying host. Copy the binary to the\n        # same directory where
+    we install cilium cni plugin so that exec permissions\n        # are available.\n
+    \       - |\n          cp /usr/bin/cilium-mount /hostbin/cilium-mount;\n          nsenter
+    --cgroup=/hostproc/1/ns/cgroup --mount=/hostproc/1/ns/mnt \"${BIN_PATH}/cilium-mount\"
+    $CGROUP_ROOT;\n          rm /hostbin/cilium-mount\n        volumeMounts:\n        -
+    name: hostproc\n          mountPath: /hostproc\n        - name: cni-path\n          mountPath:
+    /hostbin\n        terminationMessagePolicy: FallbackToLogsOnError\n        securityContext:\n
+    \         seLinuxOptions:\n            level: s0\n            type: spc_t\n          capabilities:\n
+    \           add:\n              - SYS_ADMIN\n              - SYS_CHROOT\n              -
+    SYS_PTRACE\n            drop:\n              - ALL\n      - name: apply-sysctl-overwrites\n
+    \       image: \"quay.io/cilium/cilium:v1.19.1@sha256:41f1f74a0000de8656f1de4088ea00c8f2d49d6edea579034c73c5fd5fe01792\"\n
+    \       imagePullPolicy: IfNotPresent\n        env:\n        - name: BIN_PATH\n
+    \         value: /opt/cni/bin\n        command:\n        - sh\n        - -ec\n
+    \       # The statically linked Go program binary is invoked to avoid any\n        #
+    dependency on utilities like sh that can be missing on certain\n        # distros
+    installed on the underlying host. Copy the binary to the\n        # same directory
+    where we install cilium cni plugin so that exec permissions\n        # are available.\n
+    \       - |\n          cp /usr/bin/cilium-sysctlfix /hostbin/cilium-sysctlfix;\n
+    \         nsenter --mount=/hostproc/1/ns/mnt \"${BIN_PATH}/cilium-sysctlfix\";\n
+    \         rm /hostbin/cilium-sysctlfix\n        volumeMounts:\n        - name:
+    hostproc\n          mountPath: /hostproc\n        - name: cni-path\n          mountPath:
+    /hostbin\n        terminationMessagePolicy: FallbackToLogsOnError\n        securityContext:\n
+    \         seLinuxOptions:\n            level: s0\n            type: spc_t\n          capabilities:\n
+    \           add:\n              - SYS_ADMIN\n              - SYS_CHROOT\n              -
+    SYS_PTRACE\n            drop:\n              - ALL\n      # Mount the bpf fs if
+    it is not mounted. We will perform this task\n      # from a privileged container
+    because the mount propagation bidirectional\n      # only works from privileged
+    containers.\n      - name: mount-bpf-fs\n        image: \"quay.io/cilium/cilium:v1.19.1@sha256:41f1f74a0000de8656f1de4088ea00c8f2d49d6edea579034c73c5fd5fe01792\"\n
+    \       imagePullPolicy: IfNotPresent\n        args:\n        - 'mount | grep
+    \"/sys/fs/bpf type bpf\" || mount -t bpf bpf /sys/fs/bpf'\n        command:\n
+    \       - /bin/bash\n        - -c\n        - --\n        terminationMessagePolicy:
+    FallbackToLogsOnError\n        securityContext:\n          privileged: true\n
+    \       volumeMounts:\n        - name: bpf-maps\n          mountPath: /sys/fs/bpf\n
+    \         mountPropagation: Bidirectional\n      - name: clean-cilium-state\n
+    \       image: \"quay.io/cilium/cilium:v1.19.1@sha256:41f1f74a0000de8656f1de4088ea00c8f2d49d6edea579034c73c5fd5fe01792\"\n
+    \       imagePullPolicy: IfNotPresent\n        command:\n        - /init-container.sh\n
+    \       env:\n        - name: CILIUM_ALL_STATE\n          valueFrom:\n            configMapKeyRef:\n
+    \             name: cilium-config\n              key: clean-cilium-state\n              optional:
+    true\n        - name: CILIUM_BPF_STATE\n          valueFrom:\n            configMapKeyRef:\n
+    \             name: cilium-config\n              key: clean-cilium-bpf-state\n
+    \             optional: true\n        - name: WRITE_CNI_CONF_WHEN_READY\n          valueFrom:\n
+    \           configMapKeyRef:\n              name: cilium-config\n              key:
+    write-cni-conf-when-ready\n              optional: true\n        terminationMessagePolicy:
+    FallbackToLogsOnError\n        securityContext:\n          seLinuxOptions:\n            level:
+    s0\n            type: spc_t\n          capabilities:\n            add:\n              -
+    NET_ADMIN\n              - SYS_MODULE\n              - SYS_ADMIN\n              -
+    SYS_RESOURCE\n            drop:\n              - ALL\n        volumeMounts:\n
+    \       - name: bpf-maps\n          mountPath: /sys/fs/bpf\n          # Required
+    to mount cgroup filesystem from the host to cilium agent pod\n        - name:
+    cilium-cgroup\n          mountPath: /run/cilium/cgroupv2\n          mountPropagation:
+    HostToContainer\n        - name: cilium-run\n          mountPath: /var/run/cilium
+    # wait-for-kube-proxy\n      # Install the CNI binaries in an InitContainer so
+    we don't have a writable host mount in the agent\n      - name: install-cni-binaries\n
+    \       image: \"quay.io/cilium/cilium:v1.19.1@sha256:41f1f74a0000de8656f1de4088ea00c8f2d49d6edea579034c73c5fd5fe01792\"\n
+    \       imagePullPolicy: IfNotPresent\n        command:\n          - \"/install-plugin.sh\"\n
+    \       resources:\n          limits:\n            cpu: 1\n            memory:
+    1Gi\n          requests:\n            cpu: 100m\n            memory: 10Mi\n        securityContext:\n
+    \         seLinuxOptions:\n            level: s0\n            type: spc_t\n          capabilities:\n
+    \           drop:\n              - ALL\n        terminationMessagePolicy: FallbackToLogsOnError\n
+    \       volumeMounts:\n          - name: cni-path\n            mountPath: /host/opt/cni/bin
+    # .Values.cni.install\n      restartPolicy: Always\n      priorityClassName: system-node-critical\n
+    \     serviceAccountName: \"cilium\"\n      automountServiceAccountToken: true\n
+    \     terminationGracePeriodSeconds: 1\n      hostNetwork: true\n      \n      affinity:\n
+    \       podAntiAffinity:\n          requiredDuringSchedulingIgnoredDuringExecution:\n
+    \         - labelSelector:\n              matchLabels:\n                k8s-app:
+    cilium\n            topologyKey: kubernetes.io/hostname\n      nodeSelector:\n
+    \       kubernetes.io/os: linux\n      tolerations:\n        - operator: Exists\n
+    \     volumes:\n      # For sharing configuration between the \"config\" initContainer
+    and the agent\n      - name: tmp\n        emptyDir: {}\n        # To keep state
+    between restarts / upgrades\n      - name: cilium-run\n        hostPath:\n          path:
+    /var/run/cilium\n          type: DirectoryOrCreate\n        # To exec into pod
+    network namespaces\n      - name: cilium-netns\n        hostPath:\n          path:
+    /var/run/netns\n          type: DirectoryOrCreate\n        # To keep state between
+    restarts / upgrades for bpf maps\n      - name: bpf-maps\n        hostPath:\n
+    \         path: /sys/fs/bpf\n          type: DirectoryOrCreate\n      # To mount
+    cgroup2 filesystem on the host or apply sysctlfix\n      - name: hostproc\n        hostPath:\n
+    \         path: /proc\n          type: Directory\n      # To keep state between
+    restarts / upgrades for cgroup2 filesystem\n      - name: cilium-cgroup\n        hostPath:\n
+    \         path: /run/cilium/cgroupv2\n          type: DirectoryOrCreate\n      #
+    To install cilium cni plugin in the host\n      - name: cni-path\n        hostPath:\n
+    \         path:  /opt/cni/bin\n          type: DirectoryOrCreate\n        # To
+    install cilium cni configuration in the host\n      - name: etc-cni-netd\n        hostPath:\n
+    \         path: /etc/cni/net.d\n          type: DirectoryOrCreate\n        # To
+    be able to load kernel modules\n      - name: lib-modules\n        hostPath:\n
+    \         path: /lib/modules\n        # To access iptables concurrently with other
+    processes (e.g. kube-proxy)\n      - name: xtables-lock\n        hostPath:\n          path:
+    /run/xtables.lock\n          type: FileOrCreate\n      # Sharing socket with Cilium
+    Envoy on the same node by using a host path\n      - name: envoy-sockets\n        hostPath:\n
+    \         path: \"/var/run/cilium/envoy/sockets\"\n          type: DirectoryOrCreate\n
+    \       # To read the clustermesh configuration\n      - name: clustermesh-secrets\n
+    \       projected:\n          # note: the leading zero means this number is in
+    octal representation: do not remove it\n          defaultMode: 0400\n          sources:\n
+    \         - secret:\n              name: cilium-clustermesh\n              optional:
+    true\n              # note: items are not explicitly listed here, since the entries
+    of this secret\n              # depend on the peers configured, and that would
+    cause a restart of all agents\n              # at every addition/removal. Leaving
+    the field empty makes each secret entry\n              # to be automatically projected
+    into the volume as a file whose name is the key.\n          - secret:\n              name:
+    clustermesh-apiserver-remote-cert\n              optional: true\n              items:\n
+    \             - key: tls.key\n                path: common-etcd-client.key\n              -
+    key: tls.crt\n                path: common-etcd-client.crt\n              - key:
+    ca.crt\n                path: common-etcd-client-ca.crt\n          # note: we
+    configure the volume for the kvstoremesh-specific certificate\n          # regardless
+    of whether KVStoreMesh is enabled or not, so that it can be\n          # automatically
+    mounted in case KVStoreMesh gets subsequently enabled,\n          # without requiring
+    an agent restart.\n          - secret:\n              name: clustermesh-apiserver-local-cert\n
+    \             optional: true\n              items:\n              - key: tls.key\n
+    \               path: local-etcd-client.key\n              - key: tls.crt\n                path:
+    local-etcd-client.crt\n              - key: ca.crt\n                path: local-etcd-client-ca.crt\n
+    \     - name: host-proc-sys-net\n        hostPath:\n          path: /proc/sys/net\n
+    \         type: Directory\n      - name: host-proc-sys-kernel\n        hostPath:\n
+    \         path: /proc/sys/kernel\n          type: Directory\n      - name: hubble-tls\n
+    \       projected:\n          # note: the leading zero means this number is in
+    octal representation: do not remove it\n          defaultMode: 0400\n          sources:\n
+    \         - secret:\n              name: hubble-server-certs\n              optional:
+    true\n              items:\n              - key: tls.crt\n                path:
+    server.crt\n              - key: tls.key\n                path: server.key\n              -
+    key: ca.crt\n                path: client-ca.crt\n      \n\n---\n# Source: cilium/templates/cilium-envoy/daemonset.yaml\napiVersion:
+    apps/v1\nkind: DaemonSet\nmetadata:\n  name: cilium-envoy\n  namespace: kube-system\n
+    \ labels:\n    k8s-app: cilium-envoy\n    app.kubernetes.io/part-of: cilium\n
+    \   app.kubernetes.io/name: cilium-envoy\n    name: cilium-envoy\nspec:\n  selector:\n
+    \   matchLabels:\n      k8s-app: cilium-envoy\n  \n  updateStrategy:\n    rollingUpdate:\n
+    \     maxUnavailable: 2\n    type: RollingUpdate\n  template:\n    metadata:\n
+    \     annotations:\n      labels:\n        k8s-app: cilium-envoy\n        name:
+    cilium-envoy\n        app.kubernetes.io/name: cilium-envoy\n        app.kubernetes.io/part-of:
+    cilium\n    spec:\n      securityContext:\n        appArmorProfile:\n          type:
+    Unconfined\n      \n      containers:\n      - name: cilium-envoy\n        image:
+    \"quay.io/cilium/cilium-envoy:v1.35.9-1770979049-232ed4a26881e4ab4f766f251f258ed424fff663@sha256:8188114a2768b5f49d6ce58e168b20d765e0fbc64eee0d83241aa2b150ccd788\"\n
+    \       imagePullPolicy: IfNotPresent\n        command:\n        - /usr/bin/cilium-envoy-starter\n
+    \       args:\n        - '--'\n        - '-c /var/run/cilium/envoy/bootstrap-config.json'\n
+    \       - '--base-id 0'\n        - '--log-level info'\n        \n        startupProbe:\n
+    \         httpGet:\n            host: \"127.0.0.1\"\n            path: /healthz\n
+    \           port: 9878\n            scheme: HTTP\n          failureThreshold:
+    105\n          periodSeconds: 2\n          successThreshold: 1\n          initialDelaySeconds:
+    5\n        livenessProbe:\n          httpGet:\n            host: \"127.0.0.1\"\n
+    \           path: /healthz\n            port: 9878\n            scheme: HTTP\n
+    \         periodSeconds: 30\n          successThreshold: 1\n          failureThreshold:
+    10\n          timeoutSeconds: 5\n        readinessProbe:\n          httpGet:\n
+    \           host: \"127.0.0.1\"\n            path: /healthz\n            port:
+    9878\n            scheme: HTTP\n          periodSeconds: 30\n          successThreshold:
+    1\n          failureThreshold: 3\n          timeoutSeconds: 5\n        env:\n
+    \       - name: K8S_NODE_NAME\n          valueFrom:\n            fieldRef:\n              apiVersion:
+    v1\n              fieldPath: spec.nodeName\n        - name: CILIUM_K8S_NAMESPACE\n
+    \         valueFrom:\n            fieldRef:\n              apiVersion: v1\n              fieldPath:
+    metadata.namespace\n        \n        ports:\n        - name: envoy-metrics\n
+    \         containerPort: 9964\n          hostPort: 9964\n          protocol: TCP\n
+    \       securityContext:\n          seLinuxOptions:\n            level: s0\n            type:
+    spc_t\n          capabilities:\n            add:\n              - NET_ADMIN\n
+    \             - SYS_ADMIN\n            drop:\n              - ALL\n        terminationMessagePolicy:
+    FallbackToLogsOnError\n        volumeMounts:\n        - name: envoy-sockets\n
+    \         mountPath: /var/run/cilium/envoy/sockets\n          readOnly: false\n
+    \       - name: envoy-artifacts\n          mountPath: /var/run/cilium/envoy/artifacts\n
+    \         readOnly: true\n        - name: envoy-config\n          mountPath: /var/run/cilium/envoy/\n
+    \         readOnly: true\n        - name: bpf-maps\n          mountPath: /sys/fs/bpf\n
+    \         mountPropagation: HostToContainer\n        \n      restartPolicy: Always\n
+    \     priorityClassName: system-node-critical\n      serviceAccountName: \"cilium-envoy\"\n
+    \     automountServiceAccountToken: true\n      terminationGracePeriodSeconds:
+    1\n      hostNetwork: true\n      \n      affinity:\n        nodeAffinity:\n          requiredDuringSchedulingIgnoredDuringExecution:\n
+    \           nodeSelectorTerms:\n            - matchExpressions:\n              -
+    key: cilium.io/no-schedule\n                operator: NotIn\n                values:\n
+    \               - \"true\"\n        podAffinity:\n          requiredDuringSchedulingIgnoredDuringExecution:\n
+    \         - labelSelector:\n              matchLabels:\n                k8s-app:
+    cilium\n            topologyKey: kubernetes.io/hostname\n        podAntiAffinity:\n
+    \         requiredDuringSchedulingIgnoredDuringExecution:\n          - labelSelector:\n
+    \             matchLabels:\n                k8s-app: cilium-envoy\n            topologyKey:
+    kubernetes.io/hostname\n      nodeSelector:\n        kubernetes.io/os: linux\n
+    \     tolerations:\n        - operator: Exists\n      volumes:\n      - name:
+    envoy-sockets\n        hostPath:\n          path: \"/var/run/cilium/envoy/sockets\"\n
+    \         type: DirectoryOrCreate\n      - name: envoy-artifacts\n        hostPath:\n
+    \         path: \"/var/run/cilium/envoy/artifacts\"\n          type: DirectoryOrCreate\n
+    \     - name: envoy-config\n        configMap:\n          name: \"cilium-envoy-config\"\n
+    \         # note: the leading zero means this number is in octal representation:
+    do not remove it\n          defaultMode: 0400\n          items:\n            -
+    key: bootstrap-config.json\n              path: bootstrap-config.json\n        #
+    To keep state between restarts / upgrades\n        # To keep state between restarts
+    / upgrades for bpf maps\n      - name: bpf-maps\n        hostPath:\n          path:
+    /sys/fs/bpf\n          type: DirectoryOrCreate\n    \n\n---\n# Source: cilium/templates/cilium-operator/deployment.yaml\napiVersion:
+    apps/v1\nkind: Deployment\nmetadata:\n  name: cilium-operator\n  namespace: kube-system\n
+    \ labels:\n    io.cilium/app: operator\n    name: cilium-operator\n    app.kubernetes.io/part-of:
+    cilium\n    app.kubernetes.io/name: cilium-operator\nspec:\n  # See docs on ServerCapabilities.LeasesResourceLock
+    in file pkg/k8s/version/version.go\n  # for more details.\n  replicas: 1\n  selector:\n
+    \   matchLabels:\n      io.cilium/app: operator\n      name: cilium-operator\n
+    \ # ensure operator update on single node k8s clusters, by using rolling update
+    with maxUnavailable=100% in case\n  # of one replica and no user configured Recreate
+    strategy.\n  # otherwise an update might get stuck due to the default maxUnavailable=50%
+    in combination with the\n  # podAntiAffinity which prevents deployments of multiple
+    operator replicas on the same node.\n  strategy:\n    rollingUpdate:\n      maxSurge:
+    25%\n      maxUnavailable: 100%\n    type: RollingUpdate\n  template:\n    metadata:\n
+    \     annotations:\n        prometheus.io/port: \"9963\"\n        prometheus.io/scrape:
+    \"true\"\n      labels:\n        io.cilium/app: operator\n        name: cilium-operator\n
+    \       app.kubernetes.io/part-of: cilium\n        app.kubernetes.io/name: cilium-operator\n
+    \   spec:\n      securityContext:\n        seccompProfile:\n          type: RuntimeDefault\n
+    \     containers:\n      - name: cilium-operator\n        image: \"quay.io/cilium/operator-generic:v1.19.1@sha256:e7278d763e448bf6c184b0682cf98cdca078d58a27e1b2f3c906792670aa211a\"\n
+    \       imagePullPolicy: IfNotPresent\n        command:\n        - cilium-operator-generic\n
+    \       args:\n        - --config-dir=/tmp/cilium/config-map\n        - --debug=$(CILIUM_DEBUG)\n
+    \       env:\n        - name: K8S_NODE_NAME\n          valueFrom:\n            fieldRef:\n
+    \             apiVersion: v1\n              fieldPath: spec.nodeName\n        -
+    name: CILIUM_K8S_NAMESPACE\n          valueFrom:\n            fieldRef:\n              apiVersion:
+    v1\n              fieldPath: metadata.namespace\n        - name: CILIUM_DEBUG\n
+    \         valueFrom:\n            configMapKeyRef:\n              key: debug\n
+    \             name: cilium-config\n              optional: true\n        ports:\n
+    \       - name: health\n          containerPort: 9234\n          hostPort: 9234\n
+    \       - name: prometheus\n          containerPort: 9963\n          hostPort:
+    9963\n          protocol: TCP\n        livenessProbe:\n          httpGet:\n            host:
+    \"127.0.0.1\"\n            path: /healthz\n            port: health\n            scheme:
+    HTTP\n          initialDelaySeconds: 60\n          periodSeconds: 10\n          timeoutSeconds:
+    3\n        readinessProbe:\n          httpGet:\n            host: \"127.0.0.1\"\n
+    \           path: /healthz\n            port: health\n            scheme: HTTP\n
+    \         initialDelaySeconds: 0\n          periodSeconds: 5\n          timeoutSeconds:
+    3\n          failureThreshold: 5\n        volumeMounts:\n        - name: cilium-config-path\n
+    \         mountPath: /tmp/cilium/config-map\n          readOnly: true\n        \n
+    \       securityContext:\n          allowPrivilegeEscalation: false\n          capabilities:\n
+    \           drop:\n            - ALL\n        terminationMessagePolicy: FallbackToLogsOnError\n
+    \     hostNetwork: true\n      restartPolicy: Always\n      priorityClassName:
+    system-cluster-critical\n      serviceAccountName: \"cilium-operator\"\n      automountServiceAccountToken:
+    true\n      # In HA mode, cilium-operator pods must not be scheduled on the same\n
+    \     # node as they will clash with each other.\n      affinity:\n        podAntiAffinity:\n
+    \         requiredDuringSchedulingIgnoredDuringExecution:\n          - labelSelector:\n
+    \             matchLabels:\n                io.cilium/app: operator\n            topologyKey:
+    kubernetes.io/hostname\n      nodeSelector:\n        kubernetes.io/os: linux\n
+    \     tolerations:\n        - key: node-role.kubernetes.io/control-plane\n          operator:
+    Exists\n        - key: node-role.kubernetes.io/master\n          operator: Exists\n
+    \       - key: node.kubernetes.io/not-ready\n          operator: Exists\n        -
+    key: node.cloudprovider.kubernetes.io/uninitialized\n          operator: Exists\n
+    \       - key: node.cilium.io/agent-not-ready\n          operator: Exists\n      \n
+    \     volumes:\n        # To read the configuration from the config map\n      -
+    name: cilium-config-path\n        configMap:\n          name: cilium-config\n
+    \     \n\n---\n# Source: cilium/templates/hubble/tls-cronjob/job.yaml\napiVersion:
+    batch/v1\nkind: Job\nmetadata:\n  name: hubble-generate-certs-f0b9008d75\n  namespace:
+    kube-system\n  labels:\n    k8s-app: hubble-generate-certs\n    app.kubernetes.io/name:
+    hubble-generate-certs\n    app.kubernetes.io/part-of: cilium\nspec:\n  template:\n
+    \   metadata:\n      labels:\n        k8s-app: hubble-generate-certs\n    spec:\n
+    \     securityContext:\n        seccompProfile:\n          type: RuntimeDefault\n
+    \     containers:\n        - name: certgen\n          image: \"quay.io/cilium/certgen:v0.3.2@sha256:19921f48ee7e2295ea4dca955878a6cd8d70e6d4219d08f688e866ece9d95d4d\"\n
+    \         imagePullPolicy: IfNotPresent\n          securityContext:\n            capabilities:\n
+    \             drop:\n              - ALL\n            allowPrivilegeEscalation:
+    false\n          command:\n            - \"/usr/bin/cilium-certgen\"\n          #
+    Because this is executed as a job, we pass the values as command\n          #
+    line args instead of via config map. This allows users to inspect\n          #
+    the values used in past runs by inspecting the completed pod.\n          args:\n
+    \           - \"--ca-generate=true\"\n            - \"--ca-reuse-secret\"\n            -
+    \"--ca-secret-namespace=kube-system\"\n            - \"--ca-secret-name=cilium-ca\"\n
+    \           - \"--ca-common-name=Cilium CA\"\n          env:\n            - name:
+    CILIUM_CERTGEN_CONFIG\n              value: |\n                certs:\n                -
+    name: hubble-server-certs\n                  namespace: kube-system\n                  commonName:
+    \"*.hydra-mgmt.hubble-grpc.cilium.io\"\n                  hosts:\n                  -
+    \"*.hydra-mgmt.hubble-grpc.cilium.io\"\n                  usage:\n                  -
+    signing\n                  - key encipherment\n                  - server auth\n
+    \                 - client auth\n                  validity: 8760h\n            \n
+    \     hostNetwork: false\n      serviceAccountName: \"hubble-generate-certs\"\n
+    \     automountServiceAccountToken: true\n      restartPolicy: OnFailure\n\n---\n#
+    Source: cilium/templates/hubble/tls-cronjob/cronjob.yaml\napiVersion: batch/v1\nkind:
+    CronJob\nmetadata:\n  name: hubble-generate-certs\n  namespace: kube-system\n
+    \ labels:\n    k8s-app: hubble-generate-certs\n    app.kubernetes.io/name: hubble-generate-certs\n
+    \   app.kubernetes.io/part-of: cilium\nspec:\n  schedule: \"0 0 1 */4 *\"\n  successfulJobsHistoryLimit:
+    3\n  failedJobsHistoryLimit: 1\n  concurrencyPolicy: Forbid\n  jobTemplate:\n
+    \   spec:\n      template:\n        metadata:\n          labels:\n            k8s-app:
+    hubble-generate-certs\n        spec:\n          securityContext:\n            seccompProfile:\n
+    \             type: RuntimeDefault\n          containers:\n            - name:
+    certgen\n              image: \"quay.io/cilium/certgen:v0.3.2@sha256:19921f48ee7e2295ea4dca955878a6cd8d70e6d4219d08f688e866ece9d95d4d\"\n
+    \             imagePullPolicy: IfNotPresent\n              securityContext:\n
+    \               capabilities:\n                  drop:\n                  - ALL\n
+    \               allowPrivilegeEscalation: false\n              command:\n                -
+    \"/usr/bin/cilium-certgen\"\n              # Because this is executed as a job,
+    we pass the values as command\n              # line args instead of via config
+    map. This allows users to inspect\n              # the values used in past runs
+    by inspecting the completed pod.\n              args:\n                - \"--ca-generate=true\"\n
+    \               - \"--ca-reuse-secret\"\n                - \"--ca-secret-namespace=kube-system\"\n
+    \               - \"--ca-secret-name=cilium-ca\"\n                - \"--ca-common-name=Cilium
+    CA\"\n              env:\n                - name: CILIUM_CERTGEN_CONFIG\n                  value:
+    |\n                    certs:\n                    - name: hubble-server-certs\n
+    \                     namespace: kube-system\n                      commonName:
+    \"*.hydra-mgmt.hubble-grpc.cilium.io\"\n                      hosts:\n                      -
+    \"*.hydra-mgmt.hubble-grpc.cilium.io\"\n                      usage:\n                      -
+    signing\n                      - key encipherment\n                      - server
+    auth\n                      - client auth\n                      validity: 8760h\n
+    \               \n          hostNetwork: false\n          serviceAccountName:
+    \"hubble-generate-certs\"\n          automountServiceAccountToken: true\n          restartPolicy:
+    OnFailure\n"
+kind: ConfigMap
+metadata:
+  labels:
+    cni.hydra.io/cilium: hydra-mgmt
+  name: hydra-mgmt-cilium
+  namespace: default
+---
+# Installs the CNI once the cluster's API is reachable. ApplyOnce: see the hydra source.
+apiVersion: addons.cluster.x-k8s.io/v1beta2
+kind: ClusterResourceSet
+metadata:
+  name: hydra-mgmt-cilium
+  namespace: default
+spec:
+  clusterSelector:
+    matchLabels:
+      cni.hydra.io/cilium: hydra-mgmt
+  resources:
+  - kind: ConfigMap
+    name: hydra-mgmt-cilium
+  strategy: ApplyOnce

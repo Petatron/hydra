@@ -1,7 +1,9 @@
 # hydra — agent guide
 
-> **Read first:** this repo is **empty on purpose so far** — a `README.md` and an Apache-2.0
-> `LICENSE`, nothing else. It has no defined scope yet. **Do not invent one.**
+> **Read first:** this repo is the **`hydra` CLI** — a Go command-line tool that installs and
+> manages on-prem Kubernetes clusters through Cluster API. It is bound by **ADR-001** (Notion,
+> *Hydra CLI is a stateless orchestrator, not a control plane*, Accepted 2026-11-14): the CLI
+> keeps **no state of its own**. Read the ADR before adding a command.
 >
 > PR titles are `[PET-xx] Title`. Never put AI attribution in commits or PR bodies, but **do**
 > prefix every PR comment you write with `**<Agent> (<Model>)**`. See
@@ -9,46 +11,62 @@
 
 ## What this repo is
 
-The namesake repository for Project Hydra on the `Petatron` org. Today it holds only a stub README
-and the licence. Every piece of working code, configuration, and documentation lives in one of the
-sibling repos — see the table in [Project context](#project-context) for which.
+The user-facing CLI for Project Hydra. It reads one input, `hydra.yaml`
+(`apiVersion: hydra.io/v1alpha1`, `kind: ClusterConfig`), and drives host tooling, kind, clusterctl
+and the Kubernetes API. The infrastructure provider it installs lives in
+`cluster-api-provider-hydra`; this repo consumes the provider's released artifacts and never imports
+its controller code.
 
-The most likely eventual home for the **`hydra` CLI** — ADR-001 describes it as a *stateless
-orchestrator*, the one architecture decision currently scoped `Product` rather than `Reference lab`
-— but that is a proposal, not a commitment, and nothing has been built.
+Commands, in delivery order (Linear project *Hydra — Reliability & Productization*):
 
-## Before writing anything here
+| Command | Ticket | State |
+|---|---|---|
+| `hydra cluster render` | PET-78 | implemented |
+| `hydra validate` | PET-79 | planned |
+| `hydra bootstrap` (needs the provider's clusterctl release, PET-80) | PET-81 | planned |
+| `hydra cluster create` / `plan` / `status` / `delete` | PET-82 | planned |
+| pivot (`create --self-hosted`) | PET-83 | planned |
 
-Because the repo has no established scope, the failure mode is an agent inferring one from the name
-and creating structure nobody agreed to. So:
+## Layout
 
-1. **Check Linear (`PET`) for an issue that explicitly targets this repository.** If no issue names
-   `hydra`, the work almost certainly belongs somewhere else.
-2. **Check the linked Notion page** for the decided shape before scaffolding anything — module
-   layout, command surface, and language are design decisions, not implementation details.
-3. **If neither exists, stop and ask.** Say what you think belongs here and why, rather than
-   creating it.
-
-Ask specifically before: adding a language toolchain or build system, adding CI workflows, importing
-code from another repo, or turning this into a monorepo. Any of those sets a direction that is hard
-to reverse.
-
-## Where the work actually is
-
-| If the change is about… | It belongs in |
+| Path | What |
 |---|---|
-| Provider code, CRDs, controllers, reconciliation | `cluster-api-provider-hydra` |
-| Runbooks, host prep, cluster bootstrap specs | `hydra-bootstrap` |
-| Argo CD Applications, cluster configuration | `hydra-gitops` |
-| Terraform for the legacy hand-built workers | `hydra-infra` |
-| Architecture, ADRs, design rationale, worklogs | Notion, not a repo |
-| Delivery status | Linear, not a repo |
+| `cmd/hydra/` | `main` — wiring only |
+| `internal/cli/` | cobra command tree |
+| `internal/config/` | `hydra.yaml` types, defaults and validation (`Parse` is the only entry) |
+| `internal/render/` | `hydra.yaml` → Cluster API manifests; `templates/cluster.yaml.tmpl` |
+| `internal/render/assets/cilium.yaml` | **generated** by `hack/gen-cilium.sh`; never edit by hand |
+| `internal/render/testdata/*.golden.yaml` | expected output for each file in `examples/` |
+| `examples/` | user-facing `hydra.yaml` examples; every one is golden-tested |
 
-## Housekeeping changes that are fine
+## Rules specific to this repo
 
-Licence, README, `CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`, issue and PR templates, `.gitignore` — the
-open-source surface of the org. Those do not need a design decision first, though they still need a
-PET issue and a normal PR.
+1. **No CLI-local state** (ADR-001). No database, cache, inventory, progress ledger or resume
+   checkpoint. An interrupted command must be retryable by rediscovering state from kind/Docker, the
+   Kubernetes API and clusterctl. Allowed persistence is exactly: the kubeconfig, an optional
+   defaults-only `~/.config/hydra/config.yaml`, explicitly requested exports, and the temporary kind
+   cluster itself (found again by name).
+2. **`render` is deterministic.** No clock, randomness, map-order or network input. Changing output is
+   a reviewed change: run `make golden`, and commit the regenerated golden files with the code.
+3. **Never render secrets.** Rendered manifests are shareable output. Credentials Secrets are
+   referenced by name and created by commands that read them from files (PET-81/82).
+4. **The templates descend from proven manifests.** `cluster.yaml.tmpl` is derived from the
+   provider's `docs/examples/`, which were verified on hardware. When you change a setting there,
+   find the provider ticket that proved it, and keep the two in step.
+5. **Pinned versions are code.** Kubernetes default, Cilium (`CILIUM_VERSION` in
+   `hack/gen-cilium.sh` and `render.CiliumVersion`) and kube-vip change only in a reviewed PR.
+6. **Generic over lab.** No default may encode the reference lab (its bridge, pool, addresses).
+   Lab values belong in `examples/` only, marked as such.
+
+## Development
+
+```bash
+make test          # unit + golden tests
+make golden        # regenerate golden files after an intended output change
+make lint          # golangci-lint (on Go 1.27 use GOTOOLCHAIN=go1.26.5 for now)
+make verify        # go.mod tidy + gofmt
+make cilium        # regenerate the embedded Cilium manifest (needs helm)
+```
 
 ## Project context
 
@@ -59,7 +77,7 @@ provider and workload-driven node autoscaling via Cluster Autoscaler. It lives o
 
 | Repo | Role |
 |---|---|
-| [`hydra`](https://github.com/Petatron/hydra) | Umbrella / namesake repo. Effectively empty today. |
+| [`hydra`](https://github.com/Petatron/hydra) | The **`hydra` CLI** (Go) — stateless orchestrator over Cluster API (ADR-001). |
 | [`cluster-api-provider-hydra`](https://github.com/Petatron/cluster-api-provider-hydra) | The Cluster API **infrastructure provider**. Go, kubebuilder. This is where product code lives. |
 | [`hydra-bootstrap`](https://github.com/Petatron/hydra-bootstrap) | **Documentation only.** Runbooks for standing up hosts, the CAPI management cluster, and workload clusters. |
 | [`hydra-gitops`](https://github.com/Petatron/hydra-gitops) | Argo CD configuration. **A merge to `main` changes live clusters.** |
