@@ -359,3 +359,18 @@ func TestTemplateHashIgnoresComments(t *testing.T) {
 		t.Error("a comment changed the template hash")
 	}
 }
+
+func TestEveryObjectCarriesTheClusterLabel(t *testing.T) {
+	for _, name := range examples {
+		c := load(t, "../../examples/"+name+".yaml")
+		out, err := Render(c, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, o := range documents(t, out) {
+			if o.Metadata.Labels[ClusterLabelKey] != c.Metadata.Name {
+				t.Errorf("%s: %s %s lacks %s=%s", name, o.Kind, o.Metadata.Name, ClusterLabelKey, c.Metadata.Name)
+			}
+		}
+	}
+}

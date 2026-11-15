@@ -34,6 +34,11 @@ const (
 	// its CNI. The value is the cluster's name, so each cluster's set (which
 	// carries that cluster's pod CIDR and MTU) matches only that cluster.
 	CNILabelKey = "cni.hydra.io/cilium"
+
+	// ClusterLabelKey is on every rendered object, valued with the cluster's
+	// name, so commands can find all of a cluster's objects (to delete what
+	// Cluster API does not own) without needing hydra.yaml to still validate.
+	ClusterLabelKey = "hydra.io/cluster"
 )
 
 const kindConfigMap = "ConfigMap"
@@ -82,6 +87,7 @@ type data struct {
 	MHCMaxUnhealthy int32
 	KubeVIPImage    string
 	CNILabelKey     string
+	ClusterLabelKey string
 	Pools           []pool
 }
 
@@ -122,11 +128,12 @@ func Render(c *config.ClusterConfig, opts Options) ([]byte, error) {
 		CLIVersion:      opts.CLIVersion,
 		Name:            c.Metadata.Name,
 		Namespace:       c.Metadata.Namespace,
-		CPName:          c.Metadata.Name + "-cp",
+		CPName:          ControlPlaneName(c.Metadata.Name),
 		CPSchedulable:   c.Spec.ControlPlane.Schedulable != nil && *c.Spec.ControlPlane.Schedulable,
 		MHCMaxUnhealthy: max(1, (c.Spec.ControlPlane.Replicas-1)/2),
 		KubeVIPImage:    KubeVIPImage,
 		CNILabelKey:     CNILabelKey,
+		ClusterLabelKey: ClusterLabelKey,
 	}
 	if ep := c.Spec.Network.ControlPlaneEndpoint; ep != "" {
 		host, port, err := config.SplitEndpoint(ep)
@@ -135,7 +142,10 @@ func Render(c *config.ClusterConfig, opts Options) ([]byte, error) {
 		}
 		d.HasEndpoint, d.EndpointHost, d.EndpointPort = true, host, port
 	}
-	d.CPTemplateName = d.CPName + "-" + contentHash(machineShape(c.Spec.ControlPlane.MachineSize))
+	// The hash inputs are part of the naming contract: changing them renames
+	// every template, which rolls every existing cluster's machines on its next
+	// create. Change them only with a migration note in the release.
+	d.CPTemplateName = d.CPName + "-" + contentHash(c.Metadata.Name+" "+machineShape(c.Spec.ControlPlane.MachineSize))
 	for _, p := range c.Spec.NodePools {
 		pl := pool{
 			Root:       d,
@@ -143,7 +153,9 @@ func Render(c *config.ClusterConfig, opts Options) ([]byte, error) {
 			ObjName:    c.Metadata.Name + "-" + p.Name,
 			NodeLabels: joinLabels(p.Labels),
 		}
-		pl.HMTName = pl.ObjName + "-" + contentHash(machineShape(p.MachineSize))
+		// The cluster name is in the hash, so two clusters whose object names
+		// happen to collide never share a template.
+		pl.HMTName = pl.ObjName + "-" + contentHash(c.Metadata.Name+" "+machineShape(p.MachineSize))
 		var kct bytes.Buffer
 		if err := tmpl.ExecuteTemplate(&kct, "kctSpec", pl); err != nil {
 			return nil, fmt.Errorf("rendering node pool %s: %w", p.Name, err)
@@ -169,6 +181,12 @@ func Render(c *config.ClusterConfig, opts Options) ([]byte, error) {
 	out.Write(cni)
 	return out.Bytes(), nil
 }
+
+// ControlPlaneName is the KubeadmControlPlane's name for a cluster.
+func ControlPlaneName(cluster string) string { return cluster + "-cp" }
+
+// CNIName is the CNI ConfigMap's and ClusterResourceSet's name for a cluster.
+func CNIName(cluster string) string { return cluster + "-cilium" }
 
 // machineShape is the content of a HydraMachineTemplate's spec.
 func machineShape(m config.MachineSize) string {
@@ -204,14 +222,14 @@ func renderCNI(c *config.ClusterConfig) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	name := c.Metadata.Name + "-cilium"
+	name := CNIName(c.Metadata.Name)
 	cm := map[string]any{
 		"apiVersion": "v1",
 		"kind":       kindConfigMap,
 		"metadata": map[string]any{
 			"name":      name,
 			"namespace": c.Metadata.Namespace,
-			"labels":    map[string]string{CNILabelKey: c.Metadata.Name},
+			"labels":    map[string]string{CNILabelKey: c.Metadata.Name, ClusterLabelKey: c.Metadata.Name},
 		},
 		"data": map[string]string{"cilium.yaml": manifest},
 	}
@@ -221,6 +239,7 @@ func renderCNI(c *config.ClusterConfig) ([]byte, error) {
 		"metadata": map[string]any{
 			"name":      name,
 			"namespace": c.Metadata.Namespace,
+			"labels":    map[string]string{ClusterLabelKey: c.Metadata.Name},
 		},
 		"spec": map[string]any{
 			"strategy": "ApplyOnce",

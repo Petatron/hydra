@@ -204,3 +204,17 @@ func TestLoadNameIgnoresTheSpec(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadNameIgnoresTheNamespace(t *testing.T) {
+	p := t.TempDir() + "/hydra.yaml"
+	bad := strings.Replace(valid, "name: c1", "name: c1\n  namespace: Not_Valid", 1)
+	if err := os.WriteFile(p, []byte(bad), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if name, err := LoadName(p); err != nil || name != "c1" {
+		t.Errorf("LoadName must not validate the namespace: %q %v", name, err)
+	}
+	if _, err := LoadMetadata(p); err == nil {
+		t.Error("LoadMetadata must still validate the namespace")
+	}
+}
