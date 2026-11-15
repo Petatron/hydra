@@ -12,6 +12,7 @@ on:
       - 'internal/**'
       - 'examples/**'
       - 'hack/e2e/**'
+      - 'Makefile'
       - 'go.mod'
       - 'go.sum'
       - '.github/workflows/e2e.yml'
