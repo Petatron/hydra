@@ -14,10 +14,20 @@ set -eu
 root=$(cd "$(dirname "$0")/../.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hydra-e2e.XXXXXX")
 hydra="$work/hydra"
-cfg="$root/hack/e2e/hydra.yaml"
 
+# A name unique to this run, so the test never reuses (and its cleanup never
+# deletes) a bootstrap cluster that already exists on this machine.
+name="e2e-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+cfg="$work/hydra.yaml"
+sed "s/^  name: e2e$/  name: $name/" "$root/hack/e2e/hydra.yaml" >"$cfg"
+grep -q "^  name: $name$" "$cfg"
+
+# Only a cluster this run created is ever deleted.
+created=0
 cleanup() {
-  "$hydra" bootstrap delete -f "$cfg" --force >/dev/null 2>&1 || true
+  if [ "$created" = 1 ]; then
+    "$hydra" bootstrap delete -f "$cfg" --force >/dev/null 2>&1 || true
+  fi
   # ${work:?} refuses to expand if work were ever empty.
   rm -r -- "${work:?}"
 }
@@ -36,7 +46,13 @@ openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
 openssl x509 -req -in "$work/client.csr" -CA "$pki/cacert.pem" -CAkey "$work/ca.key" \
   -CAcreateserial -out "$pki/clientcert.pem" -days 1 2>/dev/null
 
-echo "--- hydra bootstrap"
+if "$hydra" bootstrap kubeconfig -f "$cfg" >/dev/null 2>&1; then
+  echo "kind cluster hydra-bootstrap-$name already exists; refusing to touch it" >&2
+  exit 1
+fi
+
+echo "--- hydra bootstrap (hydra-bootstrap-$name)"
+created=1
 "$hydra" bootstrap -f "$cfg" --hypervisor-credentials "$pki"
 
 kubeconfig="$work/kubeconfig"
