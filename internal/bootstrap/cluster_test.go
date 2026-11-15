@@ -222,8 +222,12 @@ func TestFirstRunNeedsCredentialsBeforeCreating(t *testing.T) {
 }
 
 func TestComponentsURLIsPinned(t *testing.T) {
-	if !strings.Contains(HydraComponentsURL, "/releases/"+HydraVersion+"/") || strings.Contains(HydraComponentsURL, "latest") {
-		t.Errorf("components URL must name the pinned release: %s", HydraComponentsURL)
+	// clusterctl's repository form: .../releases/{tag}/{file}. Not "latest"
+	// (unpinned), and not "releases/download/" (a download link, which
+	// clusterctl would parse as version "download").
+	if !strings.HasPrefix(HydraComponentsURL, "https://github.com/Petatron/cluster-api-provider-hydra/releases/"+HydraVersion+"/") ||
+		strings.Contains(HydraComponentsURL, "latest") || strings.Contains(HydraComponentsURL, "/download/") {
+		t.Errorf("components URL must be clusterctl's repository URL for the pinned release: %s", HydraComponentsURL)
 	}
 }
 

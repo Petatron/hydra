@@ -32,6 +32,12 @@ const (
 	// HydraComponentsURL is where clusterctl finds the Hydra provider: the
 	// pinned release itself, so no "latest" lookup (and no GitHub API call to
 	// list releases) is needed.
+	//
+	// This is clusterctl's repository URL, not a download link: clusterctl
+	// requires the form github.com/{owner}/{repo}/releases/{latest|tag}/{file},
+	// reads the version from the segment after "releases", and itself fetches
+	// .../releases/download/{tag}/{file}. A ".../releases/download/..." URL
+	// here would make clusterctl take "download" as the version.
 	HydraComponentsURL = "https://github.com/Petatron/cluster-api-provider-hydra/releases/" + HydraVersion + "/infrastructure-components.yaml"
 
 	// CertManagerName keys cert-manager's version among installed providers.
