@@ -305,7 +305,7 @@ kind: KubeadmConfigTemplate
 metadata:
   # Named after its content, so a change rolls the pool instead of reaching
   # only machines created later.
-  name: "demo-system-aa727634"
+  name: "demo-system-cbd8e8d8"
   namespace: "demo"
 spec:
   template:
@@ -333,8 +333,8 @@ spec:
             - name: node-labels
               value: "hydra.io/pool=system"
       preKubeadmCommands:
-        # Two NICs, both on DHCP: pin the Node address to the site network, as
-        # the control plane does, instead of whichever default route wins.
+        # More than one NIC, each on DHCP: pin the Node address to
+        # enp1s0, as the control plane does, instead of whichever wins.
         - |
           NODE_IP=$(ip -4 -o addr show enp1s0 | awk '{print $4}' | cut -d/ -f1 | head -1)
           printf 'KUBELET_EXTRA_ARGS=--provider-id=hydra://libvirt/%s --node-ip=%s\n' \
@@ -374,7 +374,7 @@ spec:
         configRef:
           apiGroup: bootstrap.cluster.x-k8s.io
           kind: KubeadmConfigTemplate
-          name: "demo-system-aa727634"
+          name: "demo-system-cbd8e8d8"
       infrastructureRef:
         apiGroup: infrastructure.cluster.x-k8s.io
         kind: HydraMachineTemplate
@@ -398,7 +398,7 @@ kind: KubeadmConfigTemplate
 metadata:
   # Named after its content, so a change rolls the pool instead of reaching
   # only machines created later.
-  name: "demo-compute-eb81e9a2"
+  name: "demo-compute-c794414e"
   namespace: "demo"
 spec:
   template:
@@ -426,8 +426,8 @@ spec:
             - name: node-labels
               value: "hydra.io/pool=compute"
       preKubeadmCommands:
-        # Two NICs, both on DHCP: pin the Node address to the site network, as
-        # the control plane does, instead of whichever default route wins.
+        # More than one NIC, each on DHCP: pin the Node address to
+        # enp1s0, as the control plane does, instead of whichever wins.
         - |
           NODE_IP=$(ip -4 -o addr show enp1s0 | awk '{print $4}' | cut -d/ -f1 | head -1)
           printf 'KUBELET_EXTRA_ARGS=--provider-id=hydra://libvirt/%s --node-ip=%s\n' \
@@ -474,7 +474,7 @@ spec:
         configRef:
           apiGroup: bootstrap.cluster.x-k8s.io
           kind: KubeadmConfigTemplate
-          name: "demo-compute-eb81e9a2"
+          name: "demo-compute-c794414e"
       infrastructureRef:
         apiGroup: infrastructure.cluster.x-k8s.io
         kind: HydraMachineTemplate

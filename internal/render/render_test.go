@@ -316,3 +316,46 @@ func TestNodeInterfaceWarningOnlyWhenShared(t *testing.T) {
 		t.Errorf("on a managed network the control plane and both pools must pin --node-ip, found %d", strings.Count(string(wl), "--node-ip=%s"))
 	}
 }
+
+func TestWorkersPinNodeIPWithSeveralBridges(t *testing.T) {
+	c := load(t, "../../examples/workload-managed-network.yaml")
+	c.Spec.Network.ManagedNetwork = nil
+	c.Spec.Network.ControlPlaneEndpoint = "10.0.0.10"
+	c.Spec.Network.VIPInterface = "enp1s0"
+	c.Spec.Network.Bridges = []string{"br0", "br1"}
+	out, err := Render(c, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(out), "--node-ip=%s"); n != 3 {
+		t.Errorf("two bridges: the control plane and both pools must pin --node-ip, found %d", n)
+	}
+	c.Spec.Network.Bridges = []string{"br0"}
+	out, err = Render(c, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(out), "--node-ip=%s"); n != 1 {
+		t.Errorf("one NIC: only the control plane pins --node-ip (the proven pool template), found %d", n)
+	}
+}
+
+func TestTemplateHashIgnoresComments(t *testing.T) {
+	c := load(t, "../../examples/workload-managed-network.yaml")
+	pl := pool{Spec: c.Spec.NodePools[0], ObjName: "x"}
+	d := &data{ClusterConfig: c, Spec: &c.Spec}
+	pl.Root = d
+	var a bytes.Buffer
+	if err := tmpl.ExecuteTemplate(&a, "kctSpec", pl); err != nil {
+		t.Fatal(err)
+	}
+	commented := strings.Replace(a.String(), "      files:\n", "      # a new comment\n      files:\n", 1)
+	ja, err1 := yaml.YAMLToJSON(a.Bytes())
+	jb, err2 := yaml.YAMLToJSON([]byte(commented))
+	if err1 != nil || err2 != nil {
+		t.Fatal(err1, err2)
+	}
+	if contentHash(string(ja)) != contentHash(string(jb)) {
+		t.Error("a comment changed the template hash")
+	}
+}

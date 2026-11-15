@@ -148,7 +148,13 @@ func Render(c *config.ClusterConfig, opts Options) ([]byte, error) {
 		if err := tmpl.ExecuteTemplate(&kct, "kctSpec", pl); err != nil {
 			return nil, fmt.Errorf("rendering node pool %s: %w", p.Name, err)
 		}
-		pl.KCTName = pl.ObjName + "-" + contentHash(kct.String())
+		// Hash the object, not the text: a comment-only change in a later CLI
+		// release must not roll every pool.
+		obj, err := yaml.YAMLToJSON(kct.Bytes())
+		if err != nil {
+			return nil, fmt.Errorf("node pool %s: rendered KubeadmConfigTemplate is not valid YAML: %w", p.Name, err)
+		}
+		pl.KCTName = pl.ObjName + "-" + contentHash(string(obj))
 		d.Pools = append(d.Pools, pl)
 	}
 

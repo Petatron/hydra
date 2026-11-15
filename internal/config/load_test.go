@@ -114,6 +114,8 @@ func TestRejects(t *testing.T) {
 		{"dhcp on gateway", "    controlPlaneEndpoint: 10.0.0.10\n", "    managedNetwork:\n      name: n\n      subnet: 192.168.1.0/24\n      dhcpStart: 192.168.1.1\n      dhcpEnd: 192.168.1.20\n", "gateway"},
 		{"endpoint in dhcp range", "    controlPlaneEndpoint: 10.0.0.10\n", "    controlPlaneEndpoint: 192.168.1.50\n    managedNetwork:\n      name: n\n      subnet: 192.168.1.0/24\n      dhcpStart: 192.168.1.10\n      dhcpEnd: 192.168.1.100\n", "inside the DHCP range"},
 		{"pod overlaps managed", "    controlPlaneEndpoint: 10.0.0.10\n", "    podCIDR: 192.168.0.0/16\n    managedNetwork:\n      name: n\n      subnet: 192.168.1.0/24\n      dhcpStart: 192.168.1.10\n      dhcpEnd: 192.168.1.100\n", "overlaps the managed subnet"},
+		{"endpoint in service cidr", "10.0.0.10", "10.100.0.5", "inside serviceCIDR"},
+		{"endpoint in pod cidr", "10.0.0.10", "10.244.3.4", "inside podCIDR"},
 		{"dns endpoint with managed", "    controlPlaneEndpoint: 10.0.0.10\n", "    controlPlaneEndpoint: api.example.com\n    managedNetwork:\n      name: n\n      subnet: 192.168.1.0/24\n      dhcpStart: 192.168.1.10\n      dhcpEnd: 192.168.1.100\n", "vipInterface"},
 	}
 	for _, tc := range cases {

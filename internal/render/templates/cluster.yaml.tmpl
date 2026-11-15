@@ -431,9 +431,9 @@ spec:
               value: {{ q .NodeLabels }}
 {{- end }}
       preKubeadmCommands:
-{{- if .Root.Spec.Network.ManagedNetwork }}
-        # Two NICs, both on DHCP: pin the Node address to the site network, as
-        # the control plane does, instead of whichever default route wins.
+{{- if .Root.Spec.Network.MultipleNICs }}
+        # More than one NIC, each on DHCP: pin the Node address to
+        # {{ .Root.Spec.Network.NodeInterface }}, as the control plane does, instead of whichever wins.
         - |
           NODE_IP=$(ip -4 -o addr show {{ .Root.Spec.Network.NodeInterface }} | awk '{print $4}' | cut -d/ -f1 | head -1)
           printf 'KUBELET_EXTRA_ARGS=--provider-id=hydra://libvirt/%s --node-ip=%s\n' \

@@ -304,6 +304,23 @@ func (c *ClusterConfig) validateCIDRs(errs *fieldErrors) {
 	if svc, err := netip.ParsePrefix(n.ServiceCIDR); err == nil && svc.Bits() < 12 {
 		errs.add("spec.network.serviceCIDR", "%s is larger than the /12 kube-apiserver accepts", n.ServiceCIDR)
 	}
+	// kube-vip would hold an address Cilium or kube-proxy already owns. A DNS
+	// endpoint cannot be checked here.
+	if host, ok := n.endpointIP(); ok {
+		for _, f := range n.cidrFields() {
+			if p, err := netip.ParsePrefix(f.v); err == nil && p.Contains(host) {
+				errs.add("spec.network.controlPlaneEndpoint", "%s is inside %s %s", host, f.name, f.v)
+			}
+		}
+	}
+}
+
+// MultipleNICs reports whether machines get more than one interface (several
+// bridges, or a bridge plus a managed network), each with its own DHCP
+// address, so the Node address has to be pinned rather than left to the
+// kubelet's choice.
+func (n *NetworkSpec) MultipleNICs() bool {
+	return len(n.Bridges) > 1 || n.ManagedNetwork != nil
 }
 
 func (c *ClusterConfig) validateMachines(errs *fieldErrors) {
