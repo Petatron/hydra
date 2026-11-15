@@ -1,0 +1,81 @@
+name: Release
+
+# A v* tag publishes a GitHub Release carrying the hydra binaries for
+# linux/darwin x amd64/arm64 and their SHA256 checksums. A manual run builds
+# the same binaries as a workflow artifact and publishes nothing, so the
+# pipeline can be checked without cutting a release.
+#
+# Never runs on pull_request: a PR must not be able to publish.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  # Publishing re-runs the checks itself: the PR workflows do not run on tag
+  # pushes, so nothing else guarantees the tagged commit passed them.
+  verify:
+    name: Verify before publishing
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+      - run: make verify
+      - run: make test
+      - run: make lint
+
+  publish:
+    name: Build and publish
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the GitHub Release on a tag
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0   # git describe needs the tags for the version stamp
+      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Build binaries
+        run: make dist
+
+      - name: Check the version stamp
+        run: |
+          got="$(./dist/hydra-linux-amd64 version | head -1)"
+          echo "$got"
+          if [ "${{ github.ref_type }}" = "tag" ] && [ "$got" != "hydra ${{ github.ref_name }}" ]; then
+            echo "::error::binary reports '$got', expected 'hydra ${{ github.ref_name }}'"
+            exit 1
+          fi
+
+      - name: Upload binaries as an artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hydra-${{ github.ref_name }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create '${{ github.ref_name }}' dist/* \
+            --title '${{ github.ref_name }}' \
+            --generate-notes \
+            $(case '${{ github.ref_name }}' in *-*) echo --prerelease;; esac)

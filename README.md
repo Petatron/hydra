@@ -15,6 +15,10 @@ interrupted command can always be re-run.
 
 ## Install
 
+Download the binary for your platform from the
+[latest release](https://github.com/Petatron/hydra/releases/latest) (Linux and macOS, amd64 and
+arm64; `checksums.txt` holds their SHA256 sums), or build it:
+
 ```bash
 go install github.com/Petatron/hydra/cmd/hydra@latest
 ```

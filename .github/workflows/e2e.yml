@@ -1,0 +1,47 @@
+name: E2E
+
+# hydra against a real management cluster, with no lab: `hydra bootstrap`
+# creates a kind cluster and installs cert-manager, Cluster API and the Hydra
+# provider from its release; every example is then rendered and server-side
+# dry-run against it, so a template the CRDs or webhooks reject fails here.
+# See hack/e2e/run.sh.
+on:
+  pull_request:
+    paths:
+      - 'cmd/**'
+      - 'internal/**'
+      - 'examples/**'
+      - 'hack/e2e/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/e2e.yml'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+jobs:
+  e2e:
+    permissions:
+      contents: read
+    name: kind e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+      # clusterctl reads the provider's GitHub release metadata; the job token
+      # keeps it clear of the anonymous API rate limit shared by the runner.
+      - name: Run the e2e test
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: make e2e

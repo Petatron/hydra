@@ -1,0 +1,22 @@
+version: 2
+updates:
+  # Go modules: kind, clusterctl and controller-runtime move with Cluster API,
+  # so group the Kubernetes family to review one coherent bump at a time.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      kubernetes:
+        patterns:
+          - "k8s.io/*"
+          - "sigs.k8s.io/*"
+    open-pull-requests-limit: 5
+
+  # Actions stay pinned to commit SHAs; Dependabot updates the SHA and the
+  # version comment together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

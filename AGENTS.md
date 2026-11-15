@@ -69,7 +69,17 @@ make golden        # regenerate golden files after an intended output change
 make lint          # golangci-lint (on Go 1.27 use GOTOOLCHAIN=go1.26.5 for now)
 make verify        # go.mod tidy + gofmt
 make cilium        # regenerate the embedded Cilium manifest (needs helm)
+make e2e           # kind management cluster via `hydra bootstrap`, dry-run every example (needs Docker)
+make vuln          # govulncheck
+make actionlint    # lint .github/workflows
+make dist          # release binaries + checksums into dist/
 ```
+
+CI (`.github/workflows/`): `ci.yml` (verify, test, build, lint, govulncheck, actionlint) on every PR;
+`e2e.yml` (the kind e2e) on PRs touching code or examples and on main; `cilium-drift.yml` weekly
+and on renderer changes; `release.yml` publishes binaries on a `v*` tag (manual runs build an
+artifact only). Every job runs on GitHub-hosted runners. Actions are pinned by commit SHA;
+Dependabot keeps them and the Go modules current.
 
 ## Project context
 
