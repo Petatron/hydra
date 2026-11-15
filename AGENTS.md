@@ -81,6 +81,11 @@ and on renderer changes; `release.yml` publishes binaries on a `v*` tag (manual 
 artifact only). Every job runs on GitHub-hosted runners. Actions are pinned by commit SHA;
 Dependabot keeps them and the Go modules current.
 
+**The Go toolchain is pinned in `go.mod` (`toolchain go1.26.x`).** `actions/setup-go` installs it, so
+CI and release binaries build with the latest patch, not the bare `go 1.26.0` floor; on 1.26.0
+govulncheck finds 30 reachable standard-library vulnerabilities. Bump the patch when govulncheck
+reports a standard-library fix.
+
 ## Project context
 
 **Hydra** is an open-source on-prem Kubernetes lifecycle platform built on
