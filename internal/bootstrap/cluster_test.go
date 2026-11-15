@@ -17,6 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	clusterctl "sigs.k8s.io/cluster-api/cmd/clusterctl/client"
 	clusterctlconfig "sigs.k8s.io/cluster-api/cmd/clusterctl/client/config"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
@@ -279,5 +280,55 @@ func TestGetAndLabelSecret(t *testing.T) {
 	}
 	if _, ok := got.Labels[MoveLabel]; !ok || string(got.Data[ClientKeyFile]) != "c" {
 		t.Errorf("label not added, or data changed: %v %v", got.Labels, got.Data)
+	}
+}
+
+func TestInitOptionsNeverLetClusterctlDefault(t *testing.T) {
+	// Resuming with only the core provider missing: clusterctl would add the
+	// latest kubeadm providers to empty lists. The no-op entry stops that.
+	opts, err := initOptions("kc", []Provider{Providers()[0]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.CoreProvider != "cluster-api:"+CAPIVersion {
+		t.Errorf("core: %q", opts.CoreProvider)
+	}
+	for name, l := range map[string][]string{"bootstrap": opts.BootstrapProviders, "control-plane": opts.ControlPlaneProviders} {
+		if len(l) != 1 || l[0] != clusterctl.NoopProvider {
+			t.Errorf("%s list must be only the no-op entry, got %v", name, l)
+		}
+	}
+	all, err := initOptions("kc", Providers())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(all.BootstrapProviders, ",") != clusterctl.NoopProvider+",kubeadm:"+CAPIVersion ||
+		strings.Join(all.InfrastructureProviders, ",") != "hydra:"+HydraVersion {
+		t.Errorf("pinned providers must follow the no-op entry: %+v", all)
+	}
+}
+
+func TestCertManagerCheckedWithoutInventory(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	cm := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: "cert-manager", Name: "cert-manager",
+		Annotations: map[string]string{"cert-manager.clusterctl.cluster.x-k8s.io/version": "v1.17.0"}}}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cm).WithInterceptorFuncs(interceptor.Funcs{
+		List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*unstructured.UnstructuredList); ok {
+				return noKind("Provider") // clusterctl has never run
+			}
+			return cl.List(ctx, list, opts...)
+		},
+	}).Build()
+	got, err := newKubeCluster(c).InstalledProviders(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[CertManagerName] != "v1.17.0" {
+		t.Errorf("cert-manager must be reported even without clusterctl's inventory: %v", got)
 	}
 }

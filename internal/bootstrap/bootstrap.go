@@ -243,7 +243,11 @@ func (b *Bootstrapper) ensureProviders(ctx context.Context, cl Cluster) error {
 	if len(wrong) > 0 {
 		return fmt.Errorf("providers at unexpected versions (not changing them; delete the bootstrap cluster or use a matching hydra release): %s", strings.Join(wrong, "; "))
 	}
-	if len(missing) > 0 {
+	// cert-manager is installed by clusterctl init, not tracked in its
+	// inventory: with every provider present but cert-manager gone, run init
+	// with nothing to add, which restores the pinned cert-manager.
+	_, haveCertManager := installed[CertManagerName]
+	if len(missing) > 0 || !haveCertManager {
 		if err := b.install(ctx, cl, missing); err != nil {
 			return err
 		}
@@ -259,6 +263,9 @@ func (b *Bootstrapper) install(ctx context.Context, cl Cluster, missing []Provid
 	refs := make([]string, 0, len(missing))
 	for _, p := range missing {
 		refs = append(refs, p.Ref)
+	}
+	if len(refs) == 0 {
+		refs = append(refs, "no providers")
 	}
 	b.logf("installing %s (cert-manager %s)", strings.Join(refs, ", "), CertManagerVersion)
 	if err := cl.Init(ctx, missing); err != nil {

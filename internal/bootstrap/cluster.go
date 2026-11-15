@@ -35,6 +35,9 @@ const (
 	capiVersion = "v1beta2"
 )
 
+// certManagerNamespace is where clusterctl installs cert-manager.
+const certManagerNamespace = CertManagerName
+
 // overridesFolderKey is clusterctl's config key for its local overrides directory.
 const overridesFolderKey = "overridesFolder"
 
@@ -77,19 +80,21 @@ func newKubeCluster(c client.Client) *KubeCluster {
 // InstalledProviders reads clusterctl's provider inventory. Before clusterctl
 // has ever run, its CRD does not exist, which means nothing is installed.
 func (k *KubeCluster) InstalledProviders(ctx context.Context) (map[string]string, error) {
-	list := &unstructured.UnstructuredList{}
-	list.SetGroupVersionKind(providerListGVK)
-	if err := k.c.List(ctx, list); err != nil {
-		if isNoKind(err) {
-			return map[string]string{}, nil
-		}
-		return nil, err
-	}
+	// cert-manager first: it can exist before clusterctl ever ran (installed
+	// some other way), and its version must be checked either way.
 	out := map[string]string{}
 	if v, err := k.certManagerVersion(ctx); err != nil {
 		return nil, err
 	} else if v != "" {
 		out[CertManagerName] = v
+	}
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(providerListGVK)
+	if err := k.c.List(ctx, list); err != nil {
+		if isNoKind(err) {
+			return out, nil
+		}
+		return nil, err
 	}
 	for _, p := range list.Items {
 		name, _, _ := unstructured.NestedString(p.Object, "providerName")
@@ -105,7 +110,7 @@ func (k *KubeCluster) InstalledProviders(ctx context.Context) (map[string]string
 // cert-manager is present without clusterctl's version annotation.
 func (k *KubeCluster) certManagerVersion(ctx context.Context) (string, error) {
 	var deps appsv1.DeploymentList
-	if err := k.c.List(ctx, &deps, client.InNamespace("cert-manager")); err != nil {
+	if err := k.c.List(ctx, &deps, client.InNamespace(certManagerNamespace)); err != nil {
 		return "", err
 	}
 	for _, d := range deps.Items {
@@ -159,24 +164,9 @@ func (k *KubeCluster) Init(ctx context.Context, providers []Provider) error {
 	}
 	defer cleanup()
 
-	opts := clusterctl.InitOptions{
-		Kubeconfig:          clusterctl.Kubeconfig{Path: kubeconfigPath},
-		WaitProviders:       true,
-		WaitProviderTimeout: 5 * time.Minute,
-	}
-	for _, p := range providers {
-		switch p.Kind {
-		case CoreProvider:
-			opts.CoreProvider = p.Ref
-		case BootstrapProvider:
-			opts.BootstrapProviders = append(opts.BootstrapProviders, p.Ref)
-		case ControlPlaneProvider:
-			opts.ControlPlaneProviders = append(opts.ControlPlaneProviders, p.Ref)
-		case InfrastructureProvider:
-			opts.InfrastructureProviders = append(opts.InfrastructureProviders, p.Ref)
-		default:
-			return fmt.Errorf("unknown provider kind %q", p.Kind)
-		}
+	opts, err := initOptions(kubeconfigPath, providers)
+	if err != nil {
+		return err
 	}
 	_, err = cc.Init(ctx, opts)
 	return err
@@ -210,7 +200,7 @@ func (k *KubeCluster) unavailableDeployments(ctx context.Context) ([]string, err
 	if err := k.c.List(ctx, list); err != nil {
 		return nil, err
 	}
-	namespaces := map[string]bool{"cert-manager": true}
+	namespaces := map[string]bool{certManagerNamespace: true}
 	for _, p := range list.Items {
 		namespaces[p.GetNamespace()] = true
 	}
@@ -269,6 +259,36 @@ func clusterctlReader() (*clusterctlconfig.MemoryReader, func(), error) {
 	}
 	reader.Set(overridesFolderKey, noOverrides)
 	return reader, func() { _ = os.RemoveAll(noOverrides) }, nil
+}
+
+// initOptions maps the providers to install onto clusterctl's options. The
+// bootstrap and control-plane lists always start with clusterctl's no-op
+// entry: when its inventory has no core provider, clusterctl otherwise fills
+// empty lists with the *latest* kubeadm providers, not the pinned ones. An
+// empty provider list still makes Init install the pinned cert-manager.
+func initOptions(kubeconfigPath string, providers []Provider) (clusterctl.InitOptions, error) {
+	opts := clusterctl.InitOptions{
+		Kubeconfig:            clusterctl.Kubeconfig{Path: kubeconfigPath},
+		BootstrapProviders:    []string{clusterctl.NoopProvider},
+		ControlPlaneProviders: []string{clusterctl.NoopProvider},
+		WaitProviders:         true,
+		WaitProviderTimeout:   5 * time.Minute,
+	}
+	for _, p := range providers {
+		switch p.Kind {
+		case CoreProvider:
+			opts.CoreProvider = p.Ref
+		case BootstrapProvider:
+			opts.BootstrapProviders = append(opts.BootstrapProviders, p.Ref)
+		case ControlPlaneProvider:
+			opts.ControlPlaneProviders = append(opts.ControlPlaneProviders, p.Ref)
+		case InfrastructureProvider:
+			opts.InfrastructureProviders = append(opts.InfrastructureProviders, p.Ref)
+		default:
+			return opts, fmt.Errorf("unknown provider kind %q", p.Kind)
+		}
+	}
+	return opts, nil
 }
 
 // GetSecret reads the Secret's keys, labels and deletion state.

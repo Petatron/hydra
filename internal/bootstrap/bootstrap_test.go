@@ -70,6 +70,10 @@ func (f *fakeCluster) Init(_ context.Context, ps []Provider) error {
 	for _, p := range ps {
 		f.installed[p.Name] = p.Version
 	}
+	// Like clusterctl, init installs the pinned cert-manager if none works.
+	if _, ok := f.installed[CertManagerName]; !ok {
+		f.installed[CertManagerName] = CertManagerVersion
+	}
 	return nil
 }
 func (f *fakeCluster) GetSecret(_ context.Context, ns, name string) (*SecretInfo, error) {
@@ -382,6 +386,7 @@ func TestWaitsForProvidersEvenWhenInstalled(t *testing.T) {
 	for _, p := range Providers() {
 		c.installed[p.Name] = p.Version
 	}
+	c.installed[CertManagerName] = CertManagerVersion
 	c.waitErr = errors.New("still not Available: cluster-api-provider-hydra-system/cluster-api-provider-hydra-controller-manager")
 	err := b.Create(context.Background(), cfg(t, cfgYAML), Options{Credentials: testCredentials(t)})
 	if err == nil || !strings.Contains(err.Error(), "not available") {
@@ -424,5 +429,19 @@ func TestExistingSecretIsChecked(t *testing.T) {
 				t.Errorf("labelled: %v, want %v", c.labelled, tc.wantLabel)
 			}
 		})
+	}
+}
+
+func TestRestoresMissingCertManager(t *testing.T) {
+	k, c, b, _ := newFakes()
+	k.clusters["hydra-bootstrap-lab"] = true
+	for _, p := range Providers() {
+		c.installed[p.Name] = p.Version
+	}
+	if err := b.Create(context.Background(), cfg(t, cfgYAML), Options{Credentials: testCredentials(t)}); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.inited) != 1 || len(c.inited[0]) != 0 {
+		t.Errorf("want one init with no providers (to restore cert-manager), got %v", c.inited)
 	}
 }
