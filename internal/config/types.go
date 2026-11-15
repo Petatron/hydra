@@ -84,16 +84,20 @@ type ImageSpec struct {
 
 // NetworkSpec is the cluster's addressing.
 type NetworkSpec struct {
-	// ControlPlaneEndpoint is the API address kube-vip holds, host or
-	// host:port (default port 6443). It must be outside every DHCP range on
-	// that network. Leave it empty with a ManagedNetwork to let Hydra choose.
+	// ControlPlaneEndpoint is the API address kube-vip holds: an IPv4 address
+	// or DNS name, optionally with :6443 (the only port supported, since the
+	// API server binds 6443 and kube-vip moves the address, not the port). It
+	// must be outside every DHCP range on its network. Leave it empty with a
+	// ManagedNetwork to let Hydra choose one on that network.
 	ControlPlaneEndpoint string `json:"controlPlaneEndpoint,omitempty"`
 	// Bridges are the site networks every machine is attached to, in order.
 	Bridges []string `json:"bridges"`
 	// ManagedNetwork asks Hydra to create and own a network for the cluster.
 	// Machines get an interface on it in addition to Bridges.
 	ManagedNetwork *ManagedNetworkSpec `json:"managedNetwork,omitempty"`
-	// PodCIDR is shared by kubeadm and Cilium's IPAM pool. Default 10.244.0.0/16.
+	// PodCIDR is shared by kubeadm and Cilium's IPAM pool, which gives each
+	// node a /24 from it, so it must hold one /24 per node the cluster can
+	// reach. Default 10.244.0.0/16.
 	PodCIDR string `json:"podCIDR,omitempty"`
 	// ServiceCIDR. Default 10.96.0.0/12.
 	ServiceCIDR string `json:"serviceCIDR,omitempty"`
@@ -103,8 +107,9 @@ type NetworkSpec struct {
 	// with. Default enp1s0, the first virtio NIC.
 	NodeInterface string `json:"nodeInterface,omitempty"`
 	// VIPInterface is the guest interface kube-vip puts the endpoint on.
-	// Defaults to NodeInterface, or to enp2s0 when a ManagedNetwork is the
-	// second NIC behind a single bridge. Must be set explicitly otherwise.
+	// Defaults to NodeInterface when the endpoint is on the site network, or
+	// to enp2s0 when it is on a ManagedNetwork behind a single bridge (the
+	// managed NIC comes after the bridges). Must be set explicitly otherwise.
 	VIPInterface string `json:"vipInterface,omitempty"`
 }
 

@@ -51,13 +51,13 @@ autoscaled node pools, are in [`examples/`](examples/).
 | `spec.kubernetesVersion` | `v1.35.3` | |
 | `spec.hypervisor` | (provider-wide) | `address` + `credentialsSecretName` (default `<name>-libvirt-pki`) |
 | `spec.image.bootstrap` | `packages` | `packages` installs containerd and Kubernetes at boot; `prebaked` expects an image that carries them |
-| `spec.network.controlPlaneEndpoint` | — | Required unless `managedNetwork` is set, in which case Hydra picks it |
-| `spec.network.podCIDR` / `serviceCIDR` | `10.244.0.0/16` / `10.96.0.0/12` | The pod CIDR is also Cilium's IPAM pool |
+| `spec.network.controlPlaneEndpoint` | — | IPv4 or DNS name (port 6443 only). Required unless `managedNetwork` is set, in which case Hydra picks it |
+| `spec.network.podCIDR` / `serviceCIDR` | `10.244.0.0/16` / `10.96.0.0/12` | The pod CIDR is also Cilium's IPAM pool and must hold a /24 per node; the service CIDR may be at most a /12 |
 | `spec.network.mtu` | `1500` | Cilium MTU |
 | `spec.network.nodeInterface` / `vipInterface` | `enp1s0` / derived | Guest NICs for the Node address and the API VIP |
 | `spec.controlPlane` | 3 × 4 vCPU / 8Gi / 40Gi | Replicas must be 1, 3 or 5 |
 | `spec.controlPlane.schedulable` | `true` if no node pools | Removes the control-plane taint |
-| `spec.nodePools[]` | — | `name`, `replicas` or `autoscaling: {min, max}`, size, `labels` |
+| `spec.nodePools[]` | — | `name`, `replicas` or `autoscaling: {min, max}`, size, `labels` (not in the `kubernetes.io` / `k8s.io` namespaces, which the kubelet refuses) |
 
 ## Render it
 
@@ -69,6 +69,10 @@ hydra cluster render -f hydra.yaml -o out/    # to out/<name>.yaml
 The output contains the HydraCluster, Cluster, KubeadmControlPlane (with kube-vip holding the API
 endpoint), a MachineHealthCheck, a MachineDeployment for each node pool, and a
 **ClusterResourceSet that installs Cilium** once the cluster's API is up.
+
+Machine and bootstrap templates are named after their content (`<cluster>-cp-1a2b3c4d`), so
+changing a machine's size or a pool's labels produces a new template and a rolling replacement
+rather than an in-place edit Cluster API would refuse or apply only to future machines.
 
 `render` contacts no cluster, and the same input always gives byte-identical output, so you can
 review the result, diff it between versions, or commit it to your own GitOps repository. It never

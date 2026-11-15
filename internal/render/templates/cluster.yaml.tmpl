@@ -77,7 +77,9 @@ spec:
 apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
 kind: HydraMachineTemplate
 metadata:
-  name: {{ q .CPName }}
+  # Named after its content: the spec is immutable, so a new machine shape is a
+  # new template, and KCP rolls the control plane onto it.
+  name: {{ q .CPTemplateName }}
   namespace: {{ q .Namespace }}
 spec:
   template:
@@ -99,7 +101,7 @@ spec:
       infrastructureRef:
         apiGroup: infrastructure.cluster.x-k8s.io
         kind: HydraMachineTemplate
-        name: {{ q .CPName }}
+        name: {{ q .CPTemplateName }}
       deletion:
         # Removing the VIP holder spends ~40s before its Node delete runs; the
         # 10s default left orphan Nodes behind (PET-22).
@@ -220,7 +222,9 @@ spec:
         # identity was an address that moves to a different machine on failover.
         # Captured here, before kubeadm starts the kubelet and kube-vip with it,
         # while {{ .Spec.Network.NodeInterface }} still has only its own DHCP address.
+{{- if eq .Spec.Network.NodeInterface .Spec.Network.VIPInterface }}
         # {{ .Spec.Network.NodeInterface }} here MUST be the same interface as kube-vip's vip_interface.
+{{- end }}
         NODE_IP=$(ip -4 -o addr show {{ .Spec.Network.NodeInterface }} | awk '{print $4}' | cut -d/ -f1 | head -1)
         printf 'KUBELET_EXTRA_ARGS=--provider-id=hydra://libvirt/%s --node-ip=%s\n' \
           "$(tr 'A-Z' 'a-z' < /sys/class/dmi/id/product_uuid)" \
@@ -297,7 +301,8 @@ spec:
 apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
 kind: HydraMachineTemplate
 metadata:
-  name: {{ q .ObjName }}
+  # Named after its content (immutable spec; a change rolls the pool).
+  name: {{ q .HMTName }}
   namespace: {{ q $.Namespace }}
 spec:
   template:
@@ -309,27 +314,11 @@ spec:
 apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
 kind: KubeadmConfigTemplate
 metadata:
-  name: {{ q .ObjName }}
+  # Named after its content, so a change rolls the pool instead of reaching
+  # only machines created later.
+  name: {{ q .KCTName }}
   namespace: {{ q $.Namespace }}
-spec:
-  template:
-    spec:
-      files:
-{{- template "nodeFiles" $ }}
-      joinConfiguration:
-        nodeRegistration:
-          criSocket: unix:///run/containerd/containerd.sock
-{{- if .NodeLabels }}
-          kubeletExtraArgs:
-            - name: node-labels
-              value: {{ q .NodeLabels }}
-{{- end }}
-      preKubeadmCommands:
-        - |
-          printf 'KUBELET_EXTRA_ARGS=--provider-id=hydra://libvirt/%s\n' \
-            "$(tr 'A-Z' 'a-z' < /sys/class/dmi/id/product_uuid)" \
-            > /etc/default/kubelet
-{{- template "nodeSetup" (nodeSetupArgs $ false) }}
+{{- template "kctSpec" . }}
 ---
 apiVersion: cluster.x-k8s.io/v1beta2
 kind: MachineDeployment
@@ -369,11 +358,11 @@ spec:
         configRef:
           apiGroup: bootstrap.cluster.x-k8s.io
           kind: KubeadmConfigTemplate
-          name: {{ q .ObjName }}
+          name: {{ q .KCTName }}
       infrastructureRef:
         apiGroup: infrastructure.cluster.x-k8s.io
         kind: HydraMachineTemplate
-        name: {{ q .ObjName }}
+        name: {{ q .HMTName }}
 {{- end }}
 {{- define "nodeFiles" }}
       # kubeadm's preflight needs these on disk; `sysctl --system` only applies
@@ -426,4 +415,36 @@ spec:
 {{ $i }}# Enable, not start: kubeadm starts the kubelet, but never enables it, and
 {{ $i }}# a node that reboots must rejoin (PET-56).
 {{ $i }}- systemctl enable kubelet
+{{- end }}
+{{- define "kctSpec" }}
+spec:
+  template:
+    spec:
+      files:
+{{- template "nodeFiles" .Root }}
+      joinConfiguration:
+        nodeRegistration:
+          criSocket: unix:///run/containerd/containerd.sock
+{{- if .NodeLabels }}
+          kubeletExtraArgs:
+            - name: node-labels
+              value: {{ q .NodeLabels }}
+{{- end }}
+      preKubeadmCommands:
+{{- if .Root.Spec.Network.ManagedNetwork }}
+        # Two NICs, both on DHCP: pin the Node address to the site network, as
+        # the control plane does, instead of whichever default route wins.
+        - |
+          NODE_IP=$(ip -4 -o addr show {{ .Root.Spec.Network.NodeInterface }} | awk '{print $4}' | cut -d/ -f1 | head -1)
+          printf 'KUBELET_EXTRA_ARGS=--provider-id=hydra://libvirt/%s --node-ip=%s\n' \
+            "$(tr 'A-Z' 'a-z' < /sys/class/dmi/id/product_uuid)" \
+            "$NODE_IP" \
+            > /etc/default/kubelet
+{{- else }}
+        - |
+          printf 'KUBELET_EXTRA_ARGS=--provider-id=hydra://libvirt/%s\n' \
+            "$(tr 'A-Z' 'a-z' < /sys/class/dmi/id/product_uuid)" \
+            > /etc/default/kubelet
+{{- end }}
+{{- template "nodeSetup" (nodeSetupArgs .Root false) }}
 {{- end }}

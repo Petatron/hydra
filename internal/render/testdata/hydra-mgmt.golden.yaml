@@ -46,7 +46,9 @@ spec:
 apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
 kind: HydraMachineTemplate
 metadata:
-  name: "hydra-mgmt-cp"
+  # Named after its content: the spec is immutable, so a new machine shape is a
+  # new template, and KCP rolls the control plane onto it.
+  name: "hydra-mgmt-cp-4128274b"
   namespace: "default"
 spec:
   template:
@@ -68,7 +70,7 @@ spec:
       infrastructureRef:
         apiGroup: infrastructure.cluster.x-k8s.io
         kind: HydraMachineTemplate
-        name: "hydra-mgmt-cp"
+        name: "hydra-mgmt-cp-4128274b"
       deletion:
         # Removing the VIP holder spends ~40s before its Node delete runs; the
         # 10s default left orphan Nodes behind (PET-22).

@@ -162,8 +162,10 @@ func TestCiliumCarriesClusterValues(t *testing.T) {
 	if cluster.Metadata.Labels[CNILabelKey] != "hydra-mgmt" {
 		t.Errorf("Cluster is not labelled for its ClusterResourceSet: %v", cluster.Metadata.Labels)
 	}
-	if len(manifest) > 900*1024 {
-		t.Errorf("Cilium manifest is %d bytes; a ConfigMap holds at most 1MiB", len(manifest))
+	// The tightest real limit: client-side `kubectl apply` stores the whole
+	// object in a 256KiB annotation. (A ConfigMap itself holds 1MiB.)
+	if len(manifest) > 250*1024 {
+		t.Errorf("Cilium manifest is %d bytes; client-side apply of its ConfigMap fails above 256KiB", len(manifest))
 	}
 }
 
@@ -236,5 +238,81 @@ func TestMHCQuorumBound(t *testing.T) {
 		if !strings.Contains(string(out), "unhealthyLessThanOrEqualTo: "+want+"\n") {
 			t.Errorf("replicas %d: want unhealthyLessThanOrEqualTo %s", replicas, want)
 		}
+	}
+}
+
+func TestTemplateNamesFollowContent(t *testing.T) {
+	// names returns the control plane's and the system pool's template names.
+	names := func(mutate func(c *config.ClusterConfig)) (cp, pool []string) {
+		c := load(t, "../../examples/workload-managed-network.yaml")
+		mutate(c)
+		out, err := Render(c, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, o := range documents(t, out) {
+			switch {
+			case strings.HasPrefix(o.Metadata.Name, "demo-cp-") && o.Kind == "HydraMachineTemplate":
+				cp = append(cp, o.Metadata.Name)
+			case strings.HasPrefix(o.Metadata.Name, "demo-system-"):
+				pool = append(pool, o.Kind+"/"+o.Metadata.Name)
+			}
+		}
+		return cp, pool
+	}
+	cp0, sys0 := names(func(*config.ClusterConfig) {})
+	cp1, sys1 := names(func(c *config.ClusterConfig) { c.Spec.ControlPlane.VCPUs++ })
+	if len(cp0) != 1 || cp0[0] == cp1[0] {
+		t.Errorf("a new control-plane shape must get a new HydraMachineTemplate name: %v %v", cp0, cp1)
+	}
+	if strings.Join(sys0, ",") != strings.Join(sys1, ",") {
+		t.Error("an unrelated change must not rename a pool's templates")
+	}
+	_, sys2 := names(func(c *config.ClusterConfig) { c.Spec.NodePools[0].Labels["hydra.io/tier"] = "x" })
+	if strings.Join(sys0, ",") == strings.Join(sys2, ",") {
+		t.Error("a pool label change must rename its KubeadmConfigTemplate so the pool rolls")
+	}
+}
+
+func TestReferencesResolve(t *testing.T) {
+	out, err := Render(load(t, "../../examples/workload-managed-network.yaml"), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defined := map[string]bool{}
+	for _, o := range documents(t, out) {
+		defined[o.Kind+"/"+o.Metadata.Name] = true
+	}
+	// Every templateRef/configRef/infrastructureRef name must be an object we render.
+	s := string(out)
+	for _, kind := range []string{"HydraMachineTemplate", "KubeadmConfigTemplate"} {
+		marker := "kind: " + kind + "\n"
+		for rest := s; ; {
+			i := strings.Index(rest, marker)
+			if i < 0 {
+				break
+			}
+			rest = rest[i+len(marker):]
+			line := strings.TrimSpace(rest[:strings.IndexByte(rest, '\n')])
+			if after, ok := strings.CutPrefix(line, "name: "); ok {
+				name := strings.Trim(after, `"`)
+				if !defined[kind+"/"+name] {
+					t.Errorf("reference to %s %q, which is not rendered", kind, name)
+				}
+			}
+		}
+	}
+}
+
+func TestNodeInterfaceWarningOnlyWhenShared(t *testing.T) {
+	wl, err := Render(load(t, "../../examples/workload-managed-network.yaml"), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(wl), "MUST be the same interface") {
+		t.Error("with the VIP on another NIC, the same-interface warning is false")
+	}
+	if !strings.Contains(string(wl), "--node-ip=%s") || strings.Count(string(wl), "--node-ip=%s") != 3 {
+		t.Errorf("on a managed network the control plane and both pools must pin --node-ip, found %d", strings.Count(string(wl), "--node-ip=%s"))
 	}
 }

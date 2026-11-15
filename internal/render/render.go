@@ -7,7 +7,9 @@ package render
 
 import (
 	"bytes"
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"fmt"
 	"maps"
 	"slices"
@@ -63,15 +65,18 @@ type Options struct {
 
 type data struct {
 	*config.ClusterConfig
-	Spec          *config.ClusterSpec
-	CLIVersion    string
-	Name          string
-	Namespace     string
-	CPName        string
-	HasEndpoint   bool
-	EndpointHost  string
-	EndpointPort  int
-	CPSchedulable bool
+	Spec       *config.ClusterSpec
+	CLIVersion string
+	Name       string
+	Namespace  string
+	CPName     string
+	// CPTemplateName is the control plane's HydraMachineTemplate, named after
+	// its content.
+	CPTemplateName string
+	HasEndpoint    bool
+	EndpointHost   string
+	EndpointPort   int
+	CPSchedulable  bool
 	// MHCMaxUnhealthy is how many control-plane machines may be remediated
 	// at once: what etcd can lose and keep quorum, at least 1.
 	MHCMaxUnhealthy int32
@@ -81,9 +86,17 @@ type data struct {
 }
 
 type pool struct {
+	Root       *data
 	Spec       config.NodePoolSpec
 	ObjName    string
 	NodeLabels string
+	// HMTName and KCTName carry a hash of their own content. Both templates
+	// are effectively immutable (HydraMachineTemplate's spec by CEL rule; a
+	// KubeadmConfigTemplate edited in place reaches only machines created
+	// later), so a changed shape or bootstrap must be a new template that the
+	// MachineDeployment rolls onto.
+	HMTName string
+	KCTName string
 }
 
 type nodeSetupArgs struct {
@@ -122,12 +135,21 @@ func Render(c *config.ClusterConfig, opts Options) ([]byte, error) {
 		}
 		d.HasEndpoint, d.EndpointHost, d.EndpointPort = true, host, port
 	}
+	d.CPTemplateName = d.CPName + "-" + contentHash(machineShape(c.Spec.ControlPlane.MachineSize))
 	for _, p := range c.Spec.NodePools {
-		d.Pools = append(d.Pools, pool{
+		pl := pool{
+			Root:       d,
 			Spec:       p,
 			ObjName:    c.Metadata.Name + "-" + p.Name,
 			NodeLabels: joinLabels(p.Labels),
-		})
+		}
+		pl.HMTName = pl.ObjName + "-" + contentHash(machineShape(p.MachineSize))
+		var kct bytes.Buffer
+		if err := tmpl.ExecuteTemplate(&kct, "kctSpec", pl); err != nil {
+			return nil, fmt.Errorf("rendering node pool %s: %w", p.Name, err)
+		}
+		pl.KCTName = pl.ObjName + "-" + contentHash(kct.String())
+		d.Pools = append(d.Pools, pl)
 	}
 
 	var out bytes.Buffer
@@ -140,6 +162,17 @@ func Render(c *config.ClusterConfig, opts Options) ([]byte, error) {
 	}
 	out.Write(cni)
 	return out.Bytes(), nil
+}
+
+// machineShape is the content of a HydraMachineTemplate's spec.
+func machineShape(m config.MachineSize) string {
+	return fmt.Sprintf("vcpus=%d memory=%s diskSize=%s", m.VCPUs, m.Memory.String(), m.DiskSize.String())
+}
+
+// contentHash is a short, stable digest for naming objects after their content.
+func contentHash(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])[:8]
 }
 
 // joinLabels renders a label map as k=v,k=v in key order.

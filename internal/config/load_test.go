@@ -101,6 +101,20 @@ func TestRejects(t *testing.T) {
 		{"bad bounds", "    bridges: [br0]", "    bridges: [br0]\n  nodePools:\n    - {name: w, vcpus: 1, memory: 2Gi, diskSize: 20Gi, autoscaling: {min: 4, max: 3}}", "autoscaling"},
 		{"bad label", "    bridges: [br0]", "    bridges: [br0]\n  nodePools:\n    - {name: w, replicas: 1, vcpus: 1, memory: 2Gi, diskSize: 20Gi, labels: {'a b': x}}", "labels"},
 		{"bad hypervisor", "  storagePool: pool", "  storagePool: pool\n  hypervisor:\n    address: 'bad host'", "spec.hypervisor.address"},
+		{"hypervisor port range", "  storagePool: pool", "  storagePool: pool\n  hypervisor:\n    address: hv:99999", "spec.hypervisor.address"},
+		{"pool whitespace", "storagePool: pool", "storagePool: 'my pool'", "whitespace"},
+		{"leading-zero version", "  storagePool: pool", "  storagePool: pool\n  kubernetesVersion: v1.035.3", "spec.kubernetesVersion"},
+		{"endpoint not ipv4", "10.0.0.10", "300.1.1.1", "not a valid IPv4"},
+		{"endpoint port", "10.0.0.10", "10.0.0.10:443", "only 6443"},
+		{"pod cidr too small", "    bridges: [br0]", "    bridges: [br0]\n    podCIDR: 10.244.0.0/24", "per-node"},
+		{"pod cidr smaller than node", "    bridges: [br0]", "    bridges: [br0]\n    podCIDR: 10.244.0.0/25", "smaller than one node"},
+		{"service cidr too big", "    bridges: [br0]", "    bridges: [br0]\n    serviceCIDR: 172.0.0.0/8", "/12"},
+		{"kubelet label", "    bridges: [br0]", "    bridges: [br0]\n  nodePools:\n    - {name: w, replicas: 1, vcpus: 1, memory: 2Gi, diskSize: 20Gi, labels: {node-role.kubernetes.io/worker: ''}}", "your own domain"},
+		{"dhcp reversed", "    controlPlaneEndpoint: 10.0.0.10\n", "    managedNetwork:\n      name: n\n      subnet: 192.168.1.0/24\n      dhcpStart: 192.168.1.200\n      dhcpEnd: 192.168.1.20\n", "after dhcpEnd"},
+		{"dhcp on gateway", "    controlPlaneEndpoint: 10.0.0.10\n", "    managedNetwork:\n      name: n\n      subnet: 192.168.1.0/24\n      dhcpStart: 192.168.1.1\n      dhcpEnd: 192.168.1.20\n", "gateway"},
+		{"endpoint in dhcp range", "    controlPlaneEndpoint: 10.0.0.10\n", "    controlPlaneEndpoint: 192.168.1.50\n    managedNetwork:\n      name: n\n      subnet: 192.168.1.0/24\n      dhcpStart: 192.168.1.10\n      dhcpEnd: 192.168.1.100\n", "inside the DHCP range"},
+		{"pod overlaps managed", "    controlPlaneEndpoint: 10.0.0.10\n", "    podCIDR: 192.168.0.0/16\n    managedNetwork:\n      name: n\n      subnet: 192.168.1.0/24\n      dhcpStart: 192.168.1.10\n      dhcpEnd: 192.168.1.100\n", "overlaps the managed subnet"},
+		{"dns endpoint with managed", "    controlPlaneEndpoint: 10.0.0.10\n", "    controlPlaneEndpoint: api.example.com\n    managedNetwork:\n      name: n\n      subnet: 192.168.1.0/24\n      dhcpStart: 192.168.1.10\n      dhcpEnd: 192.168.1.100\n", "vipInterface"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -133,5 +147,30 @@ func TestReportsEveryError(t *testing.T) {
 func TestEmpty(t *testing.T) {
 	if _, err := Parse([]byte("  \n")); err == nil {
 		t.Error("empty input accepted")
+	}
+}
+
+func TestVIPInterfaceFollowsEndpoint(t *testing.T) {
+	managed := "    managedNetwork:\n      name: n\n      subnet: 192.168.1.0/24\n      dhcpStart: 192.168.1.10\n      dhcpEnd: 192.168.1.100\n"
+	for _, tc := range []struct{ endpoint, want string }{
+		{"", "enp2s0"}, // Hydra chooses it on the managed network
+		{"    controlPlaneEndpoint: 192.168.1.2\n", "enp2s0"}, // stated, on the managed network
+		{"    controlPlaneEndpoint: 10.0.0.5\n", "enp1s0"},    // stated, on the site network
+	} {
+		cfg := strings.Replace(valid, "    controlPlaneEndpoint: 10.0.0.10\n", tc.endpoint+managed, 1)
+		c, err := Parse([]byte(cfg))
+		if err != nil {
+			t.Fatalf("%q: %v", tc.endpoint, err)
+		}
+		if got := c.Spec.Network.VIPInterface; got != tc.want {
+			t.Errorf("endpoint %q: vipInterface %q, want %q", tc.endpoint, got, tc.want)
+		}
+	}
+}
+
+func TestPodCIDRSizedForAutoscaledPools(t *testing.T) {
+	cfg := valid + "  nodePools:\n    - {name: w, vcpus: 1, memory: 2Gi, diskSize: 20Gi, autoscaling: {min: 0, max: 300}}\n"
+	if _, err := Parse([]byte(cfg)); err == nil || !strings.Contains(err.Error(), "303 nodes") {
+		t.Errorf("a /16 holds 256 nodes; 3 + 300 must be refused, got %v", err)
 	}
 }
