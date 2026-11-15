@@ -75,7 +75,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create '${{ github.ref_name }}' dist/* \
-            --title '${{ github.ref_name }}' \
-            --generate-notes \
-            $(case '${{ github.ref_name }}' in *-*) echo --prerelease;; esac)
+          # A tag with a "-" (v0.2.0-rc.1) is a pre-release.
+          set -- --title '${{ github.ref_name }}' --generate-notes
+          case '${{ github.ref_name }}' in *-*) set -- "$@" --prerelease ;; esac
+          gh release create '${{ github.ref_name }}' dist/* "$@"
