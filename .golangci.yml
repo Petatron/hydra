@@ -1,0 +1,45 @@
+version: "2"
+run:
+  allow-parallel-runners: true
+linters:
+  default: none
+  enable:
+    - copyloopvar
+    - depguard
+    - errcheck
+    - goconst
+    - gocyclo
+    - govet
+    - ineffassign
+    - misspell
+    - modernize
+    - nakedret
+    - prealloc
+    - revive
+    - staticcheck
+    - unconvert
+    - unparam
+    - unused
+  settings:
+    goconst:
+      # Map keys of hand-built Kubernetes objects are not magic strings.
+      ignore-string-values: ["^name$", "^kind$"]
+    depguard:
+      rules:
+        forbid-sort-pkg:
+          deny:
+            - pkg: sort
+              desc: Should be replaced with slices package
+    revive:
+      rules:
+        - name: comment-spacings
+        - name: import-shadowing
+  exclusions:
+    rules:
+      # Table tests repeat fixture fragments on purpose.
+      - linters: [goconst]
+        path: _test\.go
+formatters:
+  enable:
+    - gofmt
+    - goimports

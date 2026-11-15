@@ -1,0 +1,44 @@
+# A workload cluster on a network Hydra creates and owns, with two node pools:
+# one fixed, one Cluster Autoscaler sizes between zero and six. The endpoint is chosen by
+# Hydra on the managed network, and the hypervisor is named per cluster.
+apiVersion: hydra.io/v1alpha1
+kind: ClusterConfig
+metadata:
+  name: demo
+  namespace: demo
+spec:
+  hypervisor:
+    address: hypervisor.example.internal:16514
+  storagePool: vm-pool
+  image:
+    name: hydra-node-ubuntu-24.04-k8s-v1.35.3.qcow2
+    bootstrap: prebaked
+  network:
+    bridges: [br0]
+    managedNetwork:
+      name: demo-net
+      subnet: 192.168.70.0/24
+      dhcpStart: 192.168.70.100
+      dhcpEnd: 192.168.70.200
+  controlPlane:
+    replicas: 1
+    vcpus: 2
+    memory: 4Gi
+    diskSize: 40Gi
+  nodePools:
+    - name: system
+      replicas: 2
+      vcpus: 2
+      memory: 4Gi
+      diskSize: 40Gi
+      labels:
+        hydra.io/pool: system
+    - name: compute
+      vcpus: 4
+      memory: 8Gi
+      diskSize: 80Gi
+      labels:
+        hydra.io/pool: compute
+      autoscaling:
+        min: 0
+        max: 6
