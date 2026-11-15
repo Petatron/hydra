@@ -66,7 +66,7 @@ Commands, in delivery order (Linear project *Hydra — Reliability & Productizat
 ```bash
 make test          # unit + golden tests
 make golden        # regenerate golden files after an intended output change
-make lint          # golangci-lint (on Go 1.27 use GOTOOLCHAIN=go1.26.5 for now)
+make lint          # golangci-lint, built with the pinned toolchain (see below)
 make verify        # go.mod tidy + gofmt
 make cilium        # regenerate the embedded Cilium manifest (needs helm)
 make e2e           # kind management cluster via `hydra bootstrap`, dry-run every example (needs Docker)
@@ -84,7 +84,9 @@ Dependabot keeps them and the Go modules current.
 **The Go toolchain is pinned in `go.mod` (`toolchain go1.26.x`).** `actions/setup-go` installs it, so
 CI and release binaries build with the latest patch, not the bare `go 1.26.0` floor; on 1.26.0
 govulncheck finds 30 reachable standard-library vulnerabilities. Bump the patch when govulncheck
-reports a standard-library fix.
+reports a standard-library fix. A locally installed Go that is newer than the pin (1.27) wins over
+the `toolchain` line, and golangci-lint's typecheck currently breaks on 1.27; run
+`GOTOOLCHAIN=go1.26.11 make lint` (the pinned version, never an older patch) until it is fixed.
 
 ## Project context
 

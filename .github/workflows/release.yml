@@ -35,6 +35,9 @@ jobs:
       - run: make verify
       - run: make test
       - run: make lint
+      # The scan that catches standard-library vulnerabilities in the
+      # toolchain the binaries are built with: it must gate publishing.
+      - run: make vuln
 
   publish:
     name: Build and publish
@@ -54,12 +57,18 @@ jobs:
       - name: Build binaries
         run: make dist
 
+      # The tag name reaches the shell only through the environment, never by
+      # ${{ }} expansion into the script, so a tag containing quotes or $()
+      # cannot become shell code in a job that can publish releases.
       - name: Check the version stamp
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
         run: |
           got="$(./dist/hydra-linux-amd64 version | head -1)"
           echo "$got"
-          if [ "${{ github.ref_type }}" = "tag" ] && [ "$got" != "hydra ${{ github.ref_name }}" ]; then
-            echo "::error::binary reports '$got', expected 'hydra ${{ github.ref_name }}'"
+          if [ "$REF_TYPE" = "tag" ] && [ "$got" != "hydra $REF_NAME" ]; then
+            echo "::error::binary reports '$got', expected 'hydra $REF_NAME'"
             exit 1
           fi
 
@@ -74,8 +83,9 @@ jobs:
         if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           # A tag with a "-" (v0.2.0-rc.1) is a pre-release.
-          set -- --title '${{ github.ref_name }}' --generate-notes
-          case '${{ github.ref_name }}' in *-*) set -- "$@" --prerelease ;; esac
-          gh release create '${{ github.ref_name }}' dist/* "$@"
+          set -- --title "$REF_NAME" --generate-notes
+          case "$REF_NAME" in *-*) set -- "$@" --prerelease ;; esac
+          gh release create "$REF_NAME" dist/* "$@"

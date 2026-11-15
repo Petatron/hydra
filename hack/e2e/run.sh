@@ -43,18 +43,29 @@ kubeconfig="$work/kubeconfig"
 "$hydra" bootstrap kubeconfig -f "$cfg" > "$kubeconfig"
 export KUBECONFIG="$kubeconfig"
 
+# No pipelines below: /bin/sh has no pipefail, so a pipeline's status is its
+# last command's, and a failing hydra or kubectl ahead of `sed` would pass.
+# Each command writes to a file, so `set -e` sees its real exit status.
+
 echo "--- a rerun is a no-op"
-"$hydra" bootstrap -f "$cfg" 2>&1 | grep -q "reusing it"
+rerun="$work/rerun.out"
+if ! "$hydra" bootstrap -f "$cfg" >"$rerun" 2>&1; then
+  cat "$rerun" >&2
+  exit 1
+fi
+cat "$rerun"
+grep -q "reusing it" "$rerun"
 
 echo "--- server-side dry-run of every example"
 for example in "$root"/examples/*.yaml; do
   echo "  $(basename "$example")"
   ns=$(awk '/^  namespace:/ {print $2; exit}' "$example")
   ns=${ns:-default}
-  kubectl create namespace "$ns" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-  "$hydra" cluster render -f "$example" |
-    kubectl apply --server-side --field-manager=hydra-e2e --dry-run=server -f - |
-    sed 's/^/    /'
+  kubectl create namespace "$ns" --dry-run=client -o yaml >"$work/ns.yaml"
+  kubectl apply -f "$work/ns.yaml" >/dev/null
+  "$hydra" cluster render -f "$example" >"$work/render.yaml"
+  kubectl apply --server-side --field-manager=hydra-e2e --dry-run=server -f "$work/render.yaml" >"$work/apply.out"
+  sed 's/^/    /' "$work/apply.out"
 done
 
 echo "--- e2e passed"

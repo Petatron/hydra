@@ -15,9 +15,9 @@ interrupted command can always be re-run.
 
 ## Install
 
-Download the binary for your platform from the
-[latest release](https://github.com/Petatron/hydra/releases/latest) (Linux and macOS, amd64 and
-arm64; `checksums.txt` holds their SHA256 sums), or build it:
+Release binaries for Linux and macOS (amd64 and arm64, with SHA256 sums in `checksums.txt`) are
+published on the [releases page](https://github.com/Petatron/hydra/releases) for each tagged
+version, once the first is tagged. Until then, or for an unreleased commit, build it:
 
 ```bash
 go install github.com/Petatron/hydra/cmd/hydra@latest
