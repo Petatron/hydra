@@ -359,10 +359,17 @@ func (p *Pivot) preflight(ctx context.Context) error {
 	if secret == "" {
 		problems = append(problems, "the HydraCluster names no hypervisor (spec.hypervisor); it relies on the source manager's libvirt-config, which does not move, so the target could not reach its VMs")
 	} else {
+		// The same completeness check create makes: the target provider
+		// reads these keys, and once the bootstrap cluster is gone nothing
+		// else can reach the VMs.
 		sec := &unstructured.Unstructured{}
 		sec.SetGroupVersionKind(schema.GroupVersionKind{Version: "v1", Kind: "Secret"})
-		if err := p.Source.C.Get(ctx, client.ObjectKey{Namespace: p.Namespace, Name: secret}, sec); err != nil {
+		if err := src.CheckCredentials(ctx, p.Namespace, secret); err != nil {
+			problems = append(problems, err.Error())
+		} else if err := p.Source.C.Get(ctx, client.ObjectKey{Namespace: p.Namespace, Name: secret}, sec); err != nil {
 			problems = append(problems, fmt.Sprintf("reading credentials Secret %s: %v", secret, err))
+		} else if sec.GetDeletionTimestamp() != nil {
+			problems = append(problems, fmt.Sprintf("credentials Secret %s is being deleted", secret))
 		} else if _, ok := sec.GetLabels()[moveLabel]; !ok {
 			problems = append(problems, fmt.Sprintf("credentials Secret %s lacks the %s label, so the move would leave it behind", secret, moveLabel))
 		}
@@ -451,7 +458,10 @@ func (p *Pivot) verifyOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if !st.Exists || st.Available != cluster.ConditionTrue || !st.RolledOut {
+	// Being deleted, or a CNI only present as the moved ClusterResourceSet
+	// without its binding applied, is no management path to leave the
+	// cluster on: the bootstrap cluster is deleted once this passes.
+	if !st.Exists || st.Terminating || st.Available != cluster.ConditionTrue || !st.RolledOut || !st.CNIApplied {
 		return fmt.Errorf("the Cluster on %s: %s", p.Target.Name, st.Line())
 	}
 	if cl, err := p.getCluster(ctx, p.Target.C); err != nil {

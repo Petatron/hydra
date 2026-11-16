@@ -12,6 +12,7 @@ import (
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -60,7 +61,9 @@ func clusterObjects(uidSuffix string, identityRecorded bool) []client.Object {
 	if identityRecorded {
 		hm.SetAnnotations(map[string]string{IdentityUIDAnnotation: "hm-original", OwnerUIDAnnotation: string(uid)})
 	}
-	sec := u(secGVK, ns, "c-pki", nil)
+	sec := u(secGVK, ns, "c-pki", map[string]any{"data": map[string]any{
+		"cacert.pem": "Y2E=", "clientcert.pem": "Y2VydA==", "clientkey.pem": "a2V5",
+	}})
 	sec.SetLabels(map[string]string{moveLabel: ""})
 	crs := u(crsGVK, ns, name+"-cilium", nil)
 	bind := u(bindGVK, ns, name, map[string]any{"spec": map[string]any{"bindings": []any{
@@ -260,6 +263,24 @@ func TestPivotRefusesBeforeMoving(t *testing.T) {
 			}
 			return o
 		}, true, "lacks the clusterctl.cluster.x-k8s.io/move label"},
+		{"credentials Secret incomplete", func(o []client.Object) []client.Object {
+			for _, x := range o {
+				if x.GetName() == "c-pki" {
+					unstructured.RemoveNestedField(x.(*unstructured.Unstructured).Object, "data", "clientkey.pem")
+				}
+			}
+			return o
+		}, true, "lacks clientkey.pem"},
+		{"credentials Secret being deleted", func(o []client.Object) []client.Object {
+			for _, x := range o {
+				if x.GetName() == "c-pki" {
+					now := metav1.Now()
+					x.SetDeletionTimestamp(&now)
+					x.SetFinalizers([]string{"example.com/hold"})
+				}
+			}
+			return o
+		}, true, "is being deleted"},
 		{"CRDs not labelled", func(o []client.Object) []client.Object {
 			for _, n := range hydraCRDs {
 				o = append(o, u(crdGVK, "", n, nil)) // present, no label
@@ -508,5 +529,62 @@ func TestPivotRefusesWithoutAReadableCA(t *testing.T) {
 	p.Source.Kubeconfig = []byte("not a kubeconfig")
 	if err := p.Run(context.Background(), time.Second); err == nil || !strings.Contains(err.Error(), "certificate authority") {
 		t.Fatalf("got %v", err)
+	}
+}
+
+// afterMove runs mutate on the target once the forward move has finished.
+func afterMove(p *Pivot, mutate func(ctx context.Context) error) {
+	inner := p.Hooks.Move
+	p.Hooks.Move = func(ctx context.Context, from, to []byte, n string, dry bool) error {
+		if err := inner(ctx, from, to, n, dry); err != nil || dry {
+			return err
+		}
+		return mutate(ctx)
+	}
+}
+
+// A target being deleted, or with the CNI binding not applied, is no
+// management path: verify must not pass (the bootstrap cluster is deleted
+// once it does).
+func TestPivotVerifyNeedsALiveTargetWithCNI(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(ctx context.Context, tgt client.Client) error
+		want   string
+	}{
+		{"CNI binding not applied", func(ctx context.Context, tgt client.Client) error {
+			b := &unstructured.Unstructured{}
+			b.SetGroupVersionKind(bindGVK)
+			if err := tgt.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, b); err != nil {
+				return err
+			}
+			_ = unstructured.SetNestedSlice(b.Object, []any{map[string]any{
+				"clusterResourceSetName": name + "-cilium", "resources": []any{map[string]any{"applied": false}},
+			}}, "spec", "bindings")
+			return tgt.Update(ctx, b)
+		}, "CNI"},
+		{"target Cluster being deleted", func(ctx context.Context, tgt client.Client) error {
+			cl := &unstructured.Unstructured{}
+			cl.SetGroupVersionKind(clusterGVK)
+			if err := tgt.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, cl); err != nil {
+				return err
+			}
+			cl.SetFinalizers([]string{"cluster.cluster.x-k8s.io"})
+			if err := tgt.Update(ctx, cl); err != nil {
+				return err
+			}
+			return tgt.Delete(ctx, cl)
+		}, "did not verify"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := newClient(t, append(clusterObjects("src", true), labelledCRDs()...)...)
+			tgt := newClient(t, labelledCRDs()...)
+			p := pivotFor(t, src, tgt, &recorder{takeOver: true})
+			afterMove(p, func(ctx context.Context) error { return tc.mutate(ctx, tgt) })
+			err := p.Run(context.Background(), 30*time.Millisecond)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want %q, got %v", tc.want, err)
+			}
+		})
 	}
 }
