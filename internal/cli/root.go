@@ -29,7 +29,7 @@ func NewRootCommand(out, errOut io.Writer) *cobra.Command {
 	}
 	root.SetOut(out)
 	root.SetErr(errOut)
-	root.AddCommand(newVersionCommand(), newClusterCommand(), newBootstrapCommand())
+	root.AddCommand(newVersionCommand(), newClusterCommand(), newBootstrapCommand(), newValidateCommand())
 	root.SetFlagErrorFunc(func(c *cobra.Command, err error) error {
 		return fmt.Errorf("%w\nRun '%s --help' for usage", err, c.CommandPath())
 	})
