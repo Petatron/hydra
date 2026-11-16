@@ -17,8 +17,8 @@ The CLI is a **stateless orchestrator**: every cluster's desired and actual stat
 Kubernetes, never on your machine. There is no local database, cache or inventory, and an
 interrupted command can always be re-run.
 
-> **Status:** early. `render`, `bootstrap`, `cluster create/plan/status/delete` and the
-> self-hosting pivot work today. `validate` is next.
+> **Status:** early. `validate`, `render`, `bootstrap`, `cluster create/plan/status/delete` and
+> the self-hosting pivot work today.
 
 ## Install
 
@@ -88,6 +88,27 @@ rather than an in-place edit Cluster API would refuse or apply only to future ma
 `render` contacts no cluster, and the same input always gives byte-identical output, so you can
 review the result, diff it between versions, or commit it to your own GitOps repository. It never
 contains secrets: hypervisor credentials are referenced by Secret name only.
+
+## Check the host first
+
+```bash
+hydra validate -f hydra.yaml --hypervisor-credentials ./libvirt-pki
+```
+
+`validate` checks, read-only, what bootstrap and create will need:
+- a container runtime kind can use;
+- the hypervisor's libvirt TLS listener (16514), and that its plaintext one (16509) is closed;
+- the client certificate (keyEncipherment, validity) and the TLS login;
+- the storage pool and its free space, and the base image;
+- each bridge: up, and no port holding an address of its own;
+- the control-plane endpoint: free, on a network that is reachable (for a managed network,
+  through its gateway).
+
+Reachability is judged from where Cluster API's controllers run: inside the bootstrap cluster's
+kind node when it exists, else from this machine. Silence from the endpoint proves it free only
+once its network is shown reachable; otherwise the check warns rather than passes. Every result is
+PASS, WARN or FAIL with a fix, and the command exits non-zero on any FAIL. Without
+`--hypervisor-credentials` the checks that need a libvirt login are reported as not checked.
 
 ## Bootstrap a management cluster
 
