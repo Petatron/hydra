@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -22,14 +23,14 @@ import (
 )
 
 // pivotHooks are the clusterctl operations a pivot runs; tests replace them.
-var pivotHooks = func(out io.Writer) pivot.Hooks {
+var pivotHooks = func(out io.Writer, what string) pivot.Hooks {
 	return pivot.Hooks{
 		EnsureProviders: func(ctx context.Context, kubeconfig []byte) error {
 			cl, err := bootstrap.ConnectKube(string(kubeconfig))
 			if err != nil {
 				return err
 			}
-			return (&bootstrap.Bootstrapper{Out: out}).EnsureProviders(ctx, cl)
+			return (&bootstrap.Bootstrapper{Out: out}).EnsureProviders(ctx, cl, what)
 		},
 		Move: bootstrap.MoveNamespace,
 	}
@@ -53,7 +54,10 @@ func targetKubeconfig(ctx context.Context, src *cluster.Manager, ns, name, expli
 		path = defaultPath
 	}
 	b, err := os.ReadFile(path)
-	if err != nil {
+	switch {
+	case err != nil && serr == nil:
+		return nil, "", false, fmt.Errorf("--cluster-kubeconfig %s is unreadable (%v); the source's Secret %s/%s-kubeconfig was left unused because an explicit path wins. Fix the path, or drop the flag to use the Secret", path, err, ns, name)
+	case err != nil:
 		return nil, "", false, fmt.Errorf("no kubeconfig for cluster %s: the source has no %s-kubeconfig Secret and %s is unreadable (%v); pass --cluster-kubeconfig", name, name, path, err)
 	}
 	if serr == nil {
@@ -98,6 +102,36 @@ type pivotOptions struct {
 	// fresh confirms, for create --self-hosted, that no copy of the cluster
 	// exists yet when nothing local can show it.
 	fresh bool
+	// configFile is the hydra.yaml path, for commands printed in errors.
+	configFile string
+}
+
+// targetKubeconfigFile returns a file holding the target kubeconfig, for
+// commands an operator may need to run. A kubeconfig read from a file is that
+// file. One read from the source's Secret is written to ./<name>.kubeconfig
+// (the file create writes), unless a different cluster's kubeconfig is
+// already there.
+func targetKubeconfigFile(explicit, name, from string, kc []byte) (string, error) {
+	if explicit != "" {
+		return explicit, nil
+	}
+	path := name + ".kubeconfig"
+	if from == path {
+		return path, nil
+	}
+	if old, err := os.ReadFile(path); err == nil {
+		same, err := cluster.SameCA(old, kc)
+		if err != nil || !same {
+			return "", fmt.Errorf("%s exists but is not cluster %s's kubeconfig (its certificate authority differs or is unreadable); move it aside or pass --cluster-kubeconfig", path, name)
+		}
+		return path, nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return "", fmt.Errorf("reading %s: %w", path, err)
+	}
+	if err := writeKubeconfig(path, kc, false); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 // runPivot moves the cluster from the source onto itself, verifies, and then
@@ -117,18 +151,34 @@ func runPivot(ctx context.Context, cmd *cobra.Command, src *target, cfg config.M
 			return err
 		}
 	}
-	p := &pivot.Pivot{
-		Source:    pivot.Side{Name: src.source, C: src.m.C, Kubeconfig: src.kubeconfig},
-		Target:    pivot.Side{Name: "cluster " + cfg.Name, C: tc, Kubeconfig: kc},
-		Namespace: cfg.Namespace,
-		Name:      cfg.Name,
-		Hooks:     pivotHooks(out),
-		Out:       out,
-	}
-	if err := p.Run(ctx, o.timeout); err != nil {
+	targetFile, err := targetKubeconfigFile(o.clusterKubeconfig, cfg.Name, from, kc)
+	if err != nil {
 		return err
 	}
-	_, _ = fmt.Fprintf(out, "cluster %s/%s now manages itself; keep its kubeconfig (from %s) and pass it as --management-kubeconfig to hydra from here on\n", cfg.Namespace, cfg.Name, from)
+	srcSide := pivot.Side{Name: src.source, C: src.m.C, Kubeconfig: src.kubeconfig, File: src.path}
+	if src.bootstrapKind {
+		srcSide.File = bootstrap.KindName(cfg.Name) + ".kubeconfig"
+		cf := o.configFile
+		if cf == "" {
+			cf = "hydra.yaml"
+		}
+		srcSide.Prep = fmt.Sprintf("hydra bootstrap kubeconfig -f %s > %s", cf, srcSide.File)
+	}
+	p := &pivot.Pivot{
+		Source:    srcSide,
+		Target:    pivot.Side{Name: "cluster " + cfg.Name, C: tc, Kubeconfig: kc, File: targetFile},
+		Namespace: cfg.Namespace,
+		Name:      cfg.Name,
+		Hooks:     pivotHooks(out, "cluster "+cfg.Name),
+		Out:       out,
+	}
+	if err := p.Run(ctx, o.timeout); errors.Is(err, pivot.ErrAlreadySelfHosted) {
+		_, _ = fmt.Fprintf(out, "cluster %s/%s already manages itself (%s is the cluster itself); nothing to move\n", cfg.Namespace, cfg.Name, src.source)
+		return nil
+	} else if err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(out, "cluster %s/%s now manages itself; pass %s as --management-kubeconfig to hydra from here on\n", cfg.Namespace, cfg.Name, targetFile)
 	if !src.bootstrapKind || o.keepBootstrap {
 		return nil
 	}
@@ -183,6 +233,7 @@ is the cluster itself by its certificate authority before moving anything.`,
 			}
 			ctx, stop := interruptible(cmd)
 			defer stop()
+			o.configFile = file
 			return runPivot(ctx, cmd, t, cfg.Metadata, o)
 		},
 	}
@@ -198,19 +249,31 @@ func addPivotFlags(c *cobra.Command, o *pivotOptions) {
 	c.Flags().DurationVar(&o.timeout, "pivot-timeout", 15*time.Minute, "how long to wait for the cluster to verify on itself")
 }
 
-// endpointAnswers reports whether something already accepts connections on
-// the cluster's stated API endpoint. Tests replace it.
-var endpointAnswers = func(endpoint string) bool {
+// endpointAnswers probes the cluster's stated API endpoint: true when
+// something accepts connections, false with no error when the host refuses
+// them (nothing listens), and an error when this machine cannot tell (a
+// timeout, no route): that is not evidence the cluster is absent. Tests
+// replace it.
+var endpointAnswers = func(endpoint string) (bool, error) {
 	host, port, err := config.SplitEndpoint(endpoint)
 	if err != nil {
-		return false
+		return false, err
 	}
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), 3*time.Second)
-	if err != nil {
-		return false
+	return probeTCP(net.JoinHostPort(host, strconv.Itoa(port)))
+}
+
+// probeTCP is endpointAnswers' dial: true when addr accepts, false with no
+// error when refused, and the dial error when this machine cannot tell.
+func probeTCP(addr string) (bool, error) {
+	conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+	if err == nil {
+		_ = conn.Close()
+		return true, nil
 	}
-	_ = conn.Close()
-	return true
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return false, nil
+	}
+	return false, err
 }
 
 // runSelfHosted is `create --self-hosted`: bootstrap, create, pivot, delete
@@ -263,8 +326,9 @@ func runSelfHosted(ctx context.Context, cmd *cobra.Command, cfg *config.ClusterC
 			return fmt.Errorf("%s exists but cannot show whether cluster %s already runs (%v). If that cluster is gone, remove the file; otherwise fix access and rerun", path, md.Name, err)
 		case err == nil && self && kindExists:
 			// The move ran, at least in part: let the pivot find where the
-			// objects are (it unpauses, verifies, or reports a split) and
-			// then remove the kind cluster.
+			// objects are (it verifies, or reports a pause or a split with
+			// the commands to run; it never unpauses) and then remove the
+			// kind cluster once the target verifies.
 			_, _ = fmt.Fprintf(out, "cluster %s/%s already holds its own Cluster object; finishing the pivot\n", md.Namespace, md.Name)
 			t, err := manager(cmd, "", md.Name)
 			if err != nil {
@@ -285,15 +349,8 @@ func runSelfHosted(ctx context.Context, cmd *cobra.Command, cfg *config.ClusterC
 	}
 
 	if !kindHolds {
-		// A fresh start must not build a second cluster beside one that is
-		// already running (a self-hosted cluster whose kubeconfig file is
-		// gone, say).
-		ep := cfg.Spec.Network.ControlPlaneEndpoint
-		switch {
-		case ep != "" && endpointAnswers(ep):
-			return fmt.Errorf("something already answers on %s, this cluster's API endpoint; it may already be running. Pass --cluster-kubeconfig with its kubeconfig to finish or check it, rather than building a second one", ep)
-		case ep == "" && !po.fresh:
-			return fmt.Errorf("this cluster's endpoint is left for Hydra to choose, and there is no bootstrap cluster or kubeconfig file (%s) to show whether it already exists. If you are sure it does not, rerun with --fresh", path)
+		if err := checkFreshStart(cfg, path, po.fresh); err != nil {
+			return err
 		}
 	}
 
@@ -334,4 +391,27 @@ func selfHostedThrough(ctx context.Context, kubeconfig []byte, ns, name string) 
 		return false, "", nil
 	}
 	return m.SelfHosted(ctx, ns, name, kubeconfig, st)
+}
+
+// checkFreshStart refuses a fresh build beside a cluster that may already be
+// running (a self-hosted cluster whose kubeconfig file is gone, say): when
+// its endpoint answers, or when this machine cannot tell and --fresh was not
+// given.
+func checkFreshStart(cfg *config.ClusterConfig, path string, fresh bool) error {
+	md := cfg.Metadata
+	ep := cfg.Spec.Network.ControlPlaneEndpoint
+	if ep == "" {
+		if !fresh {
+			return fmt.Errorf("this cluster's endpoint is left for Hydra to choose, and there is no bootstrap cluster or kubeconfig file (%s) to show whether it already exists. If you are sure it does not, rerun with --fresh", path)
+		}
+		return nil
+	}
+	answers, err := endpointAnswers(ep)
+	switch {
+	case answers:
+		return fmt.Errorf("something already answers on %s, this cluster's API endpoint; it may already be running. Pass --cluster-kubeconfig with its kubeconfig to finish or check it, rather than building a second one", ep)
+	case err != nil && !fresh:
+		return fmt.Errorf("cannot tell whether cluster %s already runs: this machine cannot reach its endpoint %s (%v), and there is no bootstrap cluster or kubeconfig file (%s) to show it. If you are sure it does not exist, rerun with --fresh", md.Name, ep, err, path)
+	}
+	return nil
 }

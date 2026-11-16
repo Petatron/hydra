@@ -5,7 +5,8 @@
 // Every run rediscovers where the objects are -- on the source, on the target,
 // or split by an interrupted move -- and continues from there. Nothing is
 // recorded locally. The move is verified on the target before anything on the
-// source is removed, and a move whose verification fails is moved back.
+// source is removed. A move whose verification fails stays on the target: it
+// is never moved back, and nothing is ever unpaused, automatically (see Run).
 package pivot
 
 import (
@@ -57,6 +58,28 @@ type Side struct {
 	Name       string // for messages: "bootstrap cluster", "pet82"
 	C          client.Client
 	Kubeconfig []byte
+	// File is a kubeconfig path an operator can pass to kubectl or
+	// clusterctl, and Prep the command that writes it first, if any. They
+	// make the commands in error messages ones that can be run as printed.
+	File, Prep string
+}
+
+// ref is the side's kubeconfig as a command argument.
+func (s Side) ref() string { return s.File }
+
+// steps prefixes cmds with whatever writes the kubeconfig files they use.
+func steps(sides []Side, cmds ...string) string {
+	var out []string
+	for _, s := range sides {
+		if s.Prep != "" {
+			out = append(out, s.Prep)
+		}
+	}
+	out = append(out, cmds...)
+	for i, c := range out {
+		out[i] = fmt.Sprintf("(%d) %s", i+1, c)
+	}
+	return strings.Join(out, " ")
 }
 
 // Hooks are the operations a pivot delegates, replaced in tests.
@@ -137,6 +160,11 @@ func hasCluster(ctx context.Context, c client.Client, namespace, name string) (b
 	return false, err
 }
 
+// ErrAlreadySelfHosted is returned when source and target are one cluster:
+// the cluster already manages itself, and there is nothing to move. Moving a
+// cluster onto itself would delete the only copy of its objects.
+var ErrAlreadySelfHosted = errors.New("the source and target are the same cluster: it already manages itself")
+
 // ErrSplit is returned when an interrupted move left objects on both sides.
 var ErrSplit = errors.New("the Cluster object exists on both management clusters: a move was interrupted part way")
 
@@ -155,6 +183,16 @@ var ErrSplit = errors.New("the Cluster object exists on both management clusters
 // It never unpauses anything either: a pause left by an interrupted move and
 // one an operator set look the same, so it says what to run instead.
 func (p *Pivot) Run(ctx context.Context, verifyTimeout time.Duration) error {
+	// Both kubeconfigs reaching one cluster looks like a split to Locate, and
+	// clusterctl move has no same-cluster check: it would delete the only
+	// copy. Tell them apart by certificate authority before anything else.
+	same, err := cluster.SameCA(p.Source.Kubeconfig, p.Target.Kubeconfig)
+	if err != nil {
+		return fmt.Errorf("telling the %s and %s apart: %w", p.Source.Name, p.Target.Name, err)
+	}
+	if same {
+		return ErrAlreadySelfHosted
+	}
 	where, err := p.Locate(ctx)
 	if err != nil {
 		return err
@@ -164,18 +202,21 @@ func (p *Pivot) Run(ctx context.Context, verifyTimeout time.Duration) error {
 	case Nowhere:
 		return fmt.Errorf("the Cluster %s/%s exists on neither management cluster", p.Namespace, p.Name)
 	case Split:
-		return fmt.Errorf("%w. Do not delete either copy. clusterctl paused the source copy and has not finished creating the target. To finish the move: unpause the source copy (%s), then run the move again with clusterctl itself, which updates the objects already on the target: clusterctl move --kubeconfig <source> --to-kubeconfig <cluster's kubeconfig> --namespace %s. Then rerun this command to verify", ErrSplit, unpauseCommand("<source>", p.Namespace, p.Name), p.Namespace)
+		return fmt.Errorf("%w. Do not delete either copy. clusterctl paused the source copy and has not finished creating the target. To finish the move, unpause the source copy and run the move again with clusterctl itself, which updates the objects already on the target: %s. Then rerun this command to verify", ErrSplit,
+			steps([]Side{p.Source, p.Target},
+				unpauseCommand(p.Source.ref(), p.Namespace, p.Name),
+				fmt.Sprintf("clusterctl move --kubeconfig %s --to-kubeconfig %s --namespace %s", p.Source.ref(), p.Target.ref(), p.Namespace)))
 	case OnTarget:
 		cl, err := p.getCluster(ctx, p.Target.C)
 		if err != nil {
 			return err
 		}
 		if why := pauseReason(cl); why != "" {
-			return fmt.Errorf("the Cluster on %s is paused (%s). A move interrupted after it deleted the source copy leaves it so, but so does an operator's pause, and pivot cannot tell which. If no one paused it on purpose, %s, then rerun to verify", p.Target.Name, why, unpauseAdvice(cl, "<cluster's kubeconfig>", p.Namespace, p.Name))
+			return fmt.Errorf("the Cluster on %s is paused (%s). A move interrupted after it deleted the source copy leaves it so, but so does an operator's pause, and pivot cannot tell which. If no one paused it on purpose, %s, then rerun to verify", p.Target.Name, why, unpauseAdvice(cl, p.Target, p.Namespace, p.Name))
 		}
 		p.logf("already on %s; verifying only", p.Target.Name)
 		if err := p.verify(ctx, verifyTimeout); err != nil {
-			return fmt.Errorf("%s holds the cluster but it does not verify: %w. Nothing was moved; inspect it with `hydra cluster status --management-kubeconfig <its kubeconfig>`", p.Target.Name, err)
+			return fmt.Errorf("%s holds the cluster but it does not verify: %w. Nothing was moved; inspect it with `hydra cluster status --management-kubeconfig %s`", p.Target.Name, err, p.Target.ref())
 		}
 		return nil
 	}
@@ -191,7 +232,8 @@ func (p *Pivot) Run(ctx context.Context, verifyTimeout time.Duration) error {
 		if ctx.Err() != nil {
 			return fmt.Errorf("interrupted before %s verified (%w). The cluster has moved and stays there; rerun pivot to keep verifying", p.Target.Name, err)
 		}
-		return fmt.Errorf("the cluster moved to %s but did not verify there: %w. It stays on %s, which manages it now; pivot never moves a cluster back automatically, because a VM may already have been taken over and moving it back would strand that machine. Inspect it with `hydra cluster status --management-kubeconfig <its kubeconfig>` and rerun pivot to keep verifying. To undo the move by hand, first confirm in the target provider's log that no machine was taken over (\"Took over a machine moved from another management cluster\"), then: clusterctl move --kubeconfig <cluster's kubeconfig> --to-kubeconfig <source> --namespace %s", p.Target.Name, err, p.Target.Name, p.Namespace)
+		return fmt.Errorf("the cluster moved to %s but did not verify there: %w. It stays on %s, which manages it now; pivot never moves a cluster back automatically, because a VM may already have been taken over and moving it back would strand that machine. Inspect it with `hydra cluster status --management-kubeconfig %s` and rerun pivot to keep verifying. To undo the move by hand, first confirm in the target provider's log that no machine was taken over (\"Took over a machine moved from another management cluster\"), then: %s", p.Target.Name, err, p.Target.Name, p.Target.ref(),
+			steps([]Side{p.Source}, fmt.Sprintf("clusterctl move --kubeconfig %s --to-kubeconfig %s --namespace %s", p.Target.ref(), p.Source.ref(), p.Namespace)))
 	}
 	return nil
 }
@@ -243,15 +285,15 @@ func unpauseCommand(kubeconfig, namespace, name string) string {
 }
 
 // unpauseAdvice names the commands that clear every pause cl has.
-func unpauseAdvice(cl *unstructured.Unstructured, kubeconfig, namespace, name string) string {
+func unpauseAdvice(cl *unstructured.Unstructured, side Side, namespace, name string) string {
 	var cmds []string
 	if p, _, _ := unstructured.NestedBool(cl.Object, "spec", "paused"); p {
-		cmds = append(cmds, unpauseCommand(kubeconfig, namespace, name))
+		cmds = append(cmds, unpauseCommand(side.ref(), namespace, name))
 	}
 	if _, ok := cl.GetAnnotations()[pausedAnnotation]; ok {
-		cmds = append(cmds, fmt.Sprintf("kubectl --kubeconfig %s -n %s annotate cluster %s %s-", kubeconfig, namespace, name, pausedAnnotation))
+		cmds = append(cmds, fmt.Sprintf("kubectl --kubeconfig %s -n %s annotate cluster %s %s-", side.ref(), namespace, name, pausedAnnotation))
 	}
-	return "run: " + strings.Join(cmds, " and ")
+	return "run: " + steps([]Side{side}, cmds...)
 }
 
 func (p *Pivot) getCluster(ctx context.Context, c client.Client) (*unstructured.Unstructured, error) {
@@ -275,7 +317,7 @@ func (p *Pivot) preflight(ctx context.Context) error {
 		return err
 	}
 	if why := pauseReason(cl); why != "" {
-		return fmt.Errorf("the Cluster %s/%s is paused on the %s (%s), and clusterctl refuses to move a paused cluster. An earlier move that failed before reaching the target can leave it so. If no move is in progress and no one paused it on purpose, %s, then rerun pivot", p.Namespace, p.Name, p.Source.Name, why, unpauseAdvice(cl, "<source>", p.Namespace, p.Name))
+		return fmt.Errorf("the Cluster %s/%s is paused on the %s (%s), and clusterctl refuses to move a paused cluster. An earlier move that failed before reaching the target can leave it so. If no move is in progress and no one paused it on purpose, %s, then rerun pivot", p.Namespace, p.Name, p.Source.Name, why, unpauseAdvice(cl, p.Source, p.Namespace, p.Name))
 	}
 	if st.Available != cluster.ConditionTrue || !st.RolledOut {
 		return fmt.Errorf("the Cluster %s/%s is not settled (%s); move only an Available cluster with no rollout in progress", p.Namespace, p.Name, st.Line())

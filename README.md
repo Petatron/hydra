@@ -146,7 +146,11 @@ The VMs are untouched; the cluster's own Hydra provider takes them over.
 - Before moving it checks that the cluster is Available with no rollout, is alone in its
   namespace, is not paused, every machine has recorded its identity, the credentials Secret and
   Hydra CRDs carry the labels `clusterctl move` needs, and a dry run passes.
-- It proves the target is the cluster itself by its certificate authority before moving.
+- It proves the target is the cluster itself by its certificate authority before moving. Run
+  against a cluster that already manages itself, it says so and moves nothing.
+- Commands it prints use real kubeconfig files: the cluster's is written to `./<name>.kubeconfig`
+  when it came only from the Secret, and the bootstrap cluster's comes from
+  `hydra bootstrap kubeconfig`.
 - After moving it waits for the cluster to verify on itself. If that fails, the cluster stays on
   the target and the error says how to inspect it and how to undo the move by hand. pivot never
   moves a cluster back on its own: a VM may already have been taken over, and moving that machine
@@ -156,9 +160,9 @@ The VMs are untouched; the cluster's own Hydra provider takes them over.
   pivot never unpauses or deletes either.
 - `create --self-hosted` never builds a second copy: if the cluster's kubeconfig reaches it
   already managing itself, there is nothing to do; if it reaches a cluster that is running but not
-  yet self-hosted, or the endpoint already answers, it refuses.
-  When Hydra chooses the endpoint and nothing local shows whether the cluster exists, pass
-  `--fresh`.
+  yet self-hosted, or the endpoint already answers, it refuses. When hydra cannot check (Hydra
+  chooses the endpoint, or this machine cannot reach it) and nothing local shows whether the cluster
+  exists, pass `--fresh`.
 - After a pivot, pass the cluster's kubeconfig as `--management-kubeconfig` to every command.
 
 ## Pinned components

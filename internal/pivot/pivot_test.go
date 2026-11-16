@@ -3,6 +3,7 @@ package pivot
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"maps"
 	"slices"
@@ -179,13 +180,28 @@ func fakeMove(ctx context.Context, from, to client.Client, rec *recorder) error 
 	return setPaused(ctx, to, false)
 }
 
+func kubeconfigFor(server, ca string) []byte {
+	return []byte(`apiVersion: v1
+kind: Config
+clusters: [{name: c, cluster: {server: "` + server + `", certificate-authority-data: "` + base64.StdEncoding.EncodeToString([]byte(ca)) + `"}}]
+contexts: [{name: c, context: {cluster: c, user: u}}]
+current-context: c
+users: [{name: u, user: {token: x}}]
+`)
+}
+
+var (
+	srcKubeconfig = kubeconfigFor("https://127.0.0.1:40000", "ca-kind")
+	tgtKubeconfig = kubeconfigFor("https://10.0.0.12:6443", "ca-c")
+)
+
 // pivotFor wires a Pivot whose Move hook runs fakeMove between the two fake
 // clients.
 func pivotFor(t *testing.T, src, tgt client.Client, rec *recorder) *Pivot {
 	t.Helper()
 	return &Pivot{
-		Source:    Side{Name: "bootstrap cluster", C: src, Kubeconfig: []byte("source")},
-		Target:    Side{Name: "cluster c", C: tgt, Kubeconfig: []byte("target")},
+		Source:    Side{Name: "bootstrap cluster", C: src, Kubeconfig: srcKubeconfig, File: "kind.kubeconfig", Prep: "hydra bootstrap kubeconfig -f hydra.yaml > kind.kubeconfig"},
+		Target:    Side{Name: "cluster c", C: tgt, Kubeconfig: tgtKubeconfig, File: "c.kubeconfig"},
 		Namespace: ns,
 		Name:      name,
 		Out:       &bytes.Buffer{},
@@ -197,7 +213,7 @@ func pivotFor(t *testing.T, src, tgt client.Client, rec *recorder) *Pivot {
 				case dryRun:
 					rec.moves = append(rec.moves, "dry")
 					return nil
-				case string(from) != "source":
+				case !bytes.Equal(from, srcKubeconfig):
 					t.Fatal("pivot must never move from the target")
 				}
 				rec.moves = append(rec.moves, "forward")
@@ -333,7 +349,7 @@ func TestPivotInterruptedMoveLeavesASplit(t *testing.T) {
 	}
 	rec = &recorder{}
 	err := pivotFor(t, src, tgt, rec).Run(ctx, time.Second)
-	if !errors.Is(err, ErrSplit) || !strings.Contains(err.Error(), "clusterctl move --kubeconfig <source>") || !strings.Contains(err.Error(), `"paused":false`) {
+	if !errors.Is(err, ErrSplit) || !strings.Contains(err.Error(), "(1) hydra bootstrap kubeconfig -f hydra.yaml > kind.kubeconfig") || !strings.Contains(err.Error(), "clusterctl move --kubeconfig kind.kubeconfig --to-kubeconfig c.kubeconfig") || !strings.Contains(err.Error(), `"paused":false`) {
 		t.Fatalf("want ErrSplit with the finishing commands, got %v", err)
 	}
 	if len(rec.moves) != 0 {
@@ -464,6 +480,33 @@ func TestPivotForwardMoveFailureIsResumable(t *testing.T) {
 	rec := &recorder{failFwd: true}
 	err := pivotFor(t, src, tgt, rec).Run(context.Background(), time.Second)
 	if err == nil || !strings.Contains(err.Error(), "rerun pivot") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+// Both kubeconfigs reaching one cluster (pivot run again with the cluster's
+// own kubeconfig as the source) must not look like a split, and must never
+// print a clusterctl move: on one cluster that deletes the only copy.
+func TestPivotSameClusterIsAlreadySelfHosted(t *testing.T) {
+	c := newClient(t, append(clusterObjects("tgt", true), labelledCRDs()...)...)
+	rec := &recorder{}
+	p := pivotFor(t, c, c, rec)
+	p.Source.Kubeconfig = kubeconfigFor("https://other-name:6443", "ca-c") // same CA, other server name
+	err := p.Run(context.Background(), time.Second)
+	if !errors.Is(err, ErrAlreadySelfHosted) || strings.Contains(err.Error(), "clusterctl move") {
+		t.Fatalf("got %v", err)
+	}
+	if len(rec.moves) != 0 {
+		t.Errorf("moves %v", rec.moves)
+	}
+}
+
+func TestPivotRefusesWithoutAReadableCA(t *testing.T) {
+	src := newClient(t, append(clusterObjects("src", true), labelledCRDs()...)...)
+	tgt := newClient(t, labelledCRDs()...)
+	p := pivotFor(t, src, tgt, &recorder{})
+	p.Source.Kubeconfig = []byte("not a kubeconfig")
+	if err := p.Run(context.Background(), time.Second); err == nil || !strings.Contains(err.Error(), "certificate authority") {
 		t.Fatalf("got %v", err)
 	}
 }

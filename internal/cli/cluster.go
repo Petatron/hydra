@@ -64,6 +64,8 @@ type target struct {
 	server string
 	// bootstrapKind is true when it is the bootstrap kind cluster.
 	bootstrapKind bool
+	// path is the --management-kubeconfig path, "" for the kind cluster.
+	path string
 	// kubeconfig is the management kubeconfig, for identity checks.
 	kubeconfig []byte
 }
@@ -86,7 +88,7 @@ func manager(cmd *cobra.Command, kubeconfigPath, clusterName string) (*target, e
 	}
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "management cluster: %s (%s)\n", source, server)
 	return &target{m: &cluster.Manager{C: c, Out: cmd.ErrOrStderr()}, source: source, server: server,
-		bootstrapKind: kubeconfigPath == "", kubeconfig: kc}, nil
+		bootstrapKind: kubeconfigPath == "", kubeconfig: kc, path: kubeconfigPath}, nil
 }
 
 func interruptible(cmd *cobra.Command) (context.Context, func()) {
@@ -146,6 +148,7 @@ used.`,
 				if po.clusterKubeconfig == "" {
 					po.clusterKubeconfig = kubeconfigOut
 				}
+				po.configFile = file
 				return runSelfHosted(ctx, cmd, cfg, objs, credentials, co, po)
 			}
 			t, err := manager(cmd, mgmt, cfg.Metadata.Name)
@@ -166,7 +169,7 @@ used.`,
 	c.Flags().BoolVar(&selfHosted, "self-hosted", false, "bootstrap a kind cluster, create the cluster from it, pivot the cluster onto itself and delete kind")
 	c.Flags().StringVar(&credentials, "hypervisor-credentials", "", "with --self-hosted: directory holding cacert.pem, clientcert.pem and clientkey.pem (needed the first time)")
 	addPivotFlags(c, &po)
-	c.Flags().BoolVar(&po.fresh, "fresh", false, "with --self-hosted and an endpoint Hydra chooses: confirm no copy of this cluster exists yet")
+	c.Flags().BoolVar(&po.fresh, "fresh", false, "with --self-hosted: confirm no copy of this cluster exists yet, when hydra cannot check (Hydra chooses the endpoint, or this machine cannot reach it)")
 	return c
 }
 

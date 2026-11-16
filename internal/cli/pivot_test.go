@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -86,6 +88,13 @@ func TestTargetKubeconfig(t *testing.T) {
 			t.Fatalf("got %q %v %v", from, proven, err)
 		}
 	})
+	t.Run("an unreadable explicit file says the Secret was left unused", func(t *testing.T) {
+		src := &cluster.Manager{C: fakeClient(t, kubeconfigSecret(own))}
+		_, _, _, err := targetKubeconfig(ctx, src, "ns", "c", filepath.Join(t.TempDir(), "missing"), "")
+		if err == nil || !strings.Contains(err.Error(), "left unused") || strings.Contains(err.Error(), "has no") {
+			t.Fatalf("got %v", err)
+		}
+	})
 	t.Run("without the Secret the file is used unproven", func(t *testing.T) {
 		src := &cluster.Manager{C: fakeClient(t)}
 		_, _, proven, err := targetKubeconfig(ctx, src, "ns", "c", "", writeFile(t, own))
@@ -148,28 +157,31 @@ func selfHostedConfig(endpoint string) *config.ClusterConfig {
 
 func TestSelfHostedRefusesBeforeBuilding(t *testing.T) {
 	ctx := context.Background()
-	answering := func(t *testing.T, v bool) {
+	answering := func(t *testing.T, v bool, err error) {
 		orig := endpointAnswers
-		endpointAnswers = func(string) bool { return v }
+		endpointAnswers = func(string) (bool, error) { return v, err }
 		t.Cleanup(func() { endpointAnswers = orig })
 	}
+	unreachable := errors.New("dial tcp 10.0.0.12:6443: i/o timeout")
 	for _, tc := range []struct {
 		name     string
 		endpoint string
 		answers  bool
+		probeErr error
 		file     []byte // nil: no kubeconfig file
 		fileDir  bool   // the path is a directory: unreadable
 		wantErr  string
 	}{
-		{"endpoint already answers", "10.0.0.12", true, nil, false, "already answers"},
-		{"Hydra chooses the endpoint, no --fresh", "", false, nil, false, "--fresh"},
-		{"unreadable kubeconfig path", "10.0.0.12", false, nil, true, "reading"},
-		{"kubeconfig file but cluster unreachable", "10.0.0.12", false, []byte("not a kubeconfig"), false, "cannot show whether"},
+		{"endpoint already answers", "10.0.0.12", true, nil, nil, false, "already answers"},
+		{"endpoint unreachable, no --fresh", "10.0.0.12", false, unreachable, nil, false, "cannot reach its endpoint"},
+		{"Hydra chooses the endpoint, no --fresh", "", false, nil, nil, false, "--fresh"},
+		{"unreadable kubeconfig path", "10.0.0.12", false, nil, nil, true, "reading"},
+		{"kubeconfig file but cluster unreachable", "10.0.0.12", false, nil, []byte("not a kubeconfig"), false, "cannot show whether"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			k := &fakeKind{}
 			withFakeKind(t, k)
-			answering(t, tc.answers)
+			answering(t, tc.answers, tc.probeErr)
 			orig := connectManagement
 			connectManagement = func(b []byte) (client.Client, error) { return cluster.Connect(b) }
 			t.Cleanup(func() { connectManagement = orig })
@@ -247,5 +259,41 @@ func TestSelfHostedRefusesWhenTheFileReachesALiveCluster(t *testing.T) {
 				t.Error("nothing may be built")
 			}
 		})
+	}
+}
+
+func TestTargetKubeconfigFile(t *testing.T) {
+	own := kubeconfigWithCA("https://10.0.0.12:6443", "ca-c")
+	other := kubeconfigWithCA("https://10.0.0.99:6443", "ca-other")
+	t.Chdir(t.TempDir())
+	got, err := targetKubeconfigFile("", "c", "Secret ns/c-kubeconfig", own)
+	if err != nil || got != "c.kubeconfig" {
+		t.Fatalf("got %q %v", got, err)
+	}
+	if b, _ := os.ReadFile("c.kubeconfig"); !bytes.Equal(b, own) {
+		t.Error("the Secret's kubeconfig must be written for the printed commands")
+	}
+	if err := os.WriteFile("c.kubeconfig", other, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := targetKubeconfigFile("", "c", "Secret ns/c-kubeconfig", own); err == nil {
+		t.Error("another cluster's kubeconfig must not be overwritten or used")
+	}
+}
+
+func TestProbeTCP(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	open := l.Addr().String()
+	if ok, err := probeTCP(open); !ok || err != nil {
+		t.Errorf("a listener must answer: %v %v", ok, err)
+	}
+	_ = l.Close()
+	// The port is closed now: the host refuses, which is evidence nothing
+	// listens there, not an unknown.
+	if ok, err := probeTCP(open); ok || err != nil {
+		t.Errorf("a refused connection is a plain no: %v %v", ok, err)
 	}
 }
