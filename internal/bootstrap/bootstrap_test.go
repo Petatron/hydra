@@ -217,6 +217,20 @@ func TestRefusesWrongVersion(t *testing.T) {
 	}
 }
 
+// On a pivot target the objects still live on the source, so the refusal must
+// name the target and never advise deleting anything.
+func TestEnsureProvidersOnATargetNeverAdvisesDeleting(t *testing.T) {
+	_, c, b, _ := newFakes()
+	c.installed["cluster-api"] = "v1.13.2"
+	err := b.EnsureProviders(context.Background(), c, "cluster pet83")
+	if err == nil || !strings.Contains(err.Error(), "providers on cluster pet83") || strings.Contains(err.Error(), "delete") {
+		t.Fatalf("got %v", err)
+	}
+	if len(c.inited) != 0 {
+		t.Error("nothing may be installed after a version mismatch")
+	}
+}
+
 func TestInitFailureIsResumable(t *testing.T) {
 	_, c, b, _ := newFakes()
 	c.initErr = errors.New("boom")

@@ -193,7 +193,7 @@ func (b *Bootstrapper) Create(ctx context.Context, c *config.ClusterConfig, opts
 		return fmt.Errorf("%w (if the kind cluster is stopped or broken, remove it with `hydra bootstrap delete --force` and run bootstrap again)", err)
 	}
 
-	if err := b.ensureProviders(ctx, cl); err != nil {
+	if err := b.ensureProviders(ctx, cl, "bootstrap cluster "+KindName(c.Metadata.Name), "delete the bootstrap cluster with hydra bootstrap delete, or use a hydra release that pins them"); err != nil {
 		return err
 	}
 	if err := b.ensureCredentials(ctx, cl, c, opts); err != nil {
@@ -223,9 +223,20 @@ func (b *Bootstrapper) connect(name string) (Cluster, error) {
 	return cl, nil
 }
 
+// EnsureProviders brings any management cluster (the bootstrap one, or a
+// pivot target) to the pinned providers: installs what is missing, refuses
+// what is at another version, and waits for all of them to be available.
+//
+// what names the cluster for messages. A version mismatch is refused with no
+// advice to delete anything: on a pivot target the objects still live on the
+// source, and deleting the source would leave the VMs unmanaged.
+func (b *Bootstrapper) EnsureProviders(ctx context.Context, cl Cluster, what string) error {
+	return b.ensureProviders(ctx, cl, what, "nothing has been moved, and the source still manages the cluster; upgrade or remove those providers on "+what+" yourself, or use a hydra release that pins them")
+}
+
 // ensureProviders installs whichever pinned providers are missing and refuses
 // to touch one installed at another version.
-func (b *Bootstrapper) ensureProviders(ctx context.Context, cl Cluster) error {
+func (b *Bootstrapper) ensureProviders(ctx context.Context, cl Cluster, what, remedy string) error {
 	installed, err := cl.InstalledProviders(ctx)
 	if err != nil {
 		return fmt.Errorf("reading installed providers: %w", err)
@@ -247,7 +258,7 @@ func (b *Bootstrapper) ensureProviders(ctx context.Context, cl Cluster) error {
 		}
 	}
 	if len(wrong) > 0 {
-		return fmt.Errorf("providers at unexpected versions (not changing them; delete the bootstrap cluster or use a matching hydra release): %s", strings.Join(wrong, "; "))
+		return fmt.Errorf("providers on %s at unexpected versions (not changing them; %s): %s", what, remedy, strings.Join(wrong, "; "))
 	}
 	// cert-manager is installed by clusterctl init, not tracked in its
 	// inventory: with every provider present but cert-manager gone, run init
