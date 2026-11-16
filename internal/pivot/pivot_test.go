@@ -72,6 +72,9 @@ func clusterObjects(uidSuffix string, identityRecorded bool) []client.Object {
 	hc := u(hydraClusterGVK, ns, name, map[string]any{"spec": map[string]any{"hypervisor": map[string]any{
 		"credentialsSecretRef": map[string]any{"name": "c-pki"},
 	}}})
+	for _, o := range []*unstructured.Unstructured{kcp, crs, hc} {
+		o.SetLabels(map[string]string{"hydra.io/cluster": name}) // as rendered
+	}
 	return []client.Object{cl, kcp, hm, sec, crs, bind, hc}
 }
 
@@ -460,14 +463,47 @@ func TestPivotRefusesAClusterWithoutHypervisor(t *testing.T) {
 	}
 }
 
-func TestPivotChecksOnlyItsOwnMachines(t *testing.T) {
-	objs := clusterObjects("src", true)
-	// A machine of another cluster, without identity, is not this pivot's
-	// concern (no other Cluster object is present, so the namespace check
-	// passes).
-	other := u(hydraMachineGVK, ns, "other-1", nil)
-	other.SetLabels(map[string]string{clusterNameLabel: "other"})
-	src := newClient(t, append(append(objs, other), labelledCRDs()...)...)
+// clusterctl move is namespace-wide: anything there that is not this
+// cluster's could be carried along (or claimed on the target), so preflight
+// refuses it -- and accepts what is this cluster's by label, owner or name.
+func TestPivotRefusesStrangersInTheNamespace(t *testing.T) {
+	ccGVK := schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: capiVersion, Kind: "ClusterClass"}
+	foreignSecret := u(secGVK, ns, "other-pki", nil)
+	foreignSecret.SetLabels(map[string]string{moveLabel: ""})
+	otherMachine := u(hydraMachineGVK, ns, "other-1", nil)
+	otherMachine.SetLabels(map[string]string{clusterNameLabel: "other"})
+	for _, tc := range []struct {
+		name  string
+		extra client.Object
+		want  string
+	}{
+		{"another cluster's machine", otherMachine, "HydraMachine other-1"},
+		{"an unlabelled leftover machine", u(hydraMachineGVK, ns, "leftover", nil), "HydraMachine leftover"},
+		{"another ClusterResourceSet", u(crsGVK, ns, "other-cilium", nil), "ClusterResourceSet other-cilium"},
+		{"a ClusterClass", u(ccGVK, ns, "cc", nil), "ClusterClass cc"},
+		{"a Secret labelled for move", foreignSecret, "Secret other-pki"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := newClient(t, append(append(clusterObjects("src", true), tc.extra), labelledCRDs()...)...)
+			tgt := newClient(t, labelledCRDs()...)
+			rec := &recorder{takeOver: true}
+			err := pivotFor(t, src, tgt, rec).Run(context.Background(), time.Second)
+			if err == nil || !strings.Contains(err.Error(), "not cluster c's") || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want %q, got %v", tc.want, err)
+			}
+			for _, m := range rec.moves {
+				if m != "dry" {
+					t.Errorf("nothing may move, got %v", rec.moves)
+				}
+			}
+		})
+	}
+}
+
+func TestPivotAcceptsWhatIsOwnedByItsCluster(t *testing.T) {
+	owned := u(schema.GroupVersionKind{Group: "infrastructure.cluster.x-k8s.io", Version: "v1alpha1", Kind: "HydraMachineTemplate"}, ns, "hand-made", nil)
+	owned.SetOwnerReferences([]metav1.OwnerReference{{APIVersion: clusterGVK.GroupVersion().String(), Kind: "Cluster", Name: name, UID: "cl"}})
+	src := newClient(t, append(append(clusterObjects("src", true), owned), labelledCRDs()...)...)
 	tgt := newClient(t, labelledCRDs()...)
 	if err := pivotFor(t, src, tgt, &recorder{takeOver: true}).Run(context.Background(), time.Second); err != nil {
 		t.Fatal(err)

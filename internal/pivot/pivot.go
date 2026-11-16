@@ -34,6 +34,9 @@ const (
 	OwnerUIDAnnotation    = "hydramachine.infrastructure.cluster.x-k8s.io/owner-uid"
 
 	moveLabel = "clusterctl.cluster.x-k8s.io/move"
+	// infraGroup is the Hydra provider's API group.
+	infraGroup   = "infrastructure.cluster.x-k8s.io"
+	infraVersion = "v1alpha1"
 	// pausedAnnotation is Cluster API's other way to pause a cluster.
 	pausedAnnotation = "cluster.x-k8s.io/paused"
 	clusterNameLabel = "cluster.x-k8s.io/cluster-name"
@@ -43,9 +46,10 @@ const (
 
 var (
 	clusterGVK      = schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: capiVersion, Kind: "Cluster"}
-	hydraMachineGVK = schema.GroupVersionKind{Group: "infrastructure.cluster.x-k8s.io", Version: "v1alpha1", Kind: "HydraMachine"}
-	hydraClusterGVK = schema.GroupVersionKind{Group: "infrastructure.cluster.x-k8s.io", Version: "v1alpha1", Kind: "HydraCluster"}
+	hydraMachineGVK = schema.GroupVersionKind{Group: infraGroup, Version: infraVersion, Kind: "HydraMachine"}
+	hydraClusterGVK = schema.GroupVersionKind{Group: infraGroup, Version: infraVersion, Kind: "HydraCluster"}
 	crsGVK          = schema.GroupVersionKind{Group: "addons.cluster.x-k8s.io", Version: capiVersion, Kind: "ClusterResourceSet"}
+	crsBindingGVK   = schema.GroupVersionKind{Group: crsGVK.Group, Version: capiVersion, Kind: crsGVK.Kind + "Binding"}
 	hydraCRDs       = []string{
 		"hydraclusters.infrastructure.cluster.x-k8s.io",
 		"hydramachines.infrastructure.cluster.x-k8s.io",
@@ -96,8 +100,10 @@ type Pivot struct {
 	Namespace      string
 	Name           string
 	Hooks          Hooks
-	Out            io.Writer
-	Poll           time.Duration
+	// credentialsSecret is read from the live HydraCluster by preflight.
+	credentialsSecret string
+	Out               io.Writer
+	Poll              time.Duration
 }
 
 func (p *Pivot) logf(format string, args ...any) {
@@ -253,6 +259,78 @@ func otherClusters(ctx context.Context, c client.Client, namespace, name string)
 	return out, nil
 }
 
+// movableKinds are the kinds, besides Cluster, that a Hydra cluster's move
+// graph is made of or that clusterctl moves by force.
+var movableKinds = []schema.GroupVersionKind{
+	hydraClusterGVK,
+	hydraMachineGVK,
+	{Group: infraGroup, Version: infraVersion, Kind: "HydraMachineTemplate"},
+	{Group: clusterGVK.Group, Version: capiVersion, Kind: "Machine"},
+	{Group: clusterGVK.Group, Version: capiVersion, Kind: "MachineSet"},
+	{Group: clusterGVK.Group, Version: capiVersion, Kind: "MachineDeployment"},
+	{Group: clusterGVK.Group, Version: capiVersion, Kind: "ClusterClass"},
+	{Group: "controlplane.cluster.x-k8s.io", Version: capiVersion, Kind: "KubeadmControlPlane"},
+	{Group: "bootstrap.cluster.x-k8s.io", Version: capiVersion, Kind: "KubeadmConfig"},
+	{Group: "bootstrap.cluster.x-k8s.io", Version: capiVersion, Kind: "KubeadmConfigTemplate"},
+	crsGVK,
+	crsBindingGVK,
+}
+
+// strangers lists the objects in the namespace a move could carry that are
+// not this cluster's. A kind whose CRD is not installed holds nothing.
+func (p *Pivot) strangers(ctx context.Context) ([]string, error) {
+	var out []string
+	for _, gvk := range movableKinds {
+		list := &unstructured.UnstructuredList{}
+		list.SetGroupVersionKind(gvk.GroupVersion().WithKind(gvk.Kind + "List"))
+		if err := p.Source.C.List(ctx, list, client.InNamespace(p.Namespace)); err != nil {
+			if meta.IsNoMatchError(err) {
+				continue
+			}
+			return nil, fmt.Errorf("listing %s in %s: %w", gvk.Kind, p.Namespace, err)
+		}
+		for i := range list.Items {
+			if !p.belongs(&list.Items[i]) {
+				out = append(out, gvk.Kind+" "+list.Items[i].GetName())
+			}
+		}
+	}
+	// Secrets move with a Cluster through ownership or its naming
+	// convention; one labelled for move goes regardless.
+	secrets := &unstructured.UnstructuredList{}
+	secrets.SetGroupVersionKind(schema.GroupVersionKind{Version: "v1", Kind: "SecretList"})
+	if err := p.Source.C.List(ctx, secrets, client.InNamespace(p.Namespace), client.HasLabels{moveLabel}); err != nil {
+		return nil, fmt.Errorf("listing Secrets in %s: %w", p.Namespace, err)
+	}
+	for i := range secrets.Items {
+		if sec := &secrets.Items[i]; sec.GetName() != p.credentialsSecret && !p.belongs(sec) {
+			out = append(out, "Secret "+sec.GetName())
+		}
+	}
+	return out, nil
+}
+
+// belongs reports whether o is this cluster's: labelled for it by Cluster API
+// or by hydra, owned by its Cluster, or its CNI set and binding by name.
+func (p *Pivot) belongs(o *unstructured.Unstructured) bool {
+	l := o.GetLabels()
+	if l[clusterNameLabel] == p.Name || l[render.ClusterLabelKey] == p.Name {
+		return true
+	}
+	for _, ref := range o.GetOwnerReferences() {
+		if ref.Kind == clusterGVK.Kind && ref.Name == p.Name {
+			return true
+		}
+	}
+	switch o.GetKind() {
+	case crsGVK.Kind:
+		return o.GetName() == render.CNIName(p.Name)
+	case crsBindingGVK.Kind:
+		return o.GetName() == p.Name
+	}
+	return false
+}
+
 // machines lists this cluster's HydraMachines (by Cluster API's cluster-name
 // label), never another cluster's in the same namespace.
 func (p *Pivot) machines(ctx context.Context, c client.Client) ([]unstructured.Unstructured, error) {
@@ -356,6 +434,7 @@ func (p *Pivot) preflight(ctx context.Context) error {
 		return fmt.Errorf("reading HydraCluster %s/%s: %w", p.Namespace, p.Name, err)
 	}
 	secret, _, _ := unstructured.NestedString(hc.Object, "spec", "hypervisor", "credentialsSecretRef", "name")
+	p.credentialsSecret = secret
 	if secret == "" {
 		problems = append(problems, "the HydraCluster names no hypervisor (spec.hypervisor); it relies on the source manager's libvirt-config, which does not move, so the target could not reach its VMs")
 	} else {
@@ -373,6 +452,17 @@ func (p *Pivot) preflight(ctx context.Context) error {
 		} else if _, ok := sec.GetLabels()[moveLabel]; !ok {
 			problems = append(problems, fmt.Sprintf("credentials Secret %s lacks the %s label, so the move would leave it behind", secret, moveLabel))
 		}
+	}
+	// Beyond other Clusters, clusterctl move carries whatever its labels or
+	// CRDs force (ClusterResourceSets, ClusterClasses, Secrets labelled for
+	// move), and a leftover object can be claimed on the target. Refuse
+	// anything in the namespace that is not this cluster's.
+	strangers, err := p.strangers(ctx)
+	if err != nil {
+		return err
+	}
+	if len(strangers) > 0 {
+		problems = append(problems, fmt.Sprintf("namespace %s holds objects that are not cluster %s's (no %s or %s label for it, no owner reference to its Cluster), and the move could carry them: %s. Move or delete them first", p.Namespace, p.Name, clusterNameLabel, render.ClusterLabelKey, strings.Join(strangers, ", ")))
 	}
 	if err := crdsLabelled(ctx, p.Source.C); err != nil {
 		problems = append(problems, "source: "+err.Error())

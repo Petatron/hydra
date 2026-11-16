@@ -202,7 +202,8 @@ clusterctl move, so it manages itself. The VMs are not touched; the cluster's
 own Hydra provider takes them over.
 
 Before moving it checks what docs/moving.md asks: the cluster is Available
-with no rollout, it is the only cluster in its namespace, every machine has
+with no rollout, its namespace holds nothing but
+this cluster (clusterctl move is namespace-wide), every machine has
 recorded its identity, the credentials Secret and the Hydra CRDs carry the
 labels clusterctl move needs, and a dry run succeeds. It installs the pinned
 providers on the target first.

@@ -143,8 +143,8 @@ hydra cluster pivot  -f hydra.yaml                 # or pivot an existing cluste
 `pivot` moves the cluster's Cluster API objects onto the cluster itself with `clusterctl move`.
 The VMs are untouched; the cluster's own Hydra provider takes them over.
 
-- Before moving it checks that the cluster is Available with no rollout, is alone in its
-  namespace, is not paused, every machine has recorded its identity, the credentials Secret and
+- Before moving it checks that the cluster is Available with no rollout, has its namespace to
+  itself (no other Cluster, and nothing else `clusterctl move` could carry), is not paused, every machine has recorded its identity, the credentials Secret and
   Hydra CRDs carry the labels `clusterctl move` needs, and a dry run passes.
 - It proves the target is the cluster itself by its certificate authority before moving. Run
   against a cluster that already manages itself, it says so and moves nothing.
