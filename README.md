@@ -1,5 +1,12 @@
 # hydra
 
+[![CI](https://github.com/Petatron/hydra/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Petatron/hydra/actions/workflows/ci.yml)
+[![E2E](https://github.com/Petatron/hydra/actions/workflows/e2e.yml/badge.svg?branch=main)](https://github.com/Petatron/hydra/actions/workflows/e2e.yml)
+[![Cilium drift](https://github.com/Petatron/hydra/actions/workflows/cilium-drift.yml/badge.svg?branch=main)](https://github.com/Petatron/hydra/actions/workflows/cilium-drift.yml)
+[![Go](https://img.shields.io/github/go-mod/go-version/Petatron/hydra?logo=go&logoColor=white)](./go.mod)
+[![Cluster API](https://img.shields.io/badge/Cluster%20API-v1.14-326CE5?logo=kubernetes&logoColor=white)](https://cluster-api.sigs.k8s.io/)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](./LICENSE)
+
 `hydra` is the command-line tool for **Project Hydra**, an open-source on-prem Kubernetes
 lifecycle platform built on [Cluster API](https://cluster-api.sigs.k8s.io/), with libvirt/KVM as its
 infrastructure provider
