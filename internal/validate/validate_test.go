@@ -10,10 +10,13 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"strings"
 	"testing"
 	"time"
+
+	"k8s.io/apimachinery/pkg/api/resource"
 
 	"github.com/Petatron/hydra/internal/bootstrap"
 	"github.com/Petatron/hydra/internal/config"
@@ -355,8 +358,12 @@ func TestNoHypervisorInConfig(t *testing.T) {
 	l := newLab(t)
 	y := strings.Replace(siteYAML, "  hypervisor: {address: 192.168.15.13}\n", "", 1)
 	rs := l.run(t, parse(t, y))
-	if r := find(t, rs, "hypervisor"); r.Status != Warn {
+	// Bootstrap refuses this config (ErrNoHypervisor), so validate must fail.
+	if r := find(t, rs, "hypervisor"); r.Status != Fail {
 		t.Fatalf("got %+v", r)
+	}
+	if !Failed(rs) {
+		t.Error("validate must exit non-zero for a config bootstrap refuses")
 	}
 	for _, r := range rs {
 		if strings.HasPrefix(r.Check, "storage pool") || strings.HasPrefix(r.Check, "libvirt TLS") {
@@ -505,4 +512,23 @@ func (e *errProber) TCP(ctx context.Context, host string, port int) (Outcome, er
 		return 0, errors.New("lookup " + host + ": no such host")
 	}
 	return e.fakeProber.TCP(ctx, host, port)
+}
+
+func TestDiskNeededSaturates(t *testing.T) {
+	cfg := parse(t, siteYAML)
+	cfg.Spec.ControlPlane.DiskSize = resource.MustParse("8Ei") // three of these overflow int64
+	if need, _ := diskNeeded(cfg); need != math.MaxUint64 {
+		t.Fatalf("an uncountable total must saturate, got %d", need)
+	}
+}
+
+// The site-network proof probes the hypervisor's stated TLS port, not 16514.
+func TestSiteReachUsesTheHypervisorsPort(t *testing.T) {
+	l := newLab(t)
+	l.host.table = map[string]Outcome{"192.168.15.13:17414": Open, "192.168.15.13:16509": Refused}
+	y := strings.Replace(siteYAML, "address: 192.168.15.13}", "address: \"192.168.15.13:17414\"}", 1)
+	rs := l.run(t, parse(t, y))
+	if r := find(t, rs, "control-plane network reachable"); r.Status != Pass {
+		t.Fatalf("got %+v", r)
+	}
 }

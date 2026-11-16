@@ -18,6 +18,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"strconv"
 	"strings"
@@ -187,12 +188,16 @@ func Run(ctx context.Context, in Input, d Deps) []Result {
 
 	h := cfg.Spec.Hypervisor
 	var hv Hypervisor
+	hvPort := libvirtTLSPort
 	if h == nil {
-		add(Result{Check: "hypervisor", Status: Warn,
-			Detail: "hydra.yaml names no hypervisor, so the provider's manager-wide libvirt-config will be used; validate cannot check it",
-			Fix:    "set spec.hypervisor.address to have it checked"})
+		// Bootstrap refuses this (bootstrap.ErrNoHypervisor): the temporary
+		// management cluster has no manager-wide libvirt-config to fall back on.
+		add(Result{Check: "hypervisor", Status: Fail,
+			Detail: "hydra.yaml names no hypervisor; bootstrap needs one, since its temporary management cluster has no manager-wide libvirt-config to fall back on",
+			Fix:    "set spec.hypervisor.address (and credentialsSecretName if not <cluster>-libvirt-pki)"})
 	} else {
 		host, port := splitHypervisor(h.Address)
+		hvPort = port
 		add(checkReach(ctx, vantage, checkHypervisorReach, host, port,
 			"open the libvirt TLS listener (libvirtd --listen, port 16514) and make sure "+vantage.Where()+" has a route to it"))
 		add(checkPlaintext(ctx, vantage, host))
@@ -220,7 +225,7 @@ func Run(ctx context.Context, in Input, d Deps) []Result {
 			}
 		}
 	}
-	out = append(out, checkEndpoint(ctx, vantage, hv, bridges, cfg)...)
+	out = append(out, checkEndpoint(ctx, vantage, hv, hvPort, bridges, cfg)...)
 	if !trusted {
 		out = capReachability(out)
 	}
@@ -419,7 +424,11 @@ func diskNeeded(cfg *config.ClusterConfig) (uint64, int32) {
 			total.Add(p.DiskSize)
 		}
 	}
-	v, _ := total.AsInt64()
+	v, ok := total.AsInt64()
+	if !ok || v < 0 {
+		// Too large to count: no pool holds it.
+		return math.MaxUint64, n
+	}
 	return uint64(v), n
 }
 
@@ -555,7 +564,7 @@ func probeEndpoint(ctx context.Context, p Prober, host string) (endpointProbe, e
 // checkEndpoint checks the control-plane endpoint is free and that the
 // controllers can reach the network it lives on: the managed network's, or,
 // for an endpoint outside it (or with no managed network), the site's.
-func checkEndpoint(ctx context.Context, p Prober, hv Hypervisor, bridges []namedIface, cfg *config.ClusterConfig) []Result {
+func checkEndpoint(ctx context.Context, p Prober, hv Hypervisor, hvPort int, bridges []namedIface, cfg *config.ClusterConfig) []Result {
 	n := cfg.Spec.Network
 	var managed Result
 	if mn := n.ManagedNetwork; mn != nil {
@@ -590,7 +599,7 @@ func checkEndpoint(ctx context.Context, p Prober, hv Hypervisor, bridges []named
 	if n.ManagedNetwork == nil || !inSubnet(host, n.ManagedNetwork.Subnet) {
 		// The endpoint is on the site network: its reachability is the
 		// site's, whatever the managed network's is.
-		site := checkSiteReach(ctx, p, hv, bridges, ep)
+		site := checkSiteReach(ctx, p, hv, hvPort, bridges, ep)
 		rs = append(rs, site)
 		reachable = site.Status == Pass
 	}
@@ -634,7 +643,8 @@ func answers(ctx context.Context, p Prober, host string, ports ...int) (bool, []
 // failing that, the hypervisor's own address on the bridge whose subnet
 // holds the endpoint, when libvirt reports bridge addresses. Without either,
 // silence could mean a free address or an unreachable network (PET-75).
-func checkSiteReach(ctx context.Context, p Prober, hv Hypervisor, bridges []namedIface, ep endpointProbe) Result {
+// hvPort is the hypervisor's libvirt TLS port, as hydra.yaml states it.
+func checkSiteReach(ctx context.Context, p Prober, hv Hypervisor, hvPort int, bridges []namedIface, ep endpointProbe) Result {
 	const check = checkSiteReachName
 	fixRoute := "run hydra from a machine on, or routed to, the endpoint's network (PET-75)"
 	switch ep.outcome {
@@ -657,7 +667,7 @@ func checkSiteReach(ctx context.Context, p Prober, hv Hypervisor, bridges []name
 			if err != nil || !subnet.Contains(ip) {
 				continue
 			}
-			ok, seen, err := answers(ctx, p, bip.String(), sshPort, libvirtTLSPort)
+			ok, seen, err := answers(ctx, p, bip.String(), sshPort, hvPort)
 			if err != nil {
 				return Result{Check: check, Status: Fail, Detail: err.Error()}
 			}

@@ -13,11 +13,19 @@ import (
 	"github.com/Petatron/hydra/internal/validate"
 )
 
+// silentProber reaches the hypervisor's libvirt TLS listener, which refuses
+// plaintext, and hears nothing else.
 type silentProber struct{}
 
 func (silentProber) Where() string    { return "this machine" }
 func (silentProber) OnThisHost() bool { return true }
-func (silentProber) TCP(context.Context, string, int) (validate.Outcome, error) {
+func (silentProber) TCP(_ context.Context, _ string, port int) (validate.Outcome, error) {
+	switch port {
+	case 16514:
+		return validate.Open, nil
+	case 16509:
+		return validate.Refused, nil
+	}
 	return validate.NoAnswer, nil
 }
 
@@ -42,7 +50,7 @@ func TestValidateExitsNonZeroOnAFailure(t *testing.T) {
 			}
 			dir := t.TempDir()
 			f := filepath.Join(dir, "hydra.yaml")
-			src, err := os.ReadFile("../../examples/hydra-mgmt.yaml")
+			src, err := os.ReadFile("../../examples/workload-managed-network.yaml")
 			if err != nil {
 				t.Fatal(err)
 			}
