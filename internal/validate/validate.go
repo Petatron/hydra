@@ -113,15 +113,19 @@ type Iface struct {
 type Member struct {
 	Name      string
 	Addresses []string
+	// Unchecked is set when the port could not be looked up on its own, so
+	// its addresses are unknown.
+	Unchecked bool
 }
 
 // Hypervisor is the read-only part of libvirt validate uses.
+// Every call is bounded: by ctx, and by the implementation's own timeout.
 type Hypervisor interface {
-	Pool(name string) (PoolInfo, error)
-	Volume(pool, name string) error
-	Interface(name string) (Iface, error)
+	Pool(ctx context.Context, name string) (PoolInfo, error)
+	Volume(ctx context.Context, pool, name string) error
+	Interface(ctx context.Context, name string) (Iface, error)
 	// Network reports whether a libvirt network exists and is active.
-	Network(name string) (active bool, err error)
+	Network(ctx context.Context, name string) (active bool, err error)
 	Close() error
 }
 
@@ -167,12 +171,13 @@ func Run(ctx context.Context, in Input, d Deps) []Result {
 
 	// Without a working runtime there is no kind node to probe from, and the
 	// runtime check already says so.
-	vantage := d.Host
+	vantage, trusted := d.Host, true
 	if rt.Status == Pass {
 		var vr *Result
 		vantage, vr = vantagePoint(d)
 		if vr != nil {
 			add(*vr)
+			trusted = false
 		}
 	}
 
@@ -184,9 +189,9 @@ func Run(ctx context.Context, in Input, d Deps) []Result {
 			Fix:    "set spec.hypervisor.address to have it checked"})
 	} else {
 		host, port := splitHypervisor(h.Address)
-		add(checkReach(ctx, vantage, "hypervisor reachable", host, port,
+		add(checkReach(ctx, vantage, checkHypervisorReach, host, port,
 			"open the libvirt TLS listener (libvirtd --listen, port 16514) and make sure "+vantage.Where()+" has a route to it"))
-		add(checkPlaintext(ctx, d.Host, host))
+		add(checkPlaintext(ctx, vantage, host))
 		if in.Credentials == nil {
 			add(Result{Check: "hypervisor credentials", Status: Warn,
 				Detail: "no credentials given, so the client certificate, the TLS login, the storage pool, the image and the bridges are not checked",
@@ -201,10 +206,10 @@ func Run(ctx context.Context, in Input, d Deps) []Result {
 	var bridges []namedIface
 	if hv != nil {
 		defer func() { _ = hv.Close() }()
-		add(checkPool(hv, cfg))
-		add(checkImage(hv, cfg))
+		add(checkPool(ctx, hv, cfg))
+		add(checkImage(ctx, hv, cfg))
 		for _, b := range cfg.Spec.Network.Bridges {
-			r, ifc := checkBridge(hv, b)
+			r, ifc := checkBridge(ctx, hv, b)
 			add(r)
 			if ifc != nil {
 				bridges = append(bridges, namedIface{b, *ifc})
@@ -212,7 +217,41 @@ func Run(ctx context.Context, in Input, d Deps) []Result {
 		}
 	}
 	out = append(out, checkEndpoint(ctx, vantage, hv, bridges, cfg)...)
+	if !trusted {
+		out = capReachability(out)
+	}
 	return out
+}
+
+// reachabilityChecks are the checks whose PASS rests on the vantage point.
+// Check names the reachability cap matches on.
+const (
+	checkHypervisorReach  = "hypervisor reachable"
+	checkSiteReachName    = "control-plane network reachable"
+	checkManagedPrefix    = "managed network "
+	checkEndpointFreeName = "control-plane endpoint free"
+)
+
+var reachabilityChecks = []string{checkHypervisorReach, checkSiteReachName, checkManagedPrefix, checkEndpointFreeName}
+
+// capReachability turns reachability PASSes into WARNs when the probes ran
+// from this machine only because the bootstrap cluster's node, where the
+// controllers run, could not be entered: this machine reaching an address
+// does not show the node can.
+func capReachability(rs []Result) []Result {
+	for i, r := range rs {
+		if r.Status != Pass {
+			continue
+		}
+		for _, c := range reachabilityChecks {
+			if strings.HasPrefix(r.Check, c) {
+				rs[i].Status = Warn
+				rs[i].Detail += "; but only from this machine, not from the bootstrap cluster's node where the controllers run"
+				rs[i].Fix = "fix the probe vantage above and rerun"
+			}
+		}
+	}
+	return rs
 }
 
 // Failed reports whether any result failed.
@@ -244,7 +283,7 @@ func vantagePoint(d Deps) (Prober, *Result) {
 	p, err := d.Kind()
 	if err != nil {
 		return d.Host, &Result{Check: "probe vantage", Status: Warn,
-			Detail: "cannot run probes inside the bootstrap cluster's node (" + err.Error() + "); probing from this host instead",
+			Detail: "cannot run probes inside the bootstrap cluster's node (" + err.Error() + "); probing from this machine instead, so reachability cannot pass",
 			Fix:    "check that the kind node container is running"}
 	}
 	if p == nil {
@@ -291,13 +330,22 @@ func checkReach(ctx context.Context, p Prober, check, host string, port int, fix
 
 func checkPlaintext(ctx context.Context, p Prober, host string) Result {
 	const check = "plaintext libvirt closed"
+	target := fmt.Sprintf("%s:%d", host, libvirtTCPPort)
 	o, err := p.TCP(ctx, host, libvirtTCPPort)
-	if err == nil && o == Open {
+	switch {
+	case err != nil:
+		return Result{Check: check, Status: Warn, Detail: fmt.Sprintf("%s was not observed from %s (%v)", target, p.Where(), err),
+			Fix: "check by hand that libvirtd's TCP listener is off"}
+	case o == Open:
 		return Result{Check: check, Status: Warn,
-			Detail: fmt.Sprintf("%s:%d accepts connections: libvirt's unauthenticated TCP listener is open", host, libvirtTCPPort),
+			Detail: target + " accepts connections: libvirt's unauthenticated TCP listener is open",
 			Fix:    "disable libvirtd's TCP listener (listen_tcp = 0, and mask libvirtd-tcp.socket); hydra only uses TLS on 16514"}
+	case o == Refused:
+		return Result{Check: check, Status: Pass, Detail: target + " refuses connections"}
 	}
-	return Result{Check: check, Status: Pass, Detail: fmt.Sprintf("%s:%d does not accept connections", host, libvirtTCPPort)}
+	// A timeout or no route: the port was not seen either way.
+	return Result{Check: check, Status: Warn, Detail: fmt.Sprintf("%s was not observed from %s (%s), so it is not shown closed", target, p.Where(), o),
+		Fix: "check by hand that libvirtd's TCP listener is off"}
 }
 
 // checkClientCert checks what the hypervisor will need of the client
@@ -362,10 +410,10 @@ func diskNeeded(cfg *config.ClusterConfig) (uint64, int32) {
 	return uint64(v), n
 }
 
-func checkPool(hv Hypervisor, cfg *config.ClusterConfig) Result {
+func checkPool(ctx context.Context, hv Hypervisor, cfg *config.ClusterConfig) Result {
 	name := cfg.Spec.StoragePool
 	check := "storage pool " + name
-	info, err := hv.Pool(name)
+	info, err := hv.Pool(ctx, name)
 	switch {
 	case errors.Is(err, ErrNotFound):
 		return Result{Check: check, Status: Fail, Detail: "no storage pool " + name + " on the hypervisor",
@@ -386,10 +434,10 @@ func checkPool(hv Hypervisor, cfg *config.ClusterConfig) Result {
 
 func gib(b uint64) string { return fmt.Sprintf("%.1f GiB", float64(b)/(1<<30)) }
 
-func checkImage(hv Hypervisor, cfg *config.ClusterConfig) Result {
+func checkImage(ctx context.Context, hv Hypervisor, cfg *config.ClusterConfig) Result {
 	img, pool := cfg.Spec.Image.Name, cfg.Spec.StoragePool
 	check := "base image"
-	err := hv.Volume(pool, img)
+	err := hv.Volume(ctx, pool, img)
 	switch {
 	case errors.Is(err, ErrNotFound):
 		return Result{Check: check, Status: Fail, Detail: img + " is not in pool " + pool,
@@ -402,9 +450,9 @@ func checkImage(hv Hypervisor, cfg *config.ClusterConfig) Result {
 
 // checkBridge checks a site bridge exists and is up, and that no port of it
 // holds an address of its own (PET-34: a port that also takes a DHCP lease).
-func checkBridge(hv Hypervisor, name string) (Result, *Iface) {
+func checkBridge(ctx context.Context, hv Hypervisor, name string) (Result, *Iface) {
 	check := "bridge " + name
-	ifc, err := hv.Interface(name)
+	ifc, err := hv.Interface(ctx, name)
 	switch {
 	case errors.Is(err, ErrNotFound):
 		return Result{Check: check, Status: Fail, Detail: "no interface " + name + " on the hypervisor",
@@ -416,11 +464,19 @@ func checkBridge(hv Hypervisor, name string) (Result, *Iface) {
 	case !ifc.Active:
 		return Result{Check: check, Status: Fail, Detail: name + " is down", Fix: "bring it up on the hypervisor"}, nil
 	}
-	var dirty []string
+	var dirty, unchecked []string
 	for _, m := range ifc.Members {
-		if len(m.Addresses) > 0 {
+		switch {
+		case m.Unchecked:
+			unchecked = append(unchecked, m.Name)
+		case len(m.Addresses) > 0:
 			dirty = append(dirty, m.Name+" ("+strings.Join(m.Addresses, ", ")+")")
 		}
+	}
+	if len(unchecked) > 0 && len(dirty) == 0 {
+		return Result{Check: check, Status: Warn,
+			Detail: "ports named on the bridge could not be looked up, so their addresses were not checked: " + strings.Join(unchecked, ", "),
+			Fix:    "check on the hypervisor that " + strings.Join(unchecked, ", ") + " carries no address (ip addr show)"}, &ifc
 	}
 	if len(dirty) > 0 {
 		return Result{Check: check, Status: Warn,
@@ -484,7 +540,7 @@ func answers(ctx context.Context, p Prober, host string, ports ...int) (bool, []
 // whose subnet holds the endpoint. Without that, silence from the endpoint
 // could mean a free address or an unreachable network (PET-75).
 func checkSiteReach(ctx context.Context, p Prober, hv Hypervisor, bridges []namedIface, endpoint string) Result {
-	const check = "control-plane network reachable"
+	const check = checkSiteReachName
 	host, _, err := config.SplitEndpoint(endpoint)
 	if err != nil {
 		return Result{Check: check, Status: Fail, Detail: err.Error()}
@@ -537,7 +593,7 @@ func outcomes(os []Outcome) string {
 // the address is taken. Silence means free only once its network is known to
 // be reachable (reachable); otherwise it is reported as unknown.
 func checkEndpointFree(ctx context.Context, p Prober, endpoint string, reachable bool) Result {
-	const check = "control-plane endpoint free"
+	const check = checkEndpointFreeName
 	host, _, err := config.SplitEndpoint(endpoint)
 	if err != nil {
 		return Result{Check: check, Status: Fail, Detail: err.Error()}
@@ -567,7 +623,7 @@ func checkEndpointFree(ctx context.Context, p Prober, endpoint string, reachable
 // network's gateway, the subnet's first address, so a TCP connect to it
 // shows a route.
 func checkManagedReach(ctx context.Context, p Prober, hv Hypervisor, mn *config.ManagedNetworkSpec) Result {
-	check := "managed network " + mn.Name + " reachable"
+	check := checkManagedPrefix + mn.Name + " reachable"
 	gw, err := firstHost(mn.Subnet)
 	if err != nil {
 		return Result{Check: check, Status: Fail, Detail: err.Error()}
@@ -576,7 +632,7 @@ func checkManagedReach(ctx context.Context, p Prober, hv Hypervisor, mn *config.
 	if hv == nil {
 		return Result{Check: check, Status: Warn, Detail: "not checked: the hypervisor was not queried", Fix: "set spec.hypervisor and pass --hypervisor-credentials so validate can find the network"}
 	}
-	active, err := hv.Network(mn.Name)
+	active, err := hv.Network(ctx, mn.Name)
 	switch {
 	case errors.Is(err, ErrNotFound) || (err == nil && !active):
 		return Result{Check: check, Status: Warn,
@@ -589,11 +645,19 @@ func checkManagedReach(ctx context.Context, p Prober, hv Hypervisor, mn *config.
 	if err != nil {
 		return Result{Check: check, Status: Fail, Detail: fmt.Sprintf("probing %s:%d from %s: %v", gw, dnsPort, p.Where(), err), Fix: fix}
 	}
-	if o == Open || o == Refused {
+	switch o {
+	case Open, Refused:
 		return Result{Check: check, Status: Pass, Detail: fmt.Sprintf("gateway %s answers from %s", gw, p.Where())}
+	case Unreachable:
+		return Result{Check: check, Status: Fail,
+			Detail: fmt.Sprintf("no route from %s to gateway %s: the controllers could not reach the new cluster's API", p.Where(), gw),
+			Fix:    fix}
 	}
-	return Result{Check: check, Status: Fail,
-		Detail: fmt.Sprintf("gateway %s from %s: %s; the controllers could not reach the new cluster's API", gw, p.Where(), o),
+	// A routed network installs no libvirt filter, so the hypervisor's own
+	// firewall decides; it can drop port 53 to the gateway and still forward
+	// to the machines.
+	return Result{Check: check, Status: Warn,
+		Detail: fmt.Sprintf("nothing answered on gateway %s:%d from %s: either there is no route to %s, or the hypervisor drops port 53 to its own address", gw, dnsPort, p.Where(), mn.Subnet),
 		Fix:    fix}
 }
 

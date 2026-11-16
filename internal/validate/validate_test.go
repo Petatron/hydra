@@ -48,27 +48,27 @@ type fakeHV struct {
 	closed   bool
 }
 
-func (h *fakeHV) Pool(n string) (PoolInfo, error) {
+func (h *fakeHV) Pool(_ context.Context, n string) (PoolInfo, error) {
 	p, ok := h.pools[n]
 	if !ok {
 		return PoolInfo{}, ErrNotFound
 	}
 	return p, nil
 }
-func (h *fakeHV) Volume(pool, n string) error {
+func (h *fakeHV) Volume(_ context.Context, pool, n string) error {
 	if !h.vols[pool+"/"+n] {
 		return ErrNotFound
 	}
 	return nil
 }
-func (h *fakeHV) Interface(n string) (Iface, error) {
+func (h *fakeHV) Interface(_ context.Context, n string) (Iface, error) {
 	i, ok := h.ifaces[n]
 	if !ok {
 		return Iface{}, ErrNotFound
 	}
 	return i, nil
 }
-func (h *fakeHV) Network(n string) (bool, error) {
+func (h *fakeHV) Network(_ context.Context, n string) (bool, error) {
 	a, ok := h.networks[n]
 	if !ok {
 		return false, ErrNotFound
@@ -206,6 +206,12 @@ func TestEachFailure(t *testing.T) {
 			*y = strings.Replace(*y, "address: 192.168.15.13", "address: 127.0.0.1", 1)
 		}, "hypervisor reachable", Fail, "loopback"},
 		{"plaintext listener open", func(_ *testing.T, l *lab, _ *string) { l.host.table["192.168.15.13:16509"] = Open }, "plaintext libvirt closed", Warn, "unauthenticated"},
+		{"plaintext listener not observed", func(_ *testing.T, l *lab, _ *string) { delete(l.host.table, "192.168.15.13:16509") }, "plaintext libvirt closed", Warn, "not observed"},
+		{"bridge port could not be looked up", func(_ *testing.T, l *lab, _ *string) {
+			i := l.hv.ifaces["br0"]
+			i.Members = []Member{{Name: "enp1s0", Unchecked: true}}
+			l.hv.ifaces["br0"] = i
+		}, "bridge br0", Warn, "not checked: enp1s0"},
 		{"no credentials", func(_ *testing.T, l *lab, _ *string) { l.creds = nil }, "hypervisor credentials", Warn, "not checked"},
 		{"cert without keyEncipherment", func(t *testing.T, l *lab, _ *string) {
 			l.creds[bootstrap.ClientCertFile] = cert(t, x509.KeyUsageDigitalSignature, now.Add(-time.Hour), now.Add(time.Hour*24*365))
@@ -307,7 +313,8 @@ func TestManagedNetworkReachability(t *testing.T) {
 		{"network not created yet", map[string]bool{}, nil, Warn, "does not run yet"},
 		{"gateway answers", map[string]bool{"lab-net": true}, new(Open), Pass, "10.50.0.1"},
 		{"gateway refuses DNS (still a live host)", map[string]bool{"lab-net": true}, new(Refused), Pass, "10.50.0.1"},
-		{"gateway silent: PET-75", map[string]bool{"lab-net": true}, nil, Fail, "could not reach"},
+		{"gateway unreachable: PET-75", map[string]bool{"lab-net": true}, new(Unreachable), Fail, "no route"},
+		{"gateway silent: a drop or no route", map[string]bool{"lab-net": true}, nil, Warn, "drops port 53"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			l := newLab(t)
@@ -347,21 +354,28 @@ func TestDiskNeededCountsAutoscalingMax(t *testing.T) {
 func TestKindVantageClassifies(t *testing.T) {
 	for _, tc := range []struct {
 		stderr string
+		exit   int
 		err    error
 		want   Outcome
 		bad    bool
 	}{
-		{"", nil, Open, false},
-		{"bash: connect: Connection refused\n", errors.New("exit 1"), Refused, false},
-		{"bash: connect: No route to host\n", errors.New("exit 1"), Unreachable, false},
-		{"", errors.New("exit 124"), NoAnswer, false},
-		{"bash: x: Name or service not known\n", errors.New("exit 1"), 0, true},
+		{"", 0, nil, Open, false},
+		{"bash: connect: Connection refused\n", 1, errors.New("exit 1"), Refused, false},
+		{"bash: connect: No route to host\n", 1, errors.New("exit 1"), Unreachable, false},
+		{"", timeoutExit, errors.New("exit 124"), NoAnswer, false},
+		// An exec that failed without a word is not a silent address.
+		{"", -1, errors.New("docker exec failed"), 0, true},
+		{"", 1, errors.New("exit 1"), 0, true},
+		{"bash: x: Name or service not known\n", 1, errors.New("exit 1"), 0, true},
 	} {
 		var args []string
-		k := &kindVantage{cluster: "k", run: func(_ context.Context, a ...string) (string, error) { args = a; return tc.stderr, tc.err }}
+		k := &kindVantage{cluster: "k", run: func(_ context.Context, a ...string) (string, int, error) {
+			args = a
+			return tc.stderr, tc.exit, tc.err
+		}}
 		o, err := k.TCP(context.Background(), "10.0.0.1", 22)
 		if (err != nil) != tc.bad || (!tc.bad && o != tc.want) {
-			t.Errorf("%q: got %v %v", tc.stderr, o, err)
+			t.Errorf("%q exit %d: got %v %v", tc.stderr, tc.exit, o, err)
 		}
 		// The host travels as an argument, never inside the script.
 		if strings.Contains(args[4], "10.0.0.1") || args[5] != "10.0.0.1" {
@@ -382,5 +396,30 @@ func TestNoRuntimeMeansNoKindProbe(t *testing.T) {
 	}
 	if len(l.kind.asked) != 0 {
 		t.Error("the kind node must not be probed without a runtime")
+	}
+}
+
+// When the bootstrap cluster exists but its node cannot be entered, this
+// machine's view must not let reachability or a free endpoint pass.
+func TestUnusableKindNodeCapsReachability(t *testing.T) {
+	l := newLab(t)
+	d := Deps{
+		Runtime: func() (string, error) { return "docker", nil },
+		Connect: func(context.Context, string, map[string][]byte) (Hypervisor, error) { return l.hv, nil },
+		Host:    l.host,
+		Kind:    func() (Prober, error) { return nil, errors.New("exec into node failed") },
+		Now:     func() time.Time { return now },
+	}
+	rs := Run(context.Background(), Input{Config: parse(t, siteYAML), Credentials: l.creds}, d)
+	if r := find(t, rs, "probe vantage"); r.Status != Warn {
+		t.Fatalf("vantage: %+v", r)
+	}
+	for _, c := range []string{"hypervisor reachable", "control-plane network reachable", "control-plane endpoint free"} {
+		if r := find(t, rs, c); r.Status != Warn || !strings.Contains(r.Detail, "only from this machine") {
+			t.Errorf("%s must be capped at WARN: %+v", c, r)
+		}
+	}
+	if r := find(t, rs, "storage pool"); r.Status != Pass {
+		t.Errorf("checks that do not rest on the vantage stay as they are: %+v", r)
 	}
 }

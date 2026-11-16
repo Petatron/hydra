@@ -6,7 +6,9 @@ import (
 	"net"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
+	"time"
 )
 
 // A bridge as libvirt's udev interface backend describes it.
@@ -64,5 +66,30 @@ func TestHostProberAgainstRealSockets(t *testing.T) {
 func TestFirstHost(t *testing.T) {
 	if gw, err := firstHost("10.50.0.0/24"); err != nil || gw != "10.50.0.1" {
 		t.Fatalf("%q %v", gw, err)
+	}
+}
+
+// A libvirt call that never returns is abandoned at its deadline, and the
+// connection is closed so the blocked read ends.
+func TestCallAbandonsAHungRPC(t *testing.T) {
+	client, server := net.Pipe()
+	defer func() { _ = server.Close() }()
+	d := &tlsDialer{conn: client}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := call(ctx, d, "reading pool", func() (int, error) {
+		buf := make([]byte, 1)
+		_, err := client.Read(buf) // nothing is ever written
+		return 0, err
+	})
+	if err == nil || !strings.Contains(err.Error(), "did not answer") {
+		t.Fatalf("got %v", err)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Error("call must return at its deadline")
+	}
+	if _, err := client.Write([]byte{1}); err == nil {
+		t.Error("the connection must be closed after an abandoned call")
 	}
 }
