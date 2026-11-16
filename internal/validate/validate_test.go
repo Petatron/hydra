@@ -41,6 +41,7 @@ func (f *fakeProber) TCP(_ context.Context, host string, port int) (Outcome, err
 }
 
 type fakeHV struct {
+	poolErr  error
 	pools    map[string]PoolInfo
 	vols     map[string]bool // "pool/name"
 	ifaces   map[string]Iface
@@ -49,6 +50,9 @@ type fakeHV struct {
 }
 
 func (h *fakeHV) Pool(_ context.Context, n string) (PoolInfo, error) {
+	if h.poolErr != nil {
+		return PoolInfo{}, h.poolErr
+	}
 	p, ok := h.pools[n]
 	if !ok {
 		return PoolInfo{}, ErrNotFound
@@ -216,6 +220,10 @@ func TestEachFailure(t *testing.T) {
 		{"cert without keyEncipherment", func(t *testing.T, l *lab, _ *string) {
 			l.creds[bootstrap.ClientCertFile] = cert(t, x509.KeyUsageDigitalSignature, now.Add(-time.Hour), now.Add(time.Hour*24*365))
 		}, "client certificate", Fail, "keyEncipherment"},
+		{"cert without a key-usage extension is accepted", func(t *testing.T, l *lab, _ *string) {
+			l.creds[bootstrap.ClientCertFile] = cert(t, 0, now.Add(-time.Hour), now.Add(365*24*time.Hour))
+		}, "client certificate", Pass, "valid until"},
+		{"pool lookup error still says what to do", func(_ *testing.T, l *lab, _ *string) { l.hv.poolErr = errors.New("rpc broke") }, "storage pool", Fail, "rpc broke"},
 		{"cert expired", func(t *testing.T, l *lab, _ *string) {
 			l.creds[bootstrap.ClientCertFile] = cert(t, x509.KeyUsageKeyEncipherment, now.Add(-48*time.Hour), now.Add(-time.Hour))
 		}, "client certificate", Fail, "expired"},
@@ -275,8 +283,10 @@ func TestEachFailure(t *testing.T) {
 			if r.Status != tc.want || !strings.Contains(r.Detail, tc.detail) {
 				t.Fatalf("want %s containing %q, got %s %q", tc.want, tc.detail, r.Status, r.Detail)
 			}
-			if r.Status != Pass && r.Fix == "" && tc.want == Fail && !strings.Contains(r.Detail, ":") {
-				t.Errorf("a failure needs a remediation line")
+			for _, r := range rs {
+				if r.Status != Pass && r.Fix == "" {
+					t.Errorf("%s is %s with no fix line", r.Check, r.Status)
+				}
 			}
 			if Failed(rs) != (tc.want == Fail) && tc.want == Fail {
 				t.Error("Failed must report the failure")
@@ -434,4 +444,65 @@ func TestUnusableKindNodeCapsReachability(t *testing.T) {
 	if r := find(t, rs, "storage pool"); r.Status != Pass {
 		t.Errorf("checks that do not rest on the vantage stay as they are: %+v", r)
 	}
+}
+
+// With a managed network, an endpoint outside its subnet lives on the site
+// network: the site's reachability decides, not the managed gateway's.
+func TestManagedNetworkWithASiteEndpoint(t *testing.T) {
+	l := newLab(t)
+	l.hv.networks = map[string]bool{"lab-net": true}
+	l.host.table["10.50.0.1:53"] = Open // the managed network is reachable
+	// The site is not: the hypervisor's br0 address is silent.
+	delete(l.host.table, "192.168.15.13:22")
+	delete(l.host.table, "192.168.15.13:16514")
+	l.host.table["192.168.15.13:16514"] = Open // keep the hypervisor itself reachable via its address check
+	y := strings.Replace(managedYAML, "    bridges: [br0]\n", "    controlPlaneEndpoint: 192.168.15.40\n    bridges: [br0]\n", 1)
+	y = strings.Replace(y, "    vipInterface: enp2s0\n", "", 1)
+	cfg := parse(t, y)
+	rs := l.run(t, cfg)
+	find(t, rs, "managed network lab-net")
+	site := find(t, rs, "control-plane network reachable")
+	if site.Status != Pass {
+		t.Fatalf("the site reach must be checked for a site endpoint: %+v", site)
+	}
+	// Now the site goes silent: the endpoint must not pass as free on the
+	// managed gateway's word.
+	l2 := newLab(t)
+	l2.hv.networks = map[string]bool{"lab-net": true}
+	l2.host.table["10.50.0.1:53"] = Open
+	delete(l2.host.table, "192.168.15.13:22")
+	delete(l2.host.table, "192.168.15.13:16514")
+	rs = l2.run(t, cfg)
+	if r := find(t, rs, "control-plane endpoint free"); r.Status == Pass {
+		t.Fatalf("a silent site endpoint must not pass on the managed gateway's reachability: %+v", r)
+	}
+}
+
+func TestUnresolvableNameEndpointWarns(t *testing.T) {
+	l := newLab(t)
+	p := &errProber{fakeProber: l.host, failHost: "api.lab.invalid"}
+	d := Deps{
+		Runtime: func() (string, error) { return "docker", nil },
+		Connect: func(context.Context, string, map[string][]byte) (Hypervisor, error) { return l.hv, nil },
+		Host:    p,
+		Now:     func() time.Time { return now },
+	}
+	y := strings.Replace(siteYAML, "controlPlaneEndpoint: 192.168.15.40", "controlPlaneEndpoint: api.lab.invalid", 1)
+	rs := Run(context.Background(), Input{Config: parse(t, y), Credentials: l.creds}, d)
+	if r := find(t, rs, "control-plane endpoint free"); r.Status != Warn || !strings.Contains(r.Detail, "is a name") {
+		t.Fatalf("got %+v", r)
+	}
+}
+
+// errProber fails every probe of one host, as a name that does not resolve.
+type errProber struct {
+	*fakeProber
+	failHost string
+}
+
+func (e *errProber) TCP(ctx context.Context, host string, port int) (Outcome, error) {
+	if host == e.failHost {
+		return 0, errors.New("lookup " + host + ": no such host")
+	}
+	return e.fakeProber.TCP(ctx, host, port)
 }

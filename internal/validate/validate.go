@@ -224,6 +224,12 @@ func Run(ctx context.Context, in Input, d Deps) []Result {
 	if !trusted {
 		out = capReachability(out)
 	}
+	// Every WARN and FAIL carries something to do.
+	for i := range out {
+		if out[i].Status != Pass && out[i].Fix == "" {
+			out[i].Fix = "resolve the error shown, then rerun hydra validate"
+		}
+	}
 	return out
 }
 
@@ -365,6 +371,9 @@ func checkClientCert(certPEM []byte, now time.Time) Result {
 		return Result{Check: check, Status: Fail, Detail: "clientcert.pem: " + err.Error(), Fix: "reissue the client certificate"}
 	}
 	switch {
+	// No key-usage extension at all (KeyUsage == 0) restricts nothing (RFC
+	// 5280 4.2.1.3), and GnuTLS, libvirt's TLS, accepts it. What fails is an
+	// extension that is present and leaves keyEncipherment out.
 	case c.KeyUsage != 0 && c.KeyUsage&x509.KeyUsageKeyEncipherment == 0:
 		return Result{Check: check, Status: Fail, Detail: "the client certificate lacks the keyEncipherment key usage, which libvirt's TLS needs",
 			Fix: "reissue it with keyUsage = digitalSignature, keyEncipherment"}
@@ -544,32 +553,55 @@ func probeEndpoint(ctx context.Context, p Prober, host string) (endpointProbe, e
 }
 
 // checkEndpoint checks the control-plane endpoint is free and that the
-// controllers can reach the network it lives on.
+// controllers can reach the network it lives on: the managed network's, or,
+// for an endpoint outside it (or with no managed network), the site's.
 func checkEndpoint(ctx context.Context, p Prober, hv Hypervisor, bridges []namedIface, cfg *config.ClusterConfig) []Result {
 	n := cfg.Spec.Network
-	var reach Result
+	var managed Result
 	if mn := n.ManagedNetwork; mn != nil {
-		reach = checkManagedReach(ctx, p, hv, mn)
+		managed = checkManagedReach(ctx, p, hv, mn)
 		if n.ControlPlaneEndpoint == "" {
-			return []Result{reach}
+			return []Result{managed}
 		}
 	}
 	host, _, err := config.SplitEndpoint(n.ControlPlaneEndpoint)
 	if err != nil {
-		return append(nonEmpty(reach), Result{Check: checkEndpointFreeName, Status: Fail, Detail: err.Error()})
+		return append(nonEmpty(managed), Result{Check: checkEndpointFreeName, Status: Fail, Detail: err.Error(),
+			Fix: "fix spec.network.controlPlaneEndpoint"})
 	}
 	if p.OnThisHost() && hostOnly(host) {
-		return append(nonEmpty(reach), Result{Check: checkEndpointFreeName, Status: Fail,
+		return append(nonEmpty(managed), Result{Check: checkEndpointFreeName, Status: Fail,
 			Detail: host + " is this machine's loopback", Fix: "the endpoint must be an address on the cluster's network"})
 	}
 	ep, err := probeEndpoint(ctx, p, host)
 	if err != nil {
-		return append(nonEmpty(reach), Result{Check: checkEndpointFreeName, Status: Fail, Detail: err.Error()})
+		if net.ParseIP(host) == nil {
+			// A name that does not resolve yet, say: not checkable, which is
+			// what a name endpoint is.
+			return append(nonEmpty(managed), Result{Check: checkEndpointFreeName, Status: Warn,
+				Detail: "the endpoint " + host + " is a name, and probing it failed (" + err.Error() + "), so it is not checked",
+				Fix:    "make sure " + host + " resolves to a free address on the cluster's network before create"})
+		}
+		return append(nonEmpty(managed), Result{Check: checkEndpointFreeName, Status: Fail, Detail: err.Error(),
+			Fix: "check that this machine can open TCP connections, then rerun"})
 	}
-	if n.ManagedNetwork == nil {
-		reach = checkSiteReach(ctx, p, hv, bridges, ep)
+	rs := nonEmpty(managed)
+	reachable := managed.Status == Pass
+	if n.ManagedNetwork == nil || !inSubnet(host, n.ManagedNetwork.Subnet) {
+		// The endpoint is on the site network: its reachability is the
+		// site's, whatever the managed network's is.
+		site := checkSiteReach(ctx, p, hv, bridges, ep)
+		rs = append(rs, site)
+		reachable = site.Status == Pass
 	}
-	return []Result{reach, checkEndpointFree(p, ep, reach.Status == Pass)}
+	return append(rs, checkEndpointFree(p, ep, reachable))
+}
+
+// inSubnet reports whether host is an IP inside cidr.
+func inSubnet(host, cidr string) bool {
+	ip := net.ParseIP(host)
+	_, n, err := net.ParseCIDR(cidr)
+	return ip != nil && err == nil && n.Contains(ip)
 }
 
 func nonEmpty(r Result) []Result {
