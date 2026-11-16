@@ -10,8 +10,8 @@ The CLI is a **stateless orchestrator**: every cluster's desired and actual stat
 Kubernetes, never on your machine. There is no local database, cache or inventory, and an
 interrupted command can always be re-run.
 
-> **Status:** early. `render`, `bootstrap` and `cluster create/plan/status/delete` work today.
-> `validate` and the self-hosting pivot are next.
+> **Status:** early. `render`, `bootstrap`, `cluster create/plan/status/delete` and the
+> self-hosting pivot work today. `validate` is next.
 
 ## Install
 
@@ -132,6 +132,34 @@ current kubectl context is never used.
 - `delete` shows which management cluster it will act on before asking, refuses to delete a
   cluster from itself (a self-hosted management cluster), and then removes everything labelled
   for the cluster once Cluster API has torn down its machines. The credentials Secret is kept.
+
+## Make a cluster manage itself
+
+```bash
+hydra cluster create -f hydra.yaml --self-hosted   # bootstrap kind, create, pivot, delete kind
+hydra cluster pivot  -f hydra.yaml                 # or pivot an existing cluster on its own
+```
+
+`pivot` moves the cluster's Cluster API objects onto the cluster itself with `clusterctl move`.
+The VMs are untouched; the cluster's own Hydra provider takes them over.
+
+- Before moving it checks that the cluster is Available with no rollout, is alone in its
+  namespace, is not paused, every machine has recorded its identity, the credentials Secret and
+  Hydra CRDs carry the labels `clusterctl move` needs, and a dry run passes.
+- It proves the target is the cluster itself by its certificate authority before moving.
+- After moving it waits for the cluster to verify on itself. If that fails, the cluster stays on
+  the target and the error says how to inspect it and how to undo the move by hand. pivot never
+  moves a cluster back on its own: a VM may already have been taken over, and moving that machine
+  back would strand it.
+- Rerunning is safe: it finds where the objects are. A cluster already on the target is only
+  verified. A paused cluster, or a copy on both sides, is reported with the commands to run;
+  pivot never unpauses or deletes either.
+- `create --self-hosted` never builds a second copy: if the cluster's kubeconfig reaches it
+  already managing itself, there is nothing to do; if it reaches a cluster that is running but not
+  yet self-hosted, or the endpoint already answers, it refuses.
+  When Hydra chooses the endpoint and nothing local shows whether the cluster exists, pass
+  `--fresh`.
+- After a pivot, pass the cluster's kubeconfig as `--management-kubeconfig` to every command.
 
 ## Pinned components
 

@@ -104,9 +104,10 @@ func renderObjects(cfg *config.ClusterConfig) ([]*unstructured.Unstructured, err
 }
 
 func newCreateCommand() *cobra.Command {
-	var file, mgmt, kubeconfigOut string
+	var file, mgmt, kubeconfigOut, credentials string
 	var timeout time.Duration
-	var wait, adopt, forceConflicts bool
+	var wait, adopt, forceConflicts, selfHosted bool
+	var po pivotOptions
 	c := &cobra.Command{
 		Use:   "create",
 		Short: "Create the cluster hydra.yaml describes and wait for it to be Available",
@@ -132,70 +133,27 @@ used.`,
 			if err != nil {
 				return err
 			}
+			ctx, stop := interruptible(cmd)
+			defer stop()
+			co := createOptions{kubeconfigOut: kubeconfigOut, timeout: timeout, wait: wait, adopt: adopt, forceConflicts: forceConflicts}
+			if selfHosted {
+				if mgmt != "" {
+					return fmt.Errorf("--self-hosted builds its own bootstrap cluster; it cannot be combined with --management-kubeconfig (use pivot for that)")
+				}
+				if !wait {
+					return fmt.Errorf("--self-hosted needs to wait for the cluster before moving it; drop --wait=false")
+				}
+				if po.clusterKubeconfig == "" {
+					po.clusterKubeconfig = kubeconfigOut
+				}
+				return runSelfHosted(ctx, cmd, cfg, objs, credentials, co, po)
+			}
 			t, err := manager(cmd, mgmt, cfg.Metadata.Name)
 			if err != nil {
 				return err
 			}
-			m := t.m
-			ctx, stop := interruptible(cmd)
-			defer stop()
-			ns, name := cfg.Metadata.Namespace, cfg.Metadata.Name
-			// Everything that can refuse runs before the first write.
-			if err := m.CheckManagementCluster(); err != nil {
-				return err
-			}
-			st, err := m.State(ctx, ns, name)
-			if err != nil {
-				return err
-			}
-			if st.Terminating {
-				return fmt.Errorf("cluster %s/%s is being deleted; let `hydra cluster delete` finish before creating it again", ns, name)
-			}
-			if !st.Exists && t.bootstrapKind {
-				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "creating a NEW cluster %s/%s from the bootstrap cluster; if it already runs elsewhere (pivoted), stop and use --management-kubeconfig\n", ns, name)
-			}
-			if h := cfg.Spec.Hypervisor; h != nil {
-				if err := m.CheckCredentials(ctx, ns, h.CredentialsSecretName); err != nil {
-					return err
-				}
-			}
-			if err := m.CheckOwnership(ctx, objs, name, adopt); err != nil {
-				return err
-			}
-			if err := m.Apply(ctx, objs, name, forceConflicts); err != nil {
-				return err
-			}
-			switch orphans, err := m.Orphans(ctx, objs, ns, name); {
-			case err != nil:
-				// The apply succeeded; only the check for leftovers failed.
-				// Say so rather than imply there are none.
-				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not check for objects hydra.yaml no longer renders: %v\n", err)
-			case len(orphans) > 0:
-				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "not in hydra.yaml any more (left in place; delete them yourself if unused):\n  %s\n", strings.Join(orphans, "\n  "))
-			}
-			if !wait {
-				_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "not waiting (--wait=false); follow with `hydra cluster status`")
-				return nil
-			}
-			start := time.Now()
-			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "waiting up to %s for cluster %s/%s to be Available\n", timeout, ns, name)
-			if err := m.WaitAvailable(ctx, ns, name, timeout); err != nil {
-				return err
-			}
-			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "cluster %s/%s is Available after %s\n", ns, name, time.Since(start).Round(time.Second))
-			kc, err := m.Kubeconfig(ctx, ns, name)
-			if err != nil {
-				return err
-			}
-			path := kubeconfigOut
-			if path == "" {
-				path = name + ".kubeconfig"
-			}
-			if err := writeKubeconfig(path, kc, kubeconfigOut != ""); err != nil {
-				return err
-			}
-			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "kubeconfig written to %s\n", path)
-			return nil
+			_, err = runCreate(ctx, cmd, t, cfg, objs, co)
+			return err
 		},
 	}
 	c.Flags().StringVarP(&file, "file", "f", "hydra.yaml", "path to hydra.yaml")
@@ -205,7 +163,82 @@ used.`,
 	c.Flags().BoolVar(&wait, "wait", true, "wait for the cluster to be Available")
 	c.Flags().BoolVar(&adopt, "adopt", false, "take over existing objects of the same names that hydra did not make (never ones labelled for another cluster)")
 	c.Flags().BoolVar(&forceConflicts, "force-conflicts", false, "take over fields another field manager owns (e.g. a hand edit) instead of failing")
+	c.Flags().BoolVar(&selfHosted, "self-hosted", false, "bootstrap a kind cluster, create the cluster from it, pivot the cluster onto itself and delete kind")
+	c.Flags().StringVar(&credentials, "hypervisor-credentials", "", "with --self-hosted: directory holding cacert.pem, clientcert.pem and clientkey.pem (needed the first time)")
+	addPivotFlags(c, &po)
+	c.Flags().BoolVar(&po.fresh, "fresh", false, "with --self-hosted and an endpoint Hydra chooses: confirm no copy of this cluster exists yet")
 	return c
+}
+
+type createOptions struct {
+	kubeconfigOut               string
+	timeout                     time.Duration
+	wait, adopt, forceConflicts bool
+}
+
+// runCreate is create's body after the management cluster is resolved: every
+// check that can refuse, the apply, the wait and the kubeconfig write. It
+// returns where the kubeconfig was written ("" when not waiting).
+func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.ClusterConfig, objs []*unstructured.Unstructured, o createOptions) (string, error) {
+	kubeconfigOut, timeout, wait, adopt, forceConflicts := o.kubeconfigOut, o.timeout, o.wait, o.adopt, o.forceConflicts
+	m := t.m
+	ns, name := cfg.Metadata.Namespace, cfg.Metadata.Name
+	// Everything that can refuse runs before the first write.
+	if err := m.CheckManagementCluster(); err != nil {
+		return "", err
+	}
+	st, err := m.State(ctx, ns, name)
+	if err != nil {
+		return "", err
+	}
+	if st.Terminating {
+		return "", fmt.Errorf("cluster %s/%s is being deleted; let `hydra cluster delete` finish before creating it again", ns, name)
+	}
+	if !st.Exists && t.bootstrapKind {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "creating a NEW cluster %s/%s from the bootstrap cluster; if it already runs elsewhere (pivoted), stop and use --management-kubeconfig\n", ns, name)
+	}
+	if h := cfg.Spec.Hypervisor; h != nil {
+		if err := m.CheckCredentials(ctx, ns, h.CredentialsSecretName); err != nil {
+			return "", err
+		}
+	}
+	if err := m.CheckOwnership(ctx, objs, name, adopt); err != nil {
+		return "", err
+	}
+	if err := m.Apply(ctx, objs, name, forceConflicts); err != nil {
+		return "", err
+	}
+	switch orphans, err := m.Orphans(ctx, objs, ns, name); {
+	case err != nil:
+		// The apply succeeded; only the check for leftovers failed.
+		// Say so rather than imply there are none.
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not check for objects hydra.yaml no longer renders: %v\n", err)
+	case len(orphans) > 0:
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "not in hydra.yaml any more (left in place; delete them yourself if unused):\n  %s\n", strings.Join(orphans, "\n  "))
+	}
+	if !wait {
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "not waiting (--wait=false); follow with `hydra cluster status`")
+		return "", nil
+	}
+	start := time.Now()
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "waiting up to %s for cluster %s/%s to be Available\n", timeout, ns, name)
+	if err := m.WaitAvailable(ctx, ns, name, timeout); err != nil {
+		return "", err
+	}
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "cluster %s/%s is Available after %s\n", ns, name, time.Since(start).Round(time.Second))
+	kc, err := m.Kubeconfig(ctx, ns, name)
+	if err != nil {
+		return "", err
+	}
+	path := kubeconfigOut
+	if path == "" {
+		path = name + ".kubeconfig"
+	}
+	if err := writeKubeconfig(path, kc, kubeconfigOut != ""); err != nil {
+		return "", err
+	}
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "kubeconfig written to %s\n", path)
+	return path, nil
 }
 
 func newPlanCommand() *cobra.Command {

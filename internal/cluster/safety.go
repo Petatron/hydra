@@ -129,6 +129,17 @@ func (m *Manager) SelfHosted(ctx context.Context, namespace, name string, manage
 	return false, "", nil
 }
 
+// SameCA reports whether two kubeconfigs trust the same certificate
+// authority. Either one lacking a readable CA is an error, never "different".
+func SameCA(a, b []byte) (bool, error) {
+	_, ca := kubeconfigIdentity(a)
+	_, cb := kubeconfigIdentity(b)
+	if len(ca) == 0 || len(cb) == 0 {
+		return false, fmt.Errorf("a kubeconfig has no readable certificate authority, so cannot tell which cluster it belongs to")
+	}
+	return bytes.Equal(ca, cb), nil
+}
+
 // kubeconfigIdentity returns the current context's server URL and CA bytes.
 // A CA given as a file path (certificate-authority) is read from that file;
 // an unreadable one yields no CA.

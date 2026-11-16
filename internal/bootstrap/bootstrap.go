@@ -223,6 +223,13 @@ func (b *Bootstrapper) connect(name string) (Cluster, error) {
 	return cl, nil
 }
 
+// EnsureProviders brings any management cluster (the bootstrap one, or a
+// pivot target) to the pinned providers: installs what is missing, refuses
+// what is at another version, and waits for all of them to be available.
+func (b *Bootstrapper) EnsureProviders(ctx context.Context, cl Cluster) error {
+	return b.ensureProviders(ctx, cl)
+}
+
 // ensureProviders installs whichever pinned providers are missing and refuses
 // to touch one installed at another version.
 func (b *Bootstrapper) ensureProviders(ctx context.Context, cl Cluster) error {
