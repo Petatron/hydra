@@ -71,12 +71,16 @@ const (
 	Refused
 	// NoAnswer: nothing answered before the timeout.
 	NoAnswer
-	// Unreachable: there is no route to the address.
-	Unreachable
+	// NoHost: the network reports nothing at the address (EHOSTUNREACH:
+	// ARP got no reply on-link, or a router said so). The network itself
+	// was reached.
+	NoHost
+	// NoRoute: there is no route to the address's network (ENETUNREACH).
+	NoRoute
 )
 
 func (o Outcome) String() string {
-	return [...]string{"open", "refused", "no answer", "unreachable"}[o]
+	return [...]string{"open", "refused", "no answer", "no host there", "no route"}[o]
 }
 
 // Prober attempts TCP connects from one vantage point.
@@ -473,6 +477,19 @@ func checkBridge(ctx context.Context, hv Hypervisor, name string) (Result, *Ifac
 			dirty = append(dirty, m.Name+" ("+strings.Join(m.Addresses, ", ")+")")
 		}
 	}
+	reported := len(ifc.Addresses) > 0
+	for _, m := range ifc.Members {
+		reported = reported || len(m.Addresses) > 0
+	}
+	if !reported && len(ifc.Members) > len(unchecked) {
+		names := make([]string, 0, len(ifc.Members))
+		for _, m := range ifc.Members {
+			names = append(names, m.Name)
+		}
+		return Result{Check: check, Status: Warn,
+			Detail: "up, but libvirt reports no addresses on " + name + " or its ports (its udev interface backend never does), so the ports were not checked for addresses of their own",
+			Fix:    "check on the hypervisor that " + strings.Join(names, ", ") + " carries no address of its own (ip -br addr show), PET-34"}, &ifc
+	}
 	if len(unchecked) > 0 && len(dirty) == 0 {
 		return Result{Check: check, Status: Warn,
 			Detail: "ports named on the bridge could not be looked up, so their addresses were not checked: " + strings.Join(unchecked, ", "),
@@ -502,20 +519,64 @@ type namedIface struct {
 	Iface
 }
 
+// endpointProbe is what probing the control-plane endpoint observed.
+type endpointProbe struct {
+	host    string
+	outcome Outcome
+	port    int
+}
+
+// probeEndpoint probes the endpoint's API port, then SSH, stopping at the
+// first decisive outcome: anything but silence.
+func probeEndpoint(ctx context.Context, p Prober, host string) (endpointProbe, error) {
+	ep := endpointProbe{host: host, outcome: NoAnswer}
+	for _, port := range []int{apiServerPort, sshPort} {
+		o, err := p.TCP(ctx, host, port)
+		if err != nil {
+			return ep, fmt.Errorf("probing %s:%d from %s: %w", host, port, p.Where(), err)
+		}
+		if o != NoAnswer {
+			ep.outcome, ep.port = o, port
+			return ep, nil
+		}
+	}
+	return ep, nil
+}
+
 // checkEndpoint checks the control-plane endpoint is free and that the
 // controllers can reach the network it lives on.
 func checkEndpoint(ctx context.Context, p Prober, hv Hypervisor, bridges []namedIface, cfg *config.ClusterConfig) []Result {
 	n := cfg.Spec.Network
+	var reach Result
 	if mn := n.ManagedNetwork; mn != nil {
-		reach := checkManagedReach(ctx, p, hv, mn)
-		rs := []Result{reach}
-		if n.ControlPlaneEndpoint != "" {
-			rs = append(rs, checkEndpointFree(ctx, p, n.ControlPlaneEndpoint, reach.Status == Pass))
+		reach = checkManagedReach(ctx, p, hv, mn)
+		if n.ControlPlaneEndpoint == "" {
+			return []Result{reach}
 		}
-		return rs
 	}
-	reach := checkSiteReach(ctx, p, hv, bridges, n.ControlPlaneEndpoint)
-	return []Result{reach, checkEndpointFree(ctx, p, n.ControlPlaneEndpoint, reach.Status == Pass)}
+	host, _, err := config.SplitEndpoint(n.ControlPlaneEndpoint)
+	if err != nil {
+		return append(nonEmpty(reach), Result{Check: checkEndpointFreeName, Status: Fail, Detail: err.Error()})
+	}
+	if p.OnThisHost() && hostOnly(host) {
+		return append(nonEmpty(reach), Result{Check: checkEndpointFreeName, Status: Fail,
+			Detail: host + " is this machine's loopback", Fix: "the endpoint must be an address on the cluster's network"})
+	}
+	ep, err := probeEndpoint(ctx, p, host)
+	if err != nil {
+		return append(nonEmpty(reach), Result{Check: checkEndpointFreeName, Status: Fail, Detail: err.Error()})
+	}
+	if n.ManagedNetwork == nil {
+		reach = checkSiteReach(ctx, p, hv, bridges, ep)
+	}
+	return []Result{reach, checkEndpointFree(p, ep, reach.Status == Pass)}
+}
+
+func nonEmpty(r Result) []Result {
+	if r.Check == "" {
+		return nil
+	}
+	return []Result{r}
 }
 
 // answers reports whether host answered on any of ports: a connection, or a
@@ -536,32 +597,32 @@ func answers(ctx context.Context, p Prober, host string, ports ...int) (bool, []
 }
 
 // checkSiteReach shows the endpoint's network is reachable from where the
-// controllers run, by probing the hypervisor's own address on the bridge
-// whose subnet holds the endpoint. Without that, silence from the endpoint
-// could mean a free address or an unreachable network (PET-75).
-func checkSiteReach(ctx context.Context, p Prober, hv Hypervisor, bridges []namedIface, endpoint string) Result {
+// controllers run. The endpoint's own probe shows it when the network
+// answered for the address (a host there, or the network saying none is);
+// failing that, the hypervisor's own address on the bridge whose subnet
+// holds the endpoint, when libvirt reports bridge addresses. Without either,
+// silence could mean a free address or an unreachable network (PET-75).
+func checkSiteReach(ctx context.Context, p Prober, hv Hypervisor, bridges []namedIface, ep endpointProbe) Result {
 	const check = checkSiteReachName
-	host, _, err := config.SplitEndpoint(endpoint)
-	if err != nil {
-		return Result{Check: check, Status: Fail, Detail: err.Error()}
+	fixRoute := "run hydra from a machine on, or routed to, the endpoint's network (PET-75)"
+	switch ep.outcome {
+	case Open, Refused, NoHost:
+		return Result{Check: check, Status: Pass, Detail: fmt.Sprintf("the network answered for %s from %s (%s)", ep.host, p.Where(), ep.outcome)}
+	case NoRoute:
+		return Result{Check: check, Status: Fail,
+			Detail: fmt.Sprintf("no route from %s to %s: the bootstrap cluster's controllers could not reach the new API, and create would stall", p.Where(), ep.host),
+			Fix:    fixRoute}
 	}
-	ip := net.ParseIP(host)
-	switch {
-	case hv == nil:
-		return Result{Check: check, Status: Warn, Detail: "not checked: the hypervisor was not queried, so its address on the endpoint's network is unknown",
-			Fix: "set spec.hypervisor and pass --hypervisor-credentials"}
-	case ip == nil:
-		return Result{Check: check, Status: Warn, Detail: "the endpoint " + host + " is a name, not an address; its network is not checked"}
+	ip := net.ParseIP(ep.host)
+	if hv == nil || ip == nil {
+		return Result{Check: check, Status: Warn,
+			Detail: fmt.Sprintf("nothing answered for %s from %s, and there is no other way here to show its network reachable", ep.host, p.Where()),
+			Fix:    "run validate from a machine on the endpoint's network, where a free address is reported as such; or set spec.hypervisor and pass --hypervisor-credentials"}
 	}
-	var seenNets []string
 	for _, b := range bridges {
 		for _, a := range b.Addresses {
 			bip, subnet, err := net.ParseCIDR(a)
-			if err != nil {
-				continue
-			}
-			seenNets = append(seenNets, b.name+" "+subnet.String())
-			if !subnet.Contains(ip) {
+			if err != nil || !subnet.Contains(ip) {
 				continue
 			}
 			ok, seen, err := answers(ctx, p, bip.String(), sshPort, libvirtTLSPort)
@@ -577,8 +638,8 @@ func checkSiteReach(ctx context.Context, p Prober, hv Hypervisor, bridges []name
 		}
 	}
 	return Result{Check: check, Status: Warn,
-		Detail: fmt.Sprintf("%s is on no bridge's subnet the hypervisor has an address in (%s), so its network is not checked", host, orNone(strings.Join(seenNets, ", "))),
-		Fix:    "check the endpoint is on the cluster's site network"}
+		Detail: fmt.Sprintf("nothing answered for %s from %s, and libvirt reports no hypervisor address on a bridge subnet holding it, so its network is not shown reachable", ep.host, p.Where()),
+		Fix:    "run validate from a machine on the endpoint's network, where a free address is reported as such"}
 }
 
 func outcomes(os []Outcome) string {
@@ -589,32 +650,24 @@ func outcomes(os []Outcome) string {
 	return strings.Join(s, ", ")
 }
 
-// checkEndpointFree probes the endpoint's API and SSH ports. Any answer means
-// the address is taken. Silence means free only once its network is known to
-// be reachable (reachable); otherwise it is reported as unknown.
-func checkEndpointFree(ctx context.Context, p Prober, endpoint string, reachable bool) Result {
+// checkEndpointFree judges the endpoint's probe. Any host answering means
+// the address is taken; the network reporting no host there means it is
+// free. Silence means free only once its network is known to be reachable.
+func checkEndpointFree(p Prober, ep endpointProbe, reachable bool) Result {
 	const check = checkEndpointFreeName
-	host, _, err := config.SplitEndpoint(endpoint)
-	if err != nil {
-		return Result{Check: check, Status: Fail, Detail: err.Error()}
-	}
-	if p.OnThisHost() && hostOnly(host) {
-		return Result{Check: check, Status: Fail, Detail: host + " is this machine's loopback", Fix: "the endpoint must be an address on the cluster's network"}
-	}
-	taken, seen, err := answers(ctx, p, host, apiServerPort, sshPort)
 	switch {
-	case err != nil:
-		return Result{Check: check, Status: Fail, Detail: err.Error()}
-	case taken:
+	case ep.outcome == Open || ep.outcome == Refused:
 		return Result{Check: check, Status: Fail,
-			Detail: fmt.Sprintf("%s answers from %s (%s): the address is already in use", host, p.Where(), outcomes(seen)),
+			Detail: fmt.Sprintf("%s answers on port %d from %s (%s): the address is already in use", ep.host, ep.port, p.Where(), ep.outcome),
 			Fix:    "choose a free address outside every DHCP range for spec.network.controlPlaneEndpoint; if this cluster already exists, validate is for before bootstrap"}
-	case !reachable:
-		return Result{Check: check, Status: Warn,
-			Detail: fmt.Sprintf("nothing answers at %s from %s (%s), but its network is not shown reachable, so that does not prove it free", host, p.Where(), outcomes(seen)),
-			Fix:    "resolve the reachability check above, or confirm by hand that nothing uses " + host}
+	case ep.outcome == NoHost:
+		return Result{Check: check, Status: Pass, Detail: fmt.Sprintf("the network reports no host at %s (seen from %s)", ep.host, p.Where())}
+	case ep.outcome == NoAnswer && reachable:
+		return Result{Check: check, Status: Pass, Detail: fmt.Sprintf("nothing answers at %s from %s, on a network that is reachable", ep.host, p.Where())}
 	}
-	return Result{Check: check, Status: Pass, Detail: fmt.Sprintf("nothing answers at %s from %s, on a network that is reachable", host, p.Where())}
+	return Result{Check: check, Status: Warn,
+		Detail: fmt.Sprintf("nothing answers at %s from %s (%s), but its network is not shown reachable, so that does not prove it free", ep.host, p.Where(), ep.outcome),
+		Fix:    "resolve the reachability check above, or confirm by hand that nothing uses " + ep.host}
 }
 
 // checkManagedReach checks the controllers can reach a managed network, which
@@ -648,9 +701,9 @@ func checkManagedReach(ctx context.Context, p Prober, hv Hypervisor, mn *config.
 	switch o {
 	case Open, Refused:
 		return Result{Check: check, Status: Pass, Detail: fmt.Sprintf("gateway %s answers from %s", gw, p.Where())}
-	case Unreachable:
+	case NoRoute, NoHost:
 		return Result{Check: check, Status: Fail,
-			Detail: fmt.Sprintf("no route from %s to gateway %s: the controllers could not reach the new cluster's API", p.Where(), gw),
+			Detail: fmt.Sprintf("gateway %s from %s: %s; the controllers could not reach the new cluster's API", gw, p.Where(), o),
 			Fix:    fix}
 	}
 	// A routed network installs no libvirt filter, so the hypervisor's own

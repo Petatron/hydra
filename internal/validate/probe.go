@@ -18,8 +18,10 @@ import (
 	kindexec "sigs.k8s.io/kind/pkg/exec"
 )
 
-// probeTimeout bounds every connect attempt.
-const probeTimeout = 3 * time.Second
+// probeTimeout bounds every connect attempt. It outlasts Linux's ARP
+// resolution (three probes a second apart), so a free address on a network
+// the probe reaches is reported as no host there rather than as silence.
+const probeTimeout = 5 * time.Second
 
 // hostVantage probes from this machine.
 type hostVantage struct{}
@@ -50,8 +52,10 @@ func classify(err error) (Outcome, error) {
 	switch {
 	case errors.Is(err, syscall.ECONNREFUSED):
 		return Refused, nil
-	case errors.Is(err, syscall.EHOSTUNREACH), errors.Is(err, syscall.ENETUNREACH):
-		return Unreachable, nil
+	case errors.Is(err, syscall.EHOSTUNREACH):
+		return NoHost, nil
+	case errors.Is(err, syscall.ENETUNREACH):
+		return NoRoute, nil
 	case errors.As(err, &ne) && ne.Timeout():
 		return NoAnswer, nil
 	}
@@ -120,8 +124,10 @@ func (k *kindVantage) TCP(ctx context.Context, host string, port int) (Outcome, 
 	switch s := strings.ToLower(stderr); {
 	case strings.Contains(s, "connection refused"):
 		return Refused, nil
-	case strings.Contains(s, "no route to host"), strings.Contains(s, "network is unreachable"):
-		return Unreachable, nil
+	case strings.Contains(s, "no route to host"):
+		return NoHost, nil
+	case strings.Contains(s, "network is unreachable"):
+		return NoRoute, nil
 	case strings.TrimSpace(s) == "" && exit == timeoutExit:
 		// timeout(1) ended the attempt: nothing answered.
 		return NoAnswer, nil

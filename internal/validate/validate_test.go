@@ -251,9 +251,20 @@ func TestEachFailure(t *testing.T) {
 			delete(l.host.table, "192.168.15.13:22")
 			delete(l.host.table, "192.168.15.13:16514")
 		}, "control-plane endpoint free", Warn, "does not prove it free"},
+		{"free endpoint reported by the network (on-link)", func(_ *testing.T, l *lab, _ *string) {
+			l.host.table["192.168.15.40:6443"] = NoHost
+			delete(l.host.table, "192.168.15.13:22") // the bridge-address proof is not needed
+			delete(l.host.table, "192.168.15.13:16514")
+		}, "control-plane endpoint free", Pass, "reports no host"},
+		{"no route to the endpoint", func(_ *testing.T, l *lab, _ *string) { l.host.table["192.168.15.40:6443"] = NoRoute }, "control-plane network reachable", Fail, NoRoute.String()},
+		{"libvirt reports no addresses (udev backend)", func(_ *testing.T, l *lab, _ *string) {
+			i := l.hv.ifaces["br0"]
+			i.Addresses = nil
+			l.hv.ifaces["br0"] = i
+		}, "bridge br0", Warn, "reports no addresses"},
 		{"endpoint off every bridge subnet", func(_ *testing.T, _ *lab, y *string) {
 			*y = strings.Replace(*y, "192.168.15.40", "10.9.9.9", 1)
-		}, "control-plane network reachable", Warn, "no bridge's subnet"},
+		}, "control-plane network reachable", Warn, "not shown reachable"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			l := newLab(t)
@@ -313,7 +324,7 @@ func TestManagedNetworkReachability(t *testing.T) {
 		{"network not created yet", map[string]bool{}, nil, Warn, "does not run yet"},
 		{"gateway answers", map[string]bool{"lab-net": true}, new(Open), Pass, "10.50.0.1"},
 		{"gateway refuses DNS (still a live host)", map[string]bool{"lab-net": true}, new(Refused), Pass, "10.50.0.1"},
-		{"gateway unreachable: PET-75", map[string]bool{"lab-net": true}, new(Unreachable), Fail, "no route"},
+		{"gateway unreachable: PET-75", map[string]bool{"lab-net": true}, new(NoRoute), Fail, NoRoute.String()},
 		{"gateway silent: a drop or no route", map[string]bool{"lab-net": true}, nil, Warn, "drops port 53"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -361,7 +372,8 @@ func TestKindVantageClassifies(t *testing.T) {
 	}{
 		{"", 0, nil, Open, false},
 		{"bash: connect: Connection refused\n", 1, errors.New("exit 1"), Refused, false},
-		{"bash: connect: No route to host\n", 1, errors.New("exit 1"), Unreachable, false},
+		{"bash: connect: No route to host\n", 1, errors.New("exit 1"), NoHost, false},
+		{"bash: connect: Network is unreachable\n", 1, errors.New("exit 1"), NoRoute, false},
 		{"", timeoutExit, errors.New("exit 124"), NoAnswer, false},
 		// An exec that failed without a word is not a silent address.
 		{"", -1, errors.New("docker exec failed"), 0, true},
