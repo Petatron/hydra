@@ -22,7 +22,7 @@ Commands, in delivery order (Linear project *Hydra — Reliability & Productizat
 | Command | Ticket | State |
 |---|---|---|
 | `hydra cluster render` | PET-78 | implemented |
-| `hydra validate` | PET-79 | implemented (full hardware run pending) |
+| `hydra validate` | PET-79 | implemented |
 | `hydra bootstrap` / `bootstrap delete` / `bootstrap kubeconfig` | PET-81 | implemented |
 | `hydra cluster create` / `plan` / `status` / `delete` | PET-82 | implemented |
 | `hydra cluster pivot` / `create --self-hosted` | PET-83 | implemented (hardware proof pending) |
