@@ -105,6 +105,7 @@ func TestDecide(t *testing.T) {
 		{name: "a pool two minors behind once the control plane is done", live: poolTwoBehind, target: "v1.36.6", file: "v1.34.1", refuse: "2 minor versions behind"},
 		{name: "unavailable between pools", live: unavailableMidway, target: "v1.36.6", file: "v1.35.3", refuse: "not Available"},
 		{name: "hydra.yaml says something else", live: settled("v1.35.3"), target: "v1.36.6", file: "v1.34.0", refuse: "hydra.yaml says"},
+		{name: "a pool a patch ahead is no skew violation", live: func() Live { l := settled("v1.35.2"); l.Pools[0].Version = v("v1.35.3"); return l }(), target: "v1.36.6", file: "v1.35.2", refuse: "--to v1.35.3"},
 		{name: "stray MachineDeployments", live: strays, target: "v1.36.6", file: "v1.35.3", refuse: "not pools in hydra.yaml"},
 		{name: "no cluster", live: gone, target: "v1.36.6", file: "v1.35.3", refuse: "does not exist"},
 		{name: "being deleted", live: deleting, target: "v1.36.6", file: "v1.35.3", refuse: "being deleted"},

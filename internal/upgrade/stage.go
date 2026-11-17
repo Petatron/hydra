@@ -177,7 +177,7 @@ func Decide(l Live, target, file Version) (Stage, error) {
 		if target.Less(p.Version) {
 			return Stage{}, &Refusal{Reason: fmt.Sprintf("pool %s runs %s, newer than %s: Kubernetes does not support downgrading", p.Name, p.Version, target)}
 		}
-		if cp.Version.Less(p.Version) {
+		if p.Version.Minor > cp.Version.Minor {
 			return Stage{}, &Refusal{
 				Reason: fmt.Sprintf("pool %s runs %s, newer than the control plane's %s, which the version-skew policy forbids", p.Name, p.Version, cp.Version),
 				Fix:    fmt.Sprintf("set pool %s back to %s by hand, or finish the control plane with `hydra cluster upgrade --to %s`", p.Name, cp.Version, p.Version),
@@ -205,9 +205,13 @@ func Decide(l Live, target, file Version) (Stage, error) {
 		}
 		for _, p := range l.Pools {
 			if p.Version != cp.Version {
+				finish := cp.Version
+				if finish.Less(p.Version) {
+					finish = p.Version
+				}
 				return Stage{}, &Refusal{
 					Reason: fmt.Sprintf("pool %s runs %s while the control plane runs %s: an earlier upgrade has not finished", p.Name, p.Version, cp.Version),
-					Fix:    fmt.Sprintf("finish it first: `hydra cluster upgrade --to %s`", cp.Version),
+					Fix:    fmt.Sprintf("bring every part to one version first: `hydra cluster upgrade --to %s`", finish),
 				}
 			}
 		}

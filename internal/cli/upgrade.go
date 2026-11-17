@@ -39,6 +39,9 @@ the target. --dry-run prints the next stage and its changes.`,
 			if to == "" {
 				return fmt.Errorf("--to is required: the Kubernetes version to upgrade to, like v1.36.6")
 			}
+			if timeout <= 0 {
+				return fmt.Errorf("--timeout must be positive")
+			}
 			target, err := upgrade.ParseVersion(to)
 			if err != nil {
 				return err

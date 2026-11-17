@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -96,6 +97,50 @@ func rolledOut(o *unstructured.Unstructured) {
 	o.Object["status"] = st
 }
 
+// poolMachines are a MachineDeployment's Machines: its desired count, at its
+// version.
+func poolMachines(md *unstructured.Unstructured) []*unstructured.Unstructured {
+	n := int64(1)
+	switch r := md.Object["spec"].(map[string]any)["replicas"].(type) {
+	case int64:
+		n = r
+	case float64:
+		n = int64(r)
+	}
+	ver, _, _ := unstructured.NestedString(md.Object, "spec", "template", "spec", "version")
+	out := make([]*unstructured.Unstructured, 0, n)
+	for i := range n {
+		mc := &unstructured.Unstructured{Object: map[string]any{"spec": map[string]any{"version": ver}}}
+		mc.SetGroupVersionKind(machineGVK)
+		mc.SetNamespace(md.GetNamespace())
+		mc.SetName(fmt.Sprintf("%s-%d", md.GetName(), i))
+		mc.SetLabels(map[string]string{clusterNameLabel: "c", deploymentNameLabel: md.GetName()})
+		out = append(out, mc)
+	}
+	return out
+}
+
+// setMachines replaces a pool's Machines with ones at its MachineDeployment's
+// version, as a finished rollout leaves them.
+func setMachines(ctx context.Context, c client.Client, md *unstructured.Unstructured) error {
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(machineGVK.GroupVersion().WithKind("MachineList"))
+	if err := c.List(ctx, list, client.MatchingLabels{deploymentNameLabel: md.GetName()}); err != nil {
+		return err
+	}
+	for i := range list.Items {
+		if err := c.Delete(ctx, &list.Items[i]); err != nil {
+			return err
+		}
+	}
+	for _, mc := range poolMachines(md) {
+		if err := c.Create(ctx, mc); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // rolling gives it the status of a rollout under way.
 func rolling(o *unstructured.Unstructured) {
 	rolledOut(o)
@@ -154,6 +199,9 @@ func newFakeCluster(t *testing.T, cfg *config.ClusterConfig, cp string, pools ma
 			} else {
 				rolledOut(o)
 			}
+			for _, mc := range poolMachines(o) {
+				seed = append(seed, mc)
+			}
 		case "Cluster":
 			o.Object["status"] = map[string]any{"conditions": []any{map[string]any{"type": "Available", "status": "True"}}}
 		}
@@ -206,7 +254,13 @@ func (fc *fakeCluster) apply(ctx context.Context, c client.WithWatch, ac runtime
 	} else {
 		rolling(o)
 	}
-	return c.Update(ctx, o)
+	if err := c.Update(ctx, o); err != nil {
+		return err
+	}
+	if fc.rollout && o.GetKind() == mdKind {
+		return setMachines(ctx, c, o)
+	}
+	return nil
 }
 
 func (fc *fakeCluster) upgrader(cfg *config.ClusterConfig, remote Remote) (*Upgrader, *bytes.Buffer) {
@@ -359,6 +413,7 @@ func TestRerunResumesMidWorkers(t *testing.T) {
 		if err := fc.c.Get(context.Background(), client.ObjectKey{Namespace: "ns", Name: "c-a"}, md); err == nil {
 			rolledOut(md)
 			_ = fc.c.Update(context.Background(), md)
+			_ = setMachines(context.Background(), fc.c, md)
 		}
 	}()
 	if err := u.Run(context.Background()); err != nil {
@@ -474,5 +529,42 @@ func TestDrainMessage(t *testing.T) {
 	mc.Object["status"] = map[string]any{"conditions": []any{map[string]any{"type": "Deleting", "reason": "WaitingForInfrastructure"}}}
 	if got := drainMessage(mc); got != "" {
 		t.Errorf("not draining, got %q", got)
+	}
+}
+
+// Just after a pool's template changes, its MachineDeployment's status can
+// still count the old machines as up to date. The pool is not rolled out
+// until its Machines run the new version.
+func TestPoolNotRolledOutWhileItsMachinesRunTheOldVersion(t *testing.T) {
+	cfg := loadConfig(t, "v1.35.3")
+	fc := newFakeCluster(t, cfg, "v1.36.6", nil)
+	md := &unstructured.Unstructured{}
+	md.SetGroupVersionKind(mdGVK)
+	ctx := context.Background()
+	if err := fc.c.Get(ctx, client.ObjectKey{Namespace: "ns", Name: "c-a"}, md); err != nil {
+		t.Fatal(err)
+	}
+	// The machines were made at v1.35.3; the spec now says v1.36.6 and the
+	// status looks complete.
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(machineGVK.GroupVersion().WithKind("MachineList"))
+	if err := fc.c.List(ctx, list, client.MatchingLabels{deploymentNameLabel: "c-a"}); err != nil {
+		t.Fatal(err)
+	}
+	for i := range list.Items {
+		_ = unstructured.SetNestedField(list.Items[i].Object, "v1.35.3", "spec", "version")
+		if err := fc.c.Update(ctx, &list.Items[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	l, err := ReadLive(ctx, fc.c, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l.Pools[0].RolledOut {
+		t.Fatal("pool a must not count as rolled out while its machines run v1.35.3")
+	}
+	if !l.Pools[1].RolledOut {
+		t.Fatal("pool b's machines run its version")
 	}
 }

@@ -130,6 +130,21 @@ func ReadLive(ctx context.Context, c client.Client, cfg *config.ClusterConfig) (
 	for i := range mds.Items {
 		byName[mds.Items[i].GetName()] = &mds.Items[i]
 	}
+	// A MachineDeployment's status can count the old MachineSet's machines as
+	// up to date just after its template changes, so a pool's rollout is
+	// judged from its Machines too.
+	machines := &unstructured.UnstructuredList{}
+	machines.SetGroupVersionKind(machineGVK.GroupVersion().WithKind("MachineList"))
+	if err := c.List(ctx, machines, client.InNamespace(ns), client.MatchingLabels{clusterNameLabel: name}); err != nil {
+		return l, fmt.Errorf("listing Machines: %w", err)
+	}
+	byDeployment := map[string][]*unstructured.Unstructured{}
+	for i := range machines.Items {
+		mc := &machines.Items[i]
+		if d := mc.GetLabels()[deploymentNameLabel]; d != "" {
+			byDeployment[d] = append(byDeployment[d], mc)
+		}
+	}
 	for _, p := range cfg.Spec.NodePools {
 		obj := name + "-" + p.Name
 		md, ok := byName[obj]
@@ -143,10 +158,28 @@ func ReadLive(ctx context.Context, c client.Client, cfg *config.ClusterConfig) (
 		if err != nil {
 			return l, fmt.Errorf("MachineDeployment %s's version: %w", obj, err)
 		}
-		l.Pools = append(l.Pools, Part{Name: p.Name, Version: pv, RolledOut: cluster.UpToDate(md)})
+		l.Pools = append(l.Pools, Part{Name: p.Name, Version: pv, RolledOut: cluster.UpToDate(md) && machinesAt(md, byDeployment[obj], v)})
 	}
 	l.Strays = slices.Sorted(maps.Keys(byName))
 	return l, nil
+}
+
+// machinesAt reports whether a MachineDeployment's Machines are exactly its
+// desired count, all at version and none being deleted.
+func machinesAt(md *unstructured.Unstructured, machines []*unstructured.Unstructured, version string) bool {
+	desired, found, _ := unstructured.NestedInt64(md.Object, "spec", "replicas")
+	if !found {
+		desired, _, _ = unstructured.NestedInt64(md.Object, "status", "replicas")
+	}
+	if int64(len(machines)) != desired {
+		return false
+	}
+	for _, mc := range machines {
+		if v, _, _ := unstructured.NestedString(mc.Object, "spec", "version"); v != version || mc.GetDeletionTimestamp() != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // Drift reports, for a live cluster, the parts whose version differs from
@@ -168,6 +201,10 @@ func Drift(ctx context.Context, c client.Client, cfg *config.ClusterConfig) ([]s
 	l, err := ReadLive(ctx, c, cfg)
 	if err != nil {
 		return nil, err
+	}
+	if !l.Exists {
+		// Leftovers of a cluster without its Cluster object: nothing runs.
+		return nil, nil
 	}
 	var out []string
 	if l.ControlPlane.Version != want {
@@ -286,9 +323,16 @@ func (u *Upgrader) checkInSync(ctx context.Context, l Live) error {
 	for _, ch := range changes {
 		what = append(what, ch.Action+" "+ch.Object)
 	}
+	fix := fmt.Sprintf("apply hydra.yaml first with `hydra cluster create` (kubernetesVersion %s, what runs), or revert the edits; `hydra cluster plan` shows them", l.Lowest())
+	if l.ControlPlane.Version != l.Lowest() {
+		// Mid-upgrade create refuses (the versions differ), so the edits
+		// wait until the upgrade is done. A newer hydra whose render
+		// differs counts as an edit too.
+		fix = "an upgrade is under way: revert the edits (or use the hydra that started it), finish the upgrade, then apply them with `hydra cluster create`"
+	}
 	return &Refusal{
 		Reason: fmt.Sprintf("hydra.yaml differs from the live cluster in more than the version (%s)", strings.Join(what, ", ")),
-		Fix:    fmt.Sprintf("apply hydra.yaml first with `hydra cluster create` (kubernetesVersion %s, what runs), or revert the edits; `hydra cluster plan` shows them", l.Lowest()),
+		Fix:    fix,
 	}
 }
 
