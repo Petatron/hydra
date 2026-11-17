@@ -104,6 +104,9 @@ type recorder struct {
 	// after creating everything on the target (a split); failAfterDelete after
 	// deleting the source but before unpausing the target.
 	failFwd, failAfterCreate, failAfterDelete bool
+	// failAfterDeleting stops the move after deleting that many source
+	// objects (0: no such failure): a split interrupted while deleting.
+	failAfterDeleting int
 	// takeOver controls whether moved HydraMachines claim their VM on arrival.
 	takeOver bool
 }
@@ -150,14 +153,6 @@ func fakeMove(ctx context.Context, from, to client.Client, rec *recorder) error 
 		o.SetResourceVersion("")
 		newUID := types.UID(string(o.GetUID()) + "-moved")
 		o.SetUID(newUID)
-		if o.GroupVersionKind() == hydraMachineGVK && rec.takeOver {
-			a := o.GetAnnotations()
-			if a == nil {
-				a = map[string]string{}
-			}
-			a[OwnerUIDAnnotation] = string(newUID)
-			o.SetAnnotations(a)
-		}
 		if err := to.Create(ctx, o); apierrors.IsAlreadyExists(err) {
 			existing := &unstructured.Unstructured{}
 			existing.SetGroupVersionKind(o.GroupVersionKind())
@@ -176,15 +171,45 @@ func fakeMove(ctx context.Context, from, to client.Client, rec *recorder) error 
 	if rec.failAfterCreate {
 		return errors.New("move failed after creating the target objects")
 	}
+	deleted := 0
 	for _, o := range slices.Backward(all) { // the Cluster, listed first, goes last
+		if rec.failAfterDeleting > 0 && deleted == rec.failAfterDeleting {
+			return errors.New("move failed while deleting the source")
+		}
 		if err := from.Delete(ctx, &o); err != nil {
 			return err
 		}
+		deleted++
 	}
 	if rec.failAfterDelete {
 		return errors.New("move failed before unpausing the target")
 	}
-	return setPaused(ctx, to, false)
+	if err := setPaused(ctx, to, false); err != nil {
+		return err
+	}
+	if rec.takeOver {
+		takeOverAll(ctx, to)
+	}
+	return nil
+}
+
+// takeOverAll does what the resumed target's provider does: each moved
+// HydraMachine claims its VM, recording its own UID as owner. A paused
+// provider takes nothing over, so this only follows a resume.
+func takeOverAll(ctx context.Context, c client.Client) {
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(hydraMachineGVK.GroupVersion().WithKind("HydraMachineList"))
+	_ = c.List(ctx, list, client.InNamespace(ns))
+	for i := range list.Items {
+		m := &list.Items[i]
+		a := m.GetAnnotations()
+		if a == nil {
+			a = map[string]string{}
+		}
+		a[OwnerUIDAnnotation] = string(m.GetUID())
+		m.SetAnnotations(a)
+		_ = c.Update(ctx, m)
+	}
 }
 
 func kubeconfigFor(server, ca string) []byte {
@@ -414,6 +439,7 @@ func TestPivotReportsAPausedTarget(t *testing.T) {
 	if err := setPaused(ctx, tgt, false); err != nil {
 		t.Fatal(err)
 	}
+	takeOverAll(ctx, tgt) // the resumed provider claims the VMs
 	if err := pivotFor(t, src, tgt, &recorder{}).Run(ctx, time.Second); err != nil {
 		t.Fatalf("after unpausing as advised, a rerun verifies: %v", err)
 	}
@@ -734,5 +760,46 @@ func TestSplitSourceRefusesAmbiguousEvidence(t *testing.T) {
 	b = newClient(t, clusterObjects("b", true)...)
 	if _, _, err := SplitSource(context.Background(), Side{Name: "a", C: a}, Side{Name: "b", C: b}, ns); err == nil {
 		t.Fatal("both sides owning must be refused")
+	}
+}
+
+// Delete order in fakeMove is the reverse of movedKinds' listing: after 5
+// deletions the source keeps only its Cluster and control plane, no
+// HydraMachines, while the target is complete and still paused.
+const deletionsLeavingClusterAndKCP = 5
+
+func TestPivotFinishesASplitInterruptedWhileDeleting(t *testing.T) {
+	ctx := context.Background()
+	src := newClient(t, append(clusterObjects("src", true), labelledCRDs()...)...)
+	tgt := newClient(t, labelledCRDs()...)
+	if err := pivotFor(t, src, tgt, &recorder{failAfterDeleting: deletionsLeavingClusterAndKCP}).Run(ctx, time.Second); err == nil {
+		t.Fatal("the interrupted move must fail")
+	}
+	// Without --finish-split: the advice must never be to resume the source.
+	err := pivotFor(t, src, tgt, &recorder{}).Run(ctx, time.Second)
+	if !errors.Is(err, ErrSplit) || !strings.Contains(err.Error(), "Never unpause the source") || strings.Contains(err.Error(), "clusterctl move --kubeconfig") {
+		t.Fatalf("got %v", err)
+	}
+	rec := &recorder{}
+	p := pivotFor(t, src, tgt, rec)
+	p.FinishSplit = true
+	_ = p.Run(ctx, 30*time.Millisecond) // verify waits for a takeover the fake does not do
+	if len(rec.moves) != 0 {
+		t.Errorf("a source interrupted while deleting must never be moved again (that resumes it): %v", rec.moves)
+	}
+	if ok, _ := hasCluster(ctx, src, ns, name); ok {
+		t.Error("the source's leftover Cluster must be removed")
+	}
+	cl := &unstructured.Unstructured{}
+	cl.SetGroupVersionKind(clusterGVK)
+	if err := tgt.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, cl); err != nil {
+		t.Fatal(err)
+	}
+	if paused(cl) {
+		t.Error("the complete copy must be resumed")
+	}
+	takeOverAll(ctx, tgt)
+	if err := pivotFor(t, src, tgt, &recorder{}).Run(ctx, time.Second); err != nil {
+		t.Fatalf("once taken over, a rerun verifies: %v", err)
 	}
 }

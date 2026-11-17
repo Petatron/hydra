@@ -229,9 +229,13 @@ The VMs are untouched; the cluster's own Hydra provider takes them over.
 - Rerunning is safe: it finds where the objects are. A cluster already on the target is only
   verified. A paused cluster is reported with the commands to run; pivot never unpauses one on its
   own. A copy on both sides (a move interrupted part way) is reported too, and `--finish-split`
-  finishes it: it proves which copy is the source from the takeover evidence (on the source every
-  machine holds its VM, on the partial copy none does), unpauses that one and moves again. It
-  refuses when the evidence is unclear, or says the split came from a move the other way.
+  finishes it from the takeover evidence, never from which command is running (on the source
+  every machine holds its VM, on the copy clusterctl was building none does). Interrupted while
+  creating (the source intact), it unpauses the source and moves again. Interrupted while deleting
+  (the target complete, the source depleted), it never resumes the source, whose controllers would
+  recreate the machines already deleted: it removes the source's leftovers as clusterctl does,
+  finalizers stripped so nothing is torn down, and resumes the complete copy. It refuses when the
+  evidence is unclear, or says the split came from a move the other way.
 - `create --self-hosted` never builds a second copy: if the cluster's kubeconfig reaches it
   already managing itself, there is nothing to do; if it reaches a cluster that is running but not
   yet self-hosted, or the endpoint already answers, it refuses. When hydra cannot check (Hydra

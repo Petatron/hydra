@@ -224,20 +224,22 @@ func (p *Pivot) Run(ctx context.Context, verifyTimeout time.Duration) error {
 	case Nowhere:
 		return fmt.Errorf("the Cluster %s/%s exists on neither management cluster", p.Namespace, p.Name)
 	case Split:
+		plan, cerr := ClassifySplit(ctx, p.Source, p.Target, p.Namespace)
+		if cerr == nil && plan.Source.Name != p.Source.Name {
+			return fmt.Errorf("%w. The evidence says the source copy is on %s, but this command moves from the %s: the split was left by a move the other way. Finish it with that command's --finish-split, never this one", ErrSplit, plan.Source.Name, p.Source.Name)
+		}
 		if !p.FinishSplit {
-			return fmt.Errorf("%w. Do not delete either copy. Rerun with --finish-split: it proves which copy is the source from the takeover evidence, unpauses it and finishes the move. Or by hand, with clusterctl: %s. Then rerun this command to verify", ErrSplit,
-				steps([]Side{p.Source, p.Target},
-					unpauseCommand(p.Source.ref(), p.Namespace, p.Name),
-					fmt.Sprintf("clusterctl move --kubeconfig %s --to-kubeconfig %s --namespace %s", p.Source.ref(), p.Target.ref(), p.Namespace)))
+			return fmt.Errorf("%w. Do not delete either copy. %s", ErrSplit, splitAdvice(plan, cerr, p.rerun(), manualFinish(p.Source, p.Target, p.Namespace, p.Name)))
 		}
-		source, _, err := SplitSource(ctx, p.Source, p.Target, p.Namespace)
+		if cerr != nil {
+			return cerr
+		}
+		if plan.Deleting {
+			err = p.finishDeletion(ctx, plan)
+		} else {
+			err = p.finishSplit(ctx, p.Source, p.Target)
+		}
 		if err != nil {
-			return err
-		}
-		if source.Name != p.Source.Name {
-			return fmt.Errorf("the evidence says the source copy of this split is on %s, but this command moves from the %s: the split was left by a move the other way. Finish it with that command's --finish-split, never this one (it would unpause the partial copy)", source.Name, p.Source.Name)
-		}
-		if err := p.finishSplit(ctx, p.Source, p.Target); err != nil {
 			return err
 		}
 		return p.verifyMoved(ctx, verifyTimeout)

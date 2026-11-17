@@ -276,22 +276,28 @@ func (t *Teardown) resumeOwnPause(ctx context.Context) error {
 
 // split handles both sides holding the Cluster: a move interrupted part way.
 func (t *Teardown) split(ctx context.Context, tomb *corev1.ConfigMap) error {
+	plan, cerr := ClassifySplit(ctx, t.Self, t.Kind, t.Namespace)
+	if cerr == nil && plan.Source.Name != t.Self.Name {
+		return fmt.Errorf("%w. The evidence says the source copy is on the %s: it was left by an interrupted pivot, not by this teardown. Finish it with `hydra cluster pivot --finish-split`, never this command", ErrSplit, plan.Source.Name)
+	}
 	if !t.FinishSplit {
-		return fmt.Errorf("%w. Do not delete either copy. Rerun with --finish-split: it proves which copy is the source from the takeover evidence, unpauses it and finishes the move", ErrSplit)
+		return fmt.Errorf("%w. Do not delete either copy. %s", ErrSplit, splitAdvice(plan, cerr, "`hydra cluster delete --self-hosted`", manualFinish(t.Self, t.Kind, t.Namespace, t.Name)))
 	}
-	source, _, err := SplitSource(ctx, t.Self, t.Kind, t.Namespace)
-	if err != nil {
-		return err
-	}
-	if source.Name != t.Self.Name {
-		return fmt.Errorf("the evidence says the source copy of this split is on the %s: it was left by an interrupted pivot, not by this teardown. Finish it with `hydra cluster pivot --finish-split`, never this command (it would unpause the partial copy)", source.Name)
+	if cerr != nil {
+		return cerr
 	}
 	if tomb == nil {
-		// A split with the cluster as its source but no tombstone was not
+		// A split with the cluster as its source but no record was not
 		// started by a teardown.
 		return fmt.Errorf("both the cluster and the %s hold Cluster %s/%s, with the cluster as the source, but no teardown is recorded in the %s. Something else moved it; finish that move by hand", t.Kind.Name, t.Namespace, t.Name, t.Kind.Name)
 	}
-	if err := t.pivot().finishSplit(ctx, t.Self, t.Kind); err != nil {
+	var err error
+	if plan.Deleting {
+		err = t.pivot().finishDeletion(ctx, plan)
+	} else {
+		err = t.pivot().finishSplit(ctx, t.Self, t.Kind)
+	}
+	if err != nil {
 		return err
 	}
 	if err := t.writeTombstone(ctx, phaseMoved); err != nil {
@@ -473,7 +479,9 @@ func (t *Teardown) writeTombstone(ctx context.Context, phase string) error {
 // deleted, or be taken for a split.
 func (t *Teardown) kindNamespaceClean(ctx context.Context) error {
 	var found []string
-	for _, gvk := range append([]schema.GroupVersionKind{clusterGVK}, movableKinds...) {
+	// MachineHealthChecks too: clusterctl carries one owned by this Cluster,
+	// and a stale one left here, not paused, could remediate moved machines.
+	for _, gvk := range append([]schema.GroupVersionKind{clusterGVK, mhcGVK}, movableKinds...) {
 		list := &unstructured.UnstructuredList{}
 		list.SetGroupVersionKind(gvk.GroupVersion().WithKind(gvk.Kind + "List"))
 		if err := t.Kind.C.List(ctx, list, client.InNamespace(t.Namespace)); err != nil {

@@ -397,7 +397,7 @@ with --finish-split.`,
 				}
 				ctx, stop := interruptible(cmd)
 				defer stop()
-				to.yes, to.adopt, to.timeout = yes, adopt, timeout
+				to.yes, to.adopt, to.timeout, to.configFile = yes, adopt, timeout, file
 				return runTeardown(ctx, cmd, cfg, to)
 			}
 			md, err := config.LoadMetadata(file)

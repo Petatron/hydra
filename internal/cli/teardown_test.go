@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -21,17 +22,19 @@ func TestDeleteSelfHostedRefusesAManagementKubeconfig(t *testing.T) {
 
 func TestTeardownNothingLocal(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		answers bool
-		wantErr string
+		name     string
+		answers  bool
+		probeErr error
+		wantErr  string
 	}{
-		{"endpoint silent: nothing to do", false, ""},
-		{"endpoint answers: refuse", true, "may still run"},
+		{"endpoint refuses: nothing to do", false, nil, ""},
+		{"endpoint answers: refuse", true, nil, "may still run"},
+		{"endpoint unreachable: cannot tell, refuse", false, errors.New("i/o timeout"), "cannot reach"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			withFakeKind(t, &fakeKind{})
 			orig := endpointAnswers
-			endpointAnswers = func(string) (bool, error) { return tc.answers, nil }
+			endpointAnswers = func(string) (bool, error) { return tc.answers, tc.probeErr }
 			t.Cleanup(func() { endpointAnswers = orig })
 			var errOut bytes.Buffer
 			cmd := &cobra.Command{}

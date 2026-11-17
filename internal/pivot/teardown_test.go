@@ -35,6 +35,7 @@ type tdRecorder struct {
 	removedFile                 bool
 	takeOver                    bool
 	failAfterCreate             bool
+	failAfterDeleting           int
 }
 
 // teardownFor wires a Teardown from self (the cluster, reached with
@@ -63,7 +64,7 @@ func teardownFor(t *testing.T, self, kind client.Client, rec *tdRecorder) *Teard
 					t.Fatal("teardown must only ever move from the cluster itself")
 				}
 				rec.moves = append(rec.moves, "move")
-				return fakeMove(ctx, self, kind, &recorder{takeOver: rec.takeOver, failAfterCreate: rec.failAfterCreate})
+				return fakeMove(ctx, self, kind, &recorder{takeOver: rec.takeOver, failAfterCreate: rec.failAfterCreate, failAfterDeleting: rec.failAfterDeleting})
 			},
 			DeleteCluster: func(ctx context.Context, k Side) error {
 				rec.deletedCluster = true
@@ -449,5 +450,50 @@ func TestTakenOverNeedsARecord(t *testing.T) {
 	src, _, err := SplitSource(context.Background(), Side{Name: "a", C: a}, Side{Name: "b", C: b}, ns)
 	if err != nil || src.Name != "b" {
 		t.Fatalf("the copy with recorded owners is the source: got %q, %v", src.Name, err)
+	}
+}
+
+// A teardown's own move interrupted while deleting the cluster's copy: the
+// cluster itself is never resumed, kind's complete copy is.
+func TestTeardownFinishesItsSplitInterruptedWhileDeleting(t *testing.T) {
+	ctx := context.Background()
+	self := newClient(t, selfObjects(t)...)
+	kind := newClient(t, labelledCRDs()...)
+	// selfObjects has one more Secret than clusterObjects (the cluster's own
+	// kubeconfig), so one more deletion reaches the HydraMachines.
+	if err := teardownFor(t, self, kind, &tdRecorder{failAfterDeleting: deletionsLeavingClusterAndKCP + 1}).Run(ctx); err == nil {
+		t.Fatal("the interrupted move must fail")
+	}
+	rec := &tdRecorder{}
+	td := teardownFor(t, self, kind, rec)
+	td.FinishSplit = true
+	if err := td.Run(ctx); err == nil || !strings.Contains(err.Error(), "would wedge") {
+		t.Fatalf("the takeover is still to come: %v", err)
+	}
+	if len(rec.moves) != 0 || rec.deletedCluster {
+		t.Errorf("no move again, nothing deleted before the takeover: %+v", rec)
+	}
+	if ok, _ := hasCluster(ctx, self, ns, name); ok {
+		t.Error("the cluster's leftover copy must be removed")
+	}
+	takeOverAll(ctx, kind)
+	rec = &tdRecorder{}
+	if err := teardownFor(t, self, kind, rec).Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !rec.deletedCluster || !rec.deletedKind {
+		t.Errorf("once taken over, the teardown finishes: %+v", rec)
+	}
+}
+
+// A stale MachineHealthCheck in kind's namespace is refused like any other
+// leftover: not paused, it could remediate the moved machines.
+func TestTeardownRefusesAStaleHealthCheckInKind(t *testing.T) {
+	self := newClient(t, selfObjects(t)...)
+	kind := newClient(t, append(labelledCRDs(), u(mhcGVK, ns, "old-mhc", nil))...)
+	rec := &tdRecorder{takeOver: true}
+	err := teardownFor(t, self, kind, rec).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "MachineHealthCheck old-mhc") || len(rec.moves) != 0 {
+		t.Fatalf("got %v, moves %v", err, rec.moves)
 	}
 }

@@ -22,6 +22,8 @@ type teardownOptions struct {
 	finishSplit       bool
 	timeout           time.Duration
 	takeoverTimeout   time.Duration
+	// configFile is the hydra.yaml path, for commands printed in errors.
+	configFile string
 }
 
 // runTeardown is `cluster delete --self-hosted`: move the cluster from itself
@@ -55,7 +57,8 @@ func runTeardown(ctx context.Context, cmd *cobra.Command, cfg *config.ClusterCon
 		return err
 	}
 	kindName := bootstrap.KindName(md.Name)
-	kind := pivot.Side{Name: "bootstrap cluster " + kindName, File: kindName + ".kubeconfig"}
+	kind := pivot.Side{Name: "bootstrap cluster " + kindName, File: kindName + ".kubeconfig",
+		Prep: fmt.Sprintf("hydra bootstrap kubeconfig -f %s > %s.kubeconfig", o.configFile, kindName)}
 	connectKind := func() (pivot.Side, error) {
 		kkc, err := b.KubeConfig(md.Name)
 		if err != nil {
@@ -81,17 +84,17 @@ func runTeardown(ctx context.Context, cmd *cobra.Command, cfg *config.ClusterCon
 	// Nothing local at all: say so only if the cluster's endpoint is silent,
 	// never while something answers there.
 	if self.Kubeconfig == nil && !kindExists {
-		note := ""
 		if ep := cfg.Spec.Network.ControlPlaneEndpoint; ep != "" {
 			answers, err := endpointAnswers(ep)
 			switch {
 			case answers:
 				return fmt.Errorf("no kubeconfig at %s and no %s, but something answers on %s, this cluster's endpoint: it may still run. Pass --cluster-kubeconfig with its kubeconfig", path, kindName, ep)
 			case err != nil:
-				note = fmt.Sprintf(" This machine cannot reach %s (%v) to confirm the cluster is gone; if it still runs, pass --cluster-kubeconfig.", ep, err)
+				// A dial error is not evidence the endpoint is empty.
+				return fmt.Errorf("no kubeconfig at %s and no %s, and this machine cannot reach %s (%v) to show the cluster is gone. If it still runs, pass --cluster-kubeconfig; if you know it is gone, there is nothing to tear down", path, kindName, ep, err)
 			}
 		}
-		_, _ = fmt.Fprintf(out, "found nothing to tear down for cluster %s/%s here: no kubeconfig at %s, no %s.%s\n", md.Namespace, md.Name, path, kindName, note)
+		_, _ = fmt.Fprintf(out, "found nothing to tear down for cluster %s/%s here: no kubeconfig at %s, no %s\n", md.Namespace, md.Name, path, kindName)
 		return nil
 	}
 
