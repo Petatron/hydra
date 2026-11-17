@@ -108,13 +108,18 @@ func poolMachines(md *unstructured.Unstructured) []*unstructured.Unstructured {
 		n = int64(r)
 	}
 	ver, _, _ := unstructured.NestedString(md.Object, "spec", "template", "spec", "version")
+	labels := map[string]string{clusterNameLabel: "c", deploymentNameLabel: md.GetName()}
+	if md.GetKind() == kcpKind {
+		ver, _, _ = unstructured.NestedString(md.Object, "spec", "version")
+		labels = map[string]string{clusterNameLabel: "c", controlPlaneLabel: ""}
+	}
 	out := make([]*unstructured.Unstructured, 0, n)
 	for i := range n {
 		mc := &unstructured.Unstructured{Object: map[string]any{"spec": map[string]any{"version": ver}}}
 		mc.SetGroupVersionKind(machineGVK)
 		mc.SetNamespace(md.GetNamespace())
 		mc.SetName(fmt.Sprintf("%s-%d", md.GetName(), i))
-		mc.SetLabels(map[string]string{clusterNameLabel: "c", deploymentNameLabel: md.GetName()})
+		mc.SetLabels(labels)
 		out = append(out, mc)
 	}
 	return out
@@ -123,9 +128,13 @@ func poolMachines(md *unstructured.Unstructured) []*unstructured.Unstructured {
 // setMachines replaces a pool's Machines with ones at its MachineDeployment's
 // version, as a finished rollout leaves them.
 func setMachines(ctx context.Context, c client.Client, md *unstructured.Unstructured) error {
+	sel := client.MatchingLabels{deploymentNameLabel: md.GetName()}
+	if md.GetKind() == kcpKind {
+		sel = client.MatchingLabels{controlPlaneLabel: ""}
+	}
 	list := &unstructured.UnstructuredList{}
 	list.SetGroupVersionKind(machineGVK.GroupVersion().WithKind("MachineList"))
-	if err := c.List(ctx, list, client.MatchingLabels{deploymentNameLabel: md.GetName()}); err != nil {
+	if err := c.List(ctx, list, sel); err != nil {
 		return err
 	}
 	for i := range list.Items {
@@ -193,6 +202,9 @@ func newFakeCluster(t *testing.T, cfg *config.ClusterConfig, cp string, pools ma
 			} else {
 				rolledOut(o)
 			}
+			for _, mc := range poolMachines(o) {
+				seed = append(seed, mc)
+			}
 		case mdKind:
 			if isRolling[strings.TrimPrefix(o.GetName(), "c-")] {
 				rolling(o)
@@ -257,7 +269,7 @@ func (fc *fakeCluster) apply(ctx context.Context, c client.WithWatch, ac runtime
 	if err := c.Update(ctx, o); err != nil {
 		return err
 	}
-	if fc.rollout && o.GetKind() == mdKind {
+	if fc.rollout && (o.GetKind() == mdKind || o.GetKind() == kcpKind) {
 		return setMachines(ctx, c, o)
 	}
 	return nil
@@ -384,6 +396,7 @@ func TestRerunResumesAControlPlaneRollout(t *testing.T) {
 		if err := fc.c.Get(context.Background(), client.ObjectKey{Namespace: "ns", Name: "c-cp"}, kcp); err == nil {
 			rolledOut(kcp)
 			_ = fc.c.Update(context.Background(), kcp)
+			_ = setMachines(context.Background(), fc.c, kcp)
 		}
 	}()
 	if err := u.Run(context.Background()); err != nil {
@@ -566,5 +579,52 @@ func TestPoolNotRolledOutWhileItsMachinesRunTheOldVersion(t *testing.T) {
 	}
 	if !l.Pools[1].RolledOut {
 		t.Fatal("pool b's machines run its version")
+	}
+}
+
+// A run that resumes on a pool (the control plane already at the target)
+// still stops for a missing Cluster Autoscaler release.
+func TestAutoscalerCheckedWhenResumingOnAPool(t *testing.T) {
+	cfg := loadConfig(t, "v1.35.3")
+	fc := newFakeCluster(t, cfg, "v1.36.6", map[string]string{"a": "v1.35.3", "b": "v1.35.3"})
+	u, out := fc.upgrader(cfg, fakeRemote{packages: true})
+	err := u.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "no Cluster Autoscaler release") {
+		t.Fatalf("want the autoscaler refusal, got %v\n%s", err, out)
+	}
+	if len(fc.applied) != 0 {
+		t.Fatalf("applied %v", fc.applied)
+	}
+}
+
+// The control plane is not rolled out while a control-plane Machine runs the
+// old version, even when the deprecated status.version is not set.
+func TestControlPlaneNotRolledOutWhileAMachineRunsTheOldVersion(t *testing.T) {
+	cfg := loadConfig(t, "v1.35.3")
+	fc := newFakeCluster(t, cfg, "v1.36.6", nil)
+	ctx := context.Background()
+	kcp := &unstructured.Unstructured{}
+	kcp.SetGroupVersionKind(kcpGVK)
+	if err := fc.c.Get(ctx, client.ObjectKey{Namespace: "ns", Name: "c-cp"}, kcp); err != nil {
+		t.Fatal(err)
+	}
+	unstructured.RemoveNestedField(kcp.Object, "status", "version")
+	if err := fc.c.Update(ctx, kcp); err != nil {
+		t.Fatal(err)
+	}
+	if l, err := ReadLive(ctx, fc.c, cfg); err != nil || !l.ControlPlane.RolledOut {
+		t.Fatalf("all machines at the target without status.version: want rolled out, got %+v %v", l.ControlPlane, err)
+	}
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(machineGVK.GroupVersion().WithKind("MachineList"))
+	if err := fc.c.List(ctx, list, client.MatchingLabels{controlPlaneLabel: ""}); err != nil {
+		t.Fatal(err)
+	}
+	_ = unstructured.SetNestedField(list.Items[0].Object, "v1.35.3", "spec", "version")
+	if err := fc.c.Update(ctx, &list.Items[0]); err != nil {
+		t.Fatal(err)
+	}
+	if l, err := ReadLive(ctx, fc.c, cfg); err != nil || l.ControlPlane.RolledOut {
+		t.Fatalf("a machine at v1.35.3: want not rolled out, got %+v %v", l.ControlPlane, err)
 	}
 }

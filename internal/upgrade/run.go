@@ -117,9 +117,20 @@ func ReadLive(ctx context.Context, c client.Client, cfg *config.ClusterConfig) (
 	if l.ControlPlane.Version, err = ParseVersion(spec); err != nil {
 		return l, fmt.Errorf("the KubeadmControlPlane's spec.version: %w", err)
 	}
-	// status.version is the lowest version any control-plane machine runs.
+	// Rolled out is judged from the control-plane Machines, as for pools.
+	// status.version (the lowest version a machine runs) is deprecated in
+	// Cluster API v1.14, so it is a further check only while it is set.
 	running, _, _ := unstructured.NestedString(kcp.Object, "status", "version")
-	l.ControlPlane.RolledOut = cluster.UpToDate(kcp) && running == spec
+	cpMachines := &unstructured.UnstructuredList{}
+	cpMachines.SetGroupVersionKind(machineGVK.GroupVersion().WithKind("MachineList"))
+	if err := c.List(ctx, cpMachines, client.InNamespace(ns), client.MatchingLabels{clusterNameLabel: name, controlPlaneLabel: ""}); err != nil {
+		return l, fmt.Errorf("listing control-plane Machines: %w", err)
+	}
+	cps := make([]*unstructured.Unstructured, 0, len(cpMachines.Items))
+	for i := range cpMachines.Items {
+		cps = append(cps, &cpMachines.Items[i])
+	}
+	l.ControlPlane.RolledOut = cluster.UpToDate(kcp) && machinesAt(kcp, cps, spec) && (running == "" || running == spec)
 
 	mds := &unstructured.UnstructuredList{}
 	mds.SetGroupVersionKind(mdGVK.GroupVersion().WithKind("MachineDeploymentList"))
@@ -338,7 +349,7 @@ func (u *Upgrader) checkInSync(ctx context.Context, l Live) error {
 
 // preflight runs the checks that need the internet, before a stage that
 // creates machines at the target.
-func (u *Upgrader) preflight(ctx context.Context, s Stage) error {
+func (u *Upgrader) preflight(ctx context.Context) error {
 	if u.Config.Spec.Image.Bootstrap == config.BootstrapPrebaked {
 		return &Refusal{
 			Reason: "this cluster boots a prebaked image, which carries one Kubernetes version; hydra cannot yet swap the image per stage",
@@ -363,9 +374,9 @@ func (u *Upgrader) preflight(ctx context.Context, s Stage) error {
 		}
 	}
 	u.logf("pkgs.k8s.io carries kubelet and kubeadm %s", u.Target)
-	if s.Kind != ApplyControlPlane {
-		return nil
-	}
+	// Whatever the first stage of this run is: a run that resumes on a pool
+	// must stop for a missing Cluster Autoscaler release just as one that
+	// starts the control plane does.
 	var autoscaled []string
 	for _, p := range u.Config.Spec.NodePools {
 		if p.Autoscaling != nil {
@@ -426,7 +437,7 @@ func (u *Upgrader) Plan(ctx context.Context) error {
 	if s.Kind != ApplyControlPlane && s.Kind != ApplyPool {
 		return nil
 	}
-	if err := u.preflight(ctx, s); err != nil {
+	if err := u.preflight(ctx); err != nil {
 		return err
 	}
 	objs, err := u.stageObjects(s)
@@ -464,7 +475,7 @@ func (u *Upgrader) Run(ctx context.Context) error {
 			return nil
 		case ApplyControlPlane, ApplyPool:
 			if !preflighted {
-				if err := u.preflight(ctx, s); err != nil {
+				if err := u.preflight(ctx); err != nil {
 					return err
 				}
 				preflighted = true

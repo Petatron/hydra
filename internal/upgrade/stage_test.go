@@ -2,6 +2,8 @@ package upgrade
 
 import (
 	"errors"
+	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -101,7 +103,10 @@ func TestDecide(t *testing.T) {
 		{name: "downgrade a patch", live: settled("v1.36.6"), target: "v1.36.2", file: "v1.36.6", refuse: "does not support downgrading"},
 		{name: "not settled", live: notSettled, target: "v1.36.6", file: "v1.35.3", refuse: "not settled"},
 		{name: "a pool left behind by an earlier upgrade", live: poolBehind, target: "v1.36.6", file: "v1.34.2", refuse: "earlier upgrade has not finished"},
-		{name: "a pool ahead of the control plane", live: poolAhead, target: "v1.36.6", file: "v1.35.3", refuse: "newer than the control plane"},
+		{name: "a pool already at the target, one minor ahead: the control plane catches up", live: poolAhead, target: "v1.36.6", file: "v1.35.3", want: Stage{Kind: ApplyControlPlane, From: v("v1.35.3")}},
+		{name: "a pool one minor ahead, not at the target", live: poolAhead, target: "v1.36.9", file: "v1.35.3", refuse: "--to v1.36.6"},
+		{name: "a pool two minors ahead", live: func() Live { l := settled("v1.35.3"); l.Pools[0].Version = v("v1.37.0"); return l }(), target: "v1.37.0", file: "v1.35.3", refuse: "back to v1.35.3 by hand"},
+		{name: "a pool newer than the target", live: func() Live { l := settled("v1.35.3"); l.Pools[0].Version = v("v1.36.6"); return l }(), target: "v1.36.2", file: "v1.35.3", refuse: "--to v1.36.6"},
 		{name: "a pool two minors behind once the control plane is done", live: poolTwoBehind, target: "v1.36.6", file: "v1.34.1", refuse: "2 minor versions behind"},
 		{name: "unavailable between pools", live: unavailableMidway, target: "v1.36.6", file: "v1.35.3", refuse: "not Available"},
 		{name: "hydra.yaml says something else", live: settled("v1.35.3"), target: "v1.36.6", file: "v1.34.0", refuse: "hydra.yaml says"},
@@ -139,11 +144,50 @@ func TestRefusalsCarryAFix(t *testing.T) {
 	}{
 		{settled("v1.35.3"), "v1.37.0", "v1.35.3"},
 		{settled("v1.36.6"), "v1.35.3", "v1.36.6"},
-		{poolAhead, "v1.36.6", "v1.35.3"},
+		{poolAhead, "v1.36.9", "v1.35.3"},
+		{poolAhead, "v1.36.2", "v1.35.3"},
 	} {
 		_, err := Decide(tc.live, v(tc.target), v(tc.file))
 		if err == nil || !strings.Contains(err.Error(), "fix: ") {
 			t.Errorf("%s -> %s: want a fix line, got %v", tc.live.ControlPlane.Version, tc.target, err)
 		}
+	}
+}
+
+var toFlag = regexp.MustCompile("upgrade --to (v1\\.[0-9]+\\.[0-9]+)`")
+
+// A refusal that suggests `hydra cluster upgrade --to X` must be answered by
+// that command: Decide with X proceeds, never refusing again the same way.
+func TestSuggestedUpgradeCommandsProceed(t *testing.T) {
+	patchAhead := settled("v1.35.2")
+	patchAhead.Pools[0].Version = v("v1.35.3")
+	poolBehind := settled("v1.35.3")
+	poolBehind.Pools[1].Version = v("v1.34.2")
+	minorAhead := settled("v1.35.3")
+	minorAhead.Pools[0].Version = v("v1.36.6")
+	for _, tc := range []struct {
+		name         string
+		live         Live
+		target, file string
+	}{
+		{"a pool a patch ahead", patchAhead, "v1.36.6", "v1.35.2"},
+		{"a pool behind", poolBehind, "v1.36.6", "v1.34.2"},
+		{"a pool a minor ahead, other target", minorAhead, "v1.36.9", "v1.35.3"},
+		{"a pool newer than the target", minorAhead, "v1.36.2", "v1.35.3"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Decide(tc.live, v(tc.target), v(tc.file))
+			m := toFlag.FindStringSubmatch(fmt.Sprint(err))
+			if m == nil {
+				t.Fatalf("want a refusal suggesting upgrade --to, got %v", err)
+			}
+			got, err := Decide(tc.live, v(m[1]), v(tc.file))
+			if err != nil {
+				t.Fatalf("the suggested --to %s is refused too: %v", m[1], err)
+			}
+			if got.Kind == Done {
+				t.Fatalf("the suggested --to %s does nothing", m[1])
+			}
+		})
 	}
 }

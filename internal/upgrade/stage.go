@@ -175,12 +175,26 @@ func Decide(l Live, target, file Version) (Stage, error) {
 	}
 	for _, p := range l.Pools {
 		if target.Less(p.Version) {
-			return Stage{}, &Refusal{Reason: fmt.Sprintf("pool %s runs %s, newer than %s: Kubernetes does not support downgrading", p.Name, p.Version, target)}
+			fix := fmt.Sprintf("set pool %s back to %s by hand (it was moved outside upgrade), or restore etcd from a backup taken before it moved", p.Name, cp.Version)
+			if p.Version.Minor-cp.Version.Minor <= 1 {
+				fix = fmt.Sprintf("upgrade to the pool's version instead: `hydra cluster upgrade --to %s`", p.Version)
+			}
+			return Stage{}, &Refusal{
+				Reason: fmt.Sprintf("pool %s runs %s, newer than %s: Kubernetes does not support downgrading", p.Name, p.Version, target),
+				Fix:    fix,
+			}
 		}
-		if p.Version.Minor > cp.Version.Minor {
+		// A pool ahead of the control plane breaks the skew policy. When it
+		// is at most one minor ahead and already at the target, bringing the
+		// control plane up to it is the repair, so let that through.
+		if p.Version.Minor > cp.Version.Minor && (p.Version != target || p.Version.Minor-cp.Version.Minor > 1) {
+			fix := fmt.Sprintf("bring the control plane up to it: `hydra cluster upgrade --to %s`", p.Version)
+			if p.Version.Minor-cp.Version.Minor > 1 {
+				fix = fmt.Sprintf("set pool %s back to %s by hand: it is too far ahead to catch up in one step", p.Name, cp.Version)
+			}
 			return Stage{}, &Refusal{
 				Reason: fmt.Sprintf("pool %s runs %s, newer than the control plane's %s, which the version-skew policy forbids", p.Name, p.Version, cp.Version),
-				Fix:    fmt.Sprintf("set pool %s back to %s by hand, or finish the control plane with `hydra cluster upgrade --to %s`", p.Name, cp.Version, p.Version),
+				Fix:    fix,
 			}
 		}
 	}
@@ -204,7 +218,12 @@ func Decide(l Live, target, file Version) (Stage, error) {
 			}
 		}
 		for _, p := range l.Pools {
-			if p.Version != cp.Version {
+			// A pool already at the target is done for this upgrade; any
+			// other version means an earlier change has not finished. The
+			// fix names a version this function then lets through: the
+			// control plane's (the pools catch up), or the pool's when it
+			// is ahead (the control plane catches up).
+			if p.Version != cp.Version && p.Version != target {
 				finish := cp.Version
 				if finish.Less(p.Version) {
 					finish = p.Version
