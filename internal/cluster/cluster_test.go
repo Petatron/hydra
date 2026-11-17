@@ -100,7 +100,7 @@ func TestStatusReadsControllers(t *testing.T) {
 	cl := obj(clusterGVK, "ns", "c", map[string]any{"status": map[string]any{"conditions": []any{
 		map[string]any{"type": "Available", "status": "True", "reason": "Available"},
 	}}})
-	kcp := obj(kcpGVK, "ns", "c-cp", map[string]any{"spec": map[string]any{"replicas": int64(3)}, "status": map[string]any{"readyReplicas": int64(3), "upToDateReplicas": int64(3)}})
+	kcp := obj(kcpGVK, "ns", "c-cp", map[string]any{"spec": map[string]any{"replicas": int64(3)}, "status": map[string]any{"replicas": int64(3), "readyReplicas": int64(3), "upToDateReplicas": int64(3)}})
 	m1 := obj(machineGVK, "ns", "c-cp-1", map[string]any{"status": map[string]any{"phase": "Running"}})
 	m1.SetLabels(map[string]string{"cluster.x-k8s.io/cluster-name": "c"})
 	other := obj(machineGVK, "ns", "other-1", map[string]any{"status": map[string]any{"phase": "Running"}})
@@ -369,6 +369,13 @@ func TestUpToDate(t *testing.T) {
 	}
 	if !upToDate(mk(1, 1, 0, 0, false)) {
 		t.Error("an autoscaled pool at zero is up to date")
+	}
+	// Scaled down from 2 to 1: the surplus Machine is still being deleted, so
+	// status.replicas is 2 while 2 are Ready and up to date.
+	down := withReady(mk(2, 2, 2, 2, false), 2)
+	_ = unstructured.SetNestedField(down.Object, int64(1), "spec", "replicas")
+	if upToDate(down) {
+		t.Error("a scale-down is not done while a surplus Machine remains")
 	}
 }
 

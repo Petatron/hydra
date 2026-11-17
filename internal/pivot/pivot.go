@@ -222,6 +222,9 @@ func (p *Pivot) Run(ctx context.Context, verifyTimeout time.Duration) error {
 		}
 		p.logf("already on %s; verifying only", p.Target.Name)
 		if err := p.verify(ctx, verifyTimeout); err != nil {
+			if ctx.Err() != nil {
+				return fmt.Errorf("interrupted while verifying %s (last seen: %w). Nothing was moved; rerun to keep verifying", p.Target.Name, err)
+			}
 			return fmt.Errorf("%s holds the cluster but it does not verify: %w. Nothing was moved; inspect it with `hydra cluster status --management-kubeconfig %s`", p.Target.Name, err, p.Target.ref())
 		}
 		return nil
@@ -236,7 +239,7 @@ func (p *Pivot) Run(ctx context.Context, verifyTimeout time.Duration) error {
 	}
 	if err := p.verify(ctx, verifyTimeout); err != nil {
 		if ctx.Err() != nil {
-			return fmt.Errorf("interrupted before %s verified (%w). The cluster has moved and stays there; rerun pivot to keep verifying", p.Target.Name, err)
+			return fmt.Errorf("interrupted before %s verified (last seen: %w). The cluster has moved and stays there; rerun pivot to keep verifying", p.Target.Name, err)
 		}
 		return fmt.Errorf("the cluster moved to %s but did not verify there: %w. It stays on %s, which manages it now; pivot never moves a cluster back automatically, because a VM may already have been taken over and moving it back would strand that machine. Inspect it with `hydra cluster status --management-kubeconfig %s` and rerun pivot to keep verifying. To undo the move by hand, first confirm in the target provider's log that no machine was taken over (\"Took over a machine moved from another management cluster\"), then: %s", p.Target.Name, err, p.Target.Name, p.Target.ref(),
 			steps([]Side{p.Source}, fmt.Sprintf("clusterctl move --kubeconfig %s --to-kubeconfig %s --namespace %s", p.Target.ref(), p.Source.ref(), p.Namespace)))
@@ -398,7 +401,7 @@ func (p *Pivot) preflight(ctx context.Context) error {
 		return fmt.Errorf("the Cluster %s/%s is paused on the %s (%s), and clusterctl refuses to move a paused cluster. An earlier move that failed before reaching the target can leave it so. If no move is in progress and no one paused it on purpose, %s, then rerun pivot", p.Namespace, p.Name, p.Source.Name, why, unpauseAdvice(cl, p.Source, p.Namespace, p.Name))
 	}
 	if st.Available != cluster.ConditionTrue || !st.RolledOut {
-		return fmt.Errorf("the Cluster %s/%s is not settled (%s); move only an Available cluster with no rollout in progress", p.Namespace, p.Name, st.Line())
+		return fmt.Errorf("the Cluster %s/%s is not settled (%s); move only an Available cluster with no rollout in progress. If it was just created, moved or scaled, wait for Cluster API to settle it, then rerun", p.Namespace, p.Name, st.Line())
 	}
 
 	var problems []string
@@ -513,23 +516,38 @@ func (p *Pivot) move(ctx context.Context) error {
 // and rolled out there, every HydraMachine has taken its VM over (owner-uid
 // rewritten to its new UID) and is Ready, the CNI ClusterResourceSet came
 // along, and the source no longer holds the Cluster.
-func (p *Pivot) verify(ctx context.Context, timeout time.Duration) error {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+func (p *Pivot) verify(parent context.Context, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	last := ""
+	// seen is the last state observed while the context was live. A check cut
+	// off by the cancellation or the deadline fails with the context's own
+	// error, which says nothing about the cluster.
+	var seen error
 	for {
 		err := p.verifyOnce(ctx)
 		if err == nil {
 			p.logf("verified: %s manages cluster %s/%s", p.Target.Name, p.Namespace, p.Name)
 			return nil
 		}
-		if msg := err.Error(); msg != last {
-			p.logf("  waiting: %s", msg)
-			last = msg
+		if ctx.Err() == nil {
+			seen = err
+			if msg := err.Error(); msg != last {
+				p.logf("  waiting: %s", msg)
+				last = msg
+			}
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("not verified within %s: %w", timeout, err)
+			if seen == nil {
+				seen = err // nothing observed before the cut-off
+			}
+			// The caller's own cancellation (Ctrl-C) is not a timeout: return
+			// the last state seen and let the caller say it was interrupted.
+			if parent.Err() != nil {
+				return seen
+			}
+			return fmt.Errorf("not verified within %s: %w", timeout, seen)
 		case <-time.After(p.poll()):
 		}
 	}
