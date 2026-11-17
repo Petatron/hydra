@@ -77,7 +77,7 @@ func newBootstrapDeleteCommand() *cobra.Command {
 	var file string
 	var force bool
 	c := &cobra.Command{
-		Use:   "delete",
+		Use:   deleteVerb,
 		Short: "Delete the temporary management cluster",
 		Long: `delete removes the hydra-bootstrap-<cluster> kind cluster. It refuses while
 that cluster still manages Cluster API Clusters, because their machines would

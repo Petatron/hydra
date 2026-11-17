@@ -667,3 +667,72 @@ func TestPivotInterruptReportsLastObservedState(t *testing.T) {
 		t.Fatalf("want the last observed state, got %v", err)
 	}
 }
+
+// splitByInterruptedPivot leaves the realistic split an interrupted pivot
+// leaves: the source paused and complete, a partial paused copy on the target.
+func splitByInterruptedPivot(t *testing.T) (src, tgt client.Client) {
+	t.Helper()
+	src = newClient(t, append(clusterObjects("src", true), labelledCRDs()...)...)
+	tgt = newClient(t, labelledCRDs()...)
+	if err := pivotFor(t, src, tgt, &recorder{failAfterCreate: true}).Run(context.Background(), time.Second); err == nil {
+		t.Fatal("the interrupted move must fail")
+	}
+	return src, tgt
+}
+
+func TestFinishSplitCompletesAPivotSplit(t *testing.T) {
+	src, tgt := splitByInterruptedPivot(t)
+	p := pivotFor(t, src, tgt, &recorder{takeOver: true})
+	p.FinishSplit = true
+	if err := p.Run(context.Background(), time.Second); err != nil {
+		t.Fatalf("finishing the split must converge: %v", err)
+	}
+	if ok, _ := hasCluster(context.Background(), src, ns, name); ok {
+		t.Error("the source must no longer hold the Cluster")
+	}
+}
+
+// The review's critical case: a split from a move one way, finished by the
+// command for the other way, would unpause the partial copy. Refuse, and
+// touch nothing.
+func TestFinishSplitRefusesTheWrongDirection(t *testing.T) {
+	src, tgt := splitByInterruptedPivot(t)
+	rec := &recorder{}
+	p := pivotFor(t, src, tgt, rec)
+	p.Source, p.Target = p.Target, p.Source // the opposite command
+	p.Source.Kubeconfig, p.Target.Kubeconfig = tgtKubeconfig, srcKubeconfig
+	p.FinishSplit = true
+	err := p.Run(context.Background(), time.Second)
+	if err == nil || !strings.Contains(err.Error(), "a move the other way") {
+		t.Fatalf("got %v", err)
+	}
+	if len(rec.moves) != 0 {
+		t.Errorf("nothing may move, got %v", rec.moves)
+	}
+	for side, c := range map[string]client.Client{"source": src, "target": tgt} {
+		cl := &unstructured.Unstructured{}
+		cl.SetGroupVersionKind(clusterGVK)
+		if err := c.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: name}, cl); err != nil {
+			t.Fatal(err)
+		}
+		if !paused(cl) {
+			t.Errorf("the %s copy must stay paused", side)
+		}
+	}
+}
+
+func TestSplitSourceRefusesAmbiguousEvidence(t *testing.T) {
+	// Neither side's machines hold their VM: no way to tell.
+	a := newClient(t, clusterObjects("a", false)...)
+	b := newClient(t, clusterObjects("b", false)...)
+	_, _, err := SplitSource(context.Background(), Side{Name: "a", C: a}, Side{Name: "b", C: b}, ns)
+	if err == nil || !strings.Contains(err.Error(), "cannot tell which copy") {
+		t.Fatalf("got %v", err)
+	}
+	// Both sides owning: also refused.
+	a = newClient(t, clusterObjects("a", true)...)
+	b = newClient(t, clusterObjects("b", true)...)
+	if _, _, err := SplitSource(context.Background(), Side{Name: "a", C: a}, Side{Name: "b", C: b}, ns); err == nil {
+		t.Fatal("both sides owning must be refused")
+	}
+}

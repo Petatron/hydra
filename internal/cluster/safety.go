@@ -129,6 +129,13 @@ func (m *Manager) SelfHosted(ctx context.Context, namespace, name string, manage
 	return false, "", nil
 }
 
+// KubeconfigCA is the certificate authority a kubeconfig's current context
+// trusts, or nil when it has none readable.
+func KubeconfigCA(kubeconfig []byte) []byte {
+	_, ca := kubeconfigIdentity(kubeconfig)
+	return ca
+}
+
 // SameCA reports whether two kubeconfigs trust the same certificate
 // authority. Either one lacking a readable CA is an error, never "different".
 func SameCA(a, b []byte) (bool, error) {

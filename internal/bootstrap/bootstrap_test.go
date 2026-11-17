@@ -459,3 +459,18 @@ func TestRestoresMissingCertManager(t *testing.T) {
 		t.Errorf("want one init with no providers (to restore cert-manager), got %v", c.inited)
 	}
 }
+
+// Teardown brings kind up for a move that carries the Secret: no
+// credentials needed, none written.
+func TestNoCredentialsBootstrap(t *testing.T) {
+	_, c, b, _ := newFakes()
+	if err := b.Create(context.Background(), cfg(t, cfgYAML), Options{NoCredentials: true}); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.secrets) != 0 {
+		t.Errorf("no Secret may be written, got %v", c.secrets)
+	}
+	if err := b.Create(context.Background(), cfg(t, cfgYAML), Options{NoCredentials: true, Credentials: testCredentials(t)}); err == nil {
+		t.Error("credentials and NoCredentials together must be refused")
+	}
+}

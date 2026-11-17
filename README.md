@@ -17,20 +17,63 @@ The CLI is a **stateless orchestrator**: every cluster's desired and actual stat
 Kubernetes, never on your machine. There is no local database, cache or inventory, and an
 interrupted command can always be re-run.
 
-> **Status:** early. `validate`, `render`, `bootstrap`, `cluster create/plan/status/delete` and
-> the self-hosting pivot work today.
+> **Status:** early, first release v0.1.0. `validate`, `render`, `bootstrap`,
+> `cluster create/plan/status/delete`, the self-hosting pivot and self-hosted teardown work today.
 
 ## Install
 
-Release binaries for Linux and macOS (amd64 and arm64, with SHA256 sums in `checksums.txt`) are
-published on the [releases page](https://github.com/Petatron/hydra/releases) for each tagged
-version, once the first is tagged. Until then, or for an unreleased commit, build it:
+Release binaries for Linux and macOS (amd64 and arm64), with SHA256 sums in `checksums.txt`, are on
+the [releases page](https://github.com/Petatron/hydra/releases). For example, on Linux amd64:
 
 ```bash
-go install github.com/Petatron/hydra/cmd/hydra@latest
+v=v0.1.0; os=linux; arch=amd64
+curl -fsSLO https://github.com/Petatron/hydra/releases/download/$v/hydra-$os-$arch
+curl -fsSLO https://github.com/Petatron/hydra/releases/download/$v/checksums.txt
+grep " hydra-$os-$arch\$" checksums.txt | sha256sum -c -   # macOS: shasum -a 256 -c -
+install -m 0755 hydra-$os-$arch ~/.local/bin/hydra && hydra version
 ```
 
-or build from a checkout with `make build` (the binary lands in `bin/hydra`).
+For an unreleased commit, `go install github.com/Petatron/hydra/cmd/hydra@latest`, or `make build`
+in a checkout (the binary lands in `bin/hydra`).
+
+## Quickstart: a self-hosted cluster and back
+
+**What the machine running hydra needs:**
+
+- A container runtime kind can use: Docker, Podman or nerdctl, usable without sudo.
+- Network reach, from that runtime's containers, to the hypervisor's libvirt TLS port (16514) and
+  to the cluster's control-plane endpoint. The bootstrap cluster's controllers run in a container
+  and dial from there; `hydra validate` checks this.
+- **On a host that is itself a Kubernetes node or a hypervisor**, install Docker so it cannot change
+  the iptables `FORWARD` policy, which those hosts rely on. Before installing Docker:
+  `echo '{"ip-forward-no-drop": true}' | sudo tee /etc/docker/daemon.json`.
+- The hypervisor's TLS client credentials in a directory: `cacert.pem`, `clientcert.pem`,
+  `clientkey.pem`.
+
+**The whole path:**
+
+```bash
+# 1. Describe the cluster in hydra.yaml (see examples/), then check the host and hypervisor
+hydra validate -f hydra.yaml --hypervisor-credentials ./libvirt-pki
+
+# 2. Build it and make it manage itself (bootstrap kind, create, pivot, delete kind)
+hydra cluster create -f hydra.yaml --self-hosted --hypervisor-credentials ./libvirt-pki
+
+# 3. Day 2: change hydra.yaml (pool sizes, say), preview, apply, against the cluster itself
+hydra cluster plan   -f hydra.yaml --management-kubeconfig ./<name>.kubeconfig
+hydra cluster create -f hydra.yaml --management-kubeconfig ./<name>.kubeconfig
+hydra cluster status -f hydra.yaml --management-kubeconfig ./<name>.kubeconfig
+
+# 4. Tear it down: move it into a bootstrap cluster, delete it there, remove kind
+hydra cluster delete -f hydra.yaml --self-hosted
+```
+
+- `create --self-hosted` refuses to build when it cannot show the cluster does not already exist
+  (this machine cannot reach the endpoint, or Hydra chooses it). Pass `--fresh` once you have
+  checked.
+- Every step can be interrupted and run again: each command finds where things are and continues.
+  A move interrupted part way leaves the Cluster on both sides; the command says so, and
+  `--finish-split` finishes it.
 
 ## Describe a cluster
 
@@ -184,14 +227,40 @@ The VMs are untouched; the cluster's own Hydra provider takes them over.
   moves a cluster back on its own: a VM may already have been taken over, and moving that machine
   back would strand it.
 - Rerunning is safe: it finds where the objects are. A cluster already on the target is only
-  verified. A paused cluster, or a copy on both sides, is reported with the commands to run;
-  pivot never unpauses or deletes either.
+  verified. A paused cluster is reported with the commands to run; pivot never unpauses one on its
+  own. A copy on both sides (a move interrupted part way) is reported too, and `--finish-split`
+  finishes it: it proves which copy is the source from the takeover evidence (on the source every
+  machine holds its VM, on the partial copy none does), unpauses that one and moves again. It
+  refuses when the evidence is unclear, or says the split came from a move the other way.
 - `create --self-hosted` never builds a second copy: if the cluster's kubeconfig reaches it
   already managing itself, there is nothing to do; if it reaches a cluster that is running but not
   yet self-hosted, or the endpoint already answers, it refuses. When hydra cannot check (Hydra
   chooses the endpoint, or this machine cannot reach it) and nothing local shows whether the cluster
   exists, pass `--fresh`.
 - After a pivot, pass the cluster's kubeconfig as `--management-kubeconfig` to every command.
+
+### Tear a self-hosted cluster down
+
+```bash
+hydra cluster delete -f hydra.yaml --self-hosted [--cluster-kubeconfig ./<name>.kubeconfig]
+```
+
+A cluster cannot delete itself (its controllers run on the machines being deleted), so this moves it
+into its bootstrap kind cluster and deletes it from there:
+
+- It proves the kubeconfig is the cluster itself, and that the cluster is hydra's to delete
+  (`--adopt` for one hydra did not make), before anything moves.
+- It brings kind up without hypervisor credentials (they come back with the move), and refuses a
+  kind whose copy of the namespace already holds something.
+- It pauses the cluster's MachineHealthChecks, moves it, and waits until kind's provider has taken
+  every VM over: deleting a machine before that would wedge it.
+- It deletes the cluster from kind, then removes `./<name>.kubeconfig` (only if it is this
+  cluster's) and kind.
+- It leaves a record in kind before moving, so an interrupted teardown is finished by running the
+  same command again; when the cluster cannot be reached and no record shows a teardown, it
+  refuses rather than guess.
+- It does not require the cluster to be healthy, but its API must answer: nothing can be moved from
+  a dead control plane.
 
 ## Pinned components
 

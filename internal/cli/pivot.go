@@ -104,6 +104,9 @@ type pivotOptions struct {
 	fresh bool
 	// configFile is the hydra.yaml path, for commands printed in errors.
 	configFile string
+	// finishSplit completes a move interrupted part way, after proving which
+	// copy is the source.
+	finishSplit bool
 }
 
 // targetKubeconfigFile returns a file holding the target kubeconfig, for
@@ -165,12 +168,13 @@ func runPivot(ctx context.Context, cmd *cobra.Command, src *target, cfg config.M
 		srcSide.Prep = fmt.Sprintf("hydra bootstrap kubeconfig -f %s > %s", cf, srcSide.File)
 	}
 	p := &pivot.Pivot{
-		Source:    srcSide,
-		Target:    pivot.Side{Name: "cluster " + cfg.Name, C: tc, Kubeconfig: kc, File: targetFile},
-		Namespace: cfg.Namespace,
-		Name:      cfg.Name,
-		Hooks:     pivotHooks(out, "cluster "+cfg.Name),
-		Out:       out,
+		Source:      srcSide,
+		Target:      pivot.Side{Name: "cluster " + cfg.Name, C: tc, Kubeconfig: kc, File: targetFile},
+		Namespace:   cfg.Namespace,
+		Name:        cfg.Name,
+		Hooks:       pivotHooks(out, "cluster "+cfg.Name),
+		Out:         out,
+		FinishSplit: o.finishSplit,
 	}
 	if err := p.Run(ctx, o.timeout); errors.Is(err, pivot.ErrAlreadySelfHosted) {
 		_, _ = fmt.Fprintf(out, "cluster %s/%s already manages itself (%s is the cluster itself); nothing to move\n", cfg.Namespace, cfg.Name, src.source)
@@ -248,6 +252,7 @@ func addPivotFlags(c *cobra.Command, o *pivotOptions) {
 	c.Flags().StringVar(&o.clusterKubeconfig, "cluster-kubeconfig", "", "the cluster's own kubeconfig, used once the source no longer holds it (default ./<name>.kubeconfig)")
 	c.Flags().BoolVar(&o.keepBootstrap, "keep-bootstrap", false, "keep the bootstrap kind cluster after a verified pivot")
 	c.Flags().DurationVar(&o.timeout, "pivot-timeout", 15*time.Minute, "how long to wait for the cluster to verify on itself")
+	c.Flags().BoolVar(&o.finishSplit, "finish-split", false, "finish a move interrupted part way (the Cluster on both sides): prove from the takeover evidence which copy is the source, unpause it and move again")
 }
 
 // endpointAnswers probes the cluster's stated API endpoint: true when
