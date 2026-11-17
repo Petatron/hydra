@@ -388,8 +388,9 @@ func (m *Manager) Status(ctx context.Context, namespace, name string) (Summary, 
 }
 
 // upToDate reports whether a KubeadmControlPlane or MachineDeployment has
-// observed its latest generation and has every desired replica both up to
-// date and Ready. upToDateReplicas alone is not enough: in Cluster API v1.14 a
+// observed its latest generation, has every desired replica both up to date
+// and Ready, and has no more replicas than desired: a scale-down is not done
+// while the surplus Machines are still being deleted. upToDateReplicas alone is not enough: in Cluster API v1.14 a
 // Machine is UpToDate as soon as its spec matches, before its Node is Ready.
 // spec.replicas is the desired count; for an autoscaled pool Cluster API
 // defaults it to the min-size annotation when the pool is created, so that
@@ -404,9 +405,10 @@ func upToDate(o *unstructured.Unstructured) bool {
 	if !found {
 		desired, _, _ = unstructured.NestedInt64(o.Object, "status", "replicas")
 	}
+	replicas, _, _ := unstructured.NestedInt64(o.Object, "status", "replicas")
 	upto, _, _ := unstructured.NestedInt64(o.Object, "status", "upToDateReplicas")
 	ready, _, _ := unstructured.NestedInt64(o.Object, "status", "readyReplicas")
-	return upto >= desired && ready >= desired
+	return replicas == desired && upto >= desired && ready >= desired
 }
 
 // condition returns the named entry of status.conditions.

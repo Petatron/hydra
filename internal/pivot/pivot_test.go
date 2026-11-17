@@ -326,7 +326,7 @@ func TestPivotNeverMovesBack(t *testing.T) {
 	tgt := newClient(t, labelledCRDs()...)
 	rec := &recorder{takeOver: false} // the target never takes the VMs over
 	err := pivotFor(t, src, tgt, rec).Run(context.Background(), 30*time.Millisecond)
-	if err == nil || !strings.Contains(err.Error(), "never moves a cluster back") || !strings.Contains(err.Error(), "clusterctl move --kubeconfig") {
+	if err == nil || !strings.Contains(err.Error(), "never moves a cluster back") || !strings.Contains(err.Error(), "clusterctl move --kubeconfig") || !strings.Contains(err.Error(), "not verified within") {
 		t.Fatalf("want a stays-on-target failure with the manual undo, got %v", err)
 	}
 	if strings.Join(rec.moves, ",") != "dry,forward" {
@@ -527,6 +527,23 @@ func TestPivotInterruptedVerifyKeepsTheMove(t *testing.T) {
 	}
 	err := p.Run(ctx, time.Second)
 	if err == nil || !strings.Contains(err.Error(), "interrupted") {
+		t.Fatalf("got %v", err)
+	}
+	// A Ctrl-C is not a timeout: the message must not claim one.
+	if strings.Contains(err.Error(), "not verified within") {
+		t.Errorf("an interrupt reported as a timeout: %v", err)
+	}
+}
+
+// Interrupted while verifying a cluster already on the target: reported as
+// an interrupt, not as a cluster that does not verify.
+func TestPivotInterruptedResumeSaysInterrupted(t *testing.T) {
+	tgt := newClient(t, append(clusterObjects("tgt", false), labelledCRDs()...)...) // never verifies
+	src := newClient(t, labelledCRDs()...)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	err := pivotFor(t, src, tgt, &recorder{}).Run(ctx, time.Hour)
+	if err == nil || !strings.Contains(err.Error(), "interrupted while verifying") || strings.Contains(err.Error(), "not verified within") {
 		t.Fatalf("got %v", err)
 	}
 }
