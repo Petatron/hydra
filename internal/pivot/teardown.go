@@ -30,6 +30,11 @@ import (
 const TombstoneName = "hydra-teardown"
 
 const (
+	// phasePreparing: kind is up and the teardown under way, nothing moved
+	// and nothing paused by it yet.
+	phasePreparing = "preparing"
+	// phaseMoving: clusterctl move was invoked; any pause found from here on
+	// may be the move's own.
 	phaseMoving  = "moving"
 	phaseMoved   = "moved"
 	phaseDeleted = "deleted"
@@ -150,7 +155,7 @@ func (t *Teardown) Run(ctx context.Context) error {
 		}
 		return t.Run(ctx)
 	case kindHolds:
-		if self == holdsUnknown && (tomb == nil || tomb.Data["phase"] == phaseMoving) {
+		if self == holdsUnknown && (tomb == nil || (tomb.Data["phase"] != phaseMoved && tomb.Data["phase"] != phaseDeleted)) {
 			return fmt.Errorf("the %s holds Cluster %s/%s, but %s cannot be reached (%v) to show it no longer holds its own copy, and no finished move is recorded. Restore access to it and rerun", t.Kind.Name, t.Namespace, t.Name, t.Self.Name, selfErr)
 		}
 		return t.finishInKind(ctx, tomb)
@@ -243,8 +248,10 @@ func (t *Teardown) moveToKind(ctx context.Context, tomb *corev1.ConfigMap) error
 	t.Kind, t.createdKind = kind, created
 	// Record at once that this teardown is under way and whether it created
 	// kind, before checks that can fail: a rerun then finds kind already
-	// there, and only this record says the teardown made it.
-	if err := t.writeTombstone(ctx, phaseMoving); err != nil {
+	// there, and only this record says the teardown made it. "preparing",
+	// not "moving": nothing this teardown does has paused anything yet, so
+	// a pause found on a rerun is not its own.
+	if err := t.writeTombstone(ctx, phasePreparing); err != nil {
 		return err
 	}
 	if err := t.kindNamespaceClean(ctx); err != nil {
@@ -255,6 +262,11 @@ func (t *Teardown) moveToKind(ctx context.Context, tomb *corev1.ConfigMap) error
 		return err
 	}
 	if err := t.pauseHealthChecks(ctx); err != nil {
+		return err
+	}
+	// Immediately before clusterctl: from here a pause on either copy may be
+	// the move's own, and only from here may a rerun lift it.
+	if err := t.writeTombstone(ctx, phaseMoving); err != nil {
 		return err
 	}
 	if err := p.move(ctx); err != nil {
@@ -472,7 +484,7 @@ func (t *Teardown) tombstone(ctx context.Context) (*corev1.ConfigMap, error) {
 	// Only a well-formed record is evidence: a known phase, and the CA of
 	// the cluster it was written for.
 	switch cm.Data["phase"] {
-	case phaseMoving, phaseMoved, phaseDeleted:
+	case phasePreparing, phaseMoving, phaseMoved, phaseDeleted:
 	default:
 		return nil, fmt.Errorf("the teardown record in the %s has an unknown phase %q; it is not this tool's record. Inspect and remove it, then rerun", t.Kind.Name, cm.Data["phase"])
 	}
@@ -580,8 +592,12 @@ func (t *Teardown) pauseHealthChecks(ctx context.Context) error {
 		}
 		return fmt.Errorf("listing MachineHealthChecks: %w", err)
 	}
+	p := t.pivot()
 	for i := range list.Items {
 		m := &list.Items[i]
+		if !p.belongs(m) {
+			continue // another cluster's: not this teardown's to touch
+		}
 		if _, ok := m.GetAnnotations()[pausedAnnotation]; ok {
 			continue
 		}

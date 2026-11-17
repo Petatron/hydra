@@ -679,3 +679,51 @@ func TestTeardownRecordsKindCreationBeforeChecks(t *testing.T) {
 		t.Error("the kind this teardown created must still be removed")
 	}
 }
+
+// An operator's pause stops the first run before any move: a rerun finds
+// only a "preparing" record and must not lift that pause.
+func TestTeardownNeverLiftsAnOperatorPause(t *testing.T) {
+	ctx := context.Background()
+	objs := selfObjects(t)
+	_ = unstructured.SetNestedField(objs[0].(*unstructured.Unstructured).Object, true, "spec", "paused")
+	self := newClient(t, objs...)
+	kind := newClient(t, labelledCRDs()...)
+	for run := 1; run <= 2; run++ {
+		rec := &tdRecorder{takeOver: true, kindExisted: run > 1}
+		err := teardownFor(t, self, kind, rec).Run(ctx)
+		if err == nil || !strings.Contains(err.Error(), "is paused") || len(rec.moves) != 0 {
+			t.Fatalf("run %d: got %v, moves %v", run, err, rec.moves)
+		}
+	}
+	cl := &unstructured.Unstructured{}
+	cl.SetGroupVersionKind(clusterGVK)
+	if err := self.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, cl); err != nil {
+		t.Fatal(err)
+	}
+	if !paused(cl) {
+		t.Error("an operator's pause must survive reruns")
+	}
+	if tb := tombstoneIn(t, kind); tb == nil || tb.Data["phase"] != phasePreparing {
+		t.Errorf("no move was attempted: the record must say preparing, got %+v", tb)
+	}
+}
+
+// Only this cluster's MachineHealthChecks are paused.
+func TestTeardownLeavesOtherHealthChecksAlone(t *testing.T) {
+	mine := u(mhcGVK, ns, name+"-cp-mhc", nil)
+	mine.SetLabels(map[string]string{clusterNameLabel: name})
+	theirs := u(mhcGVK, ns, "other-mhc", nil)
+	theirs.SetLabels(map[string]string{clusterNameLabel: "other"})
+	self := newClient(t, append(selfObjects(t), mine, theirs)...)
+	if err := teardownFor(t, self, newClient(t, labelledCRDs()...), &tdRecorder{takeOver: true}).Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := &unstructured.Unstructured{}
+	got.SetGroupVersionKind(mhcGVK)
+	if err := self.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "other-mhc"}, got); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got.GetAnnotations()[pausedAnnotation]; ok {
+		t.Error("another cluster's MachineHealthCheck must not be paused")
+	}
+}
