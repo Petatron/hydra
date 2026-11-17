@@ -26,7 +26,7 @@ Commands, in delivery order (Linear project *Hydra — Reliability & Productizat
 | `hydra bootstrap` / `bootstrap delete` / `bootstrap kubeconfig` | PET-81 | implemented |
 | `hydra cluster create` / `plan` / `status` / `delete` | PET-82 | implemented |
 | `hydra cluster pivot` / `create --self-hosted` | PET-83 | implemented |
-| `hydra cluster delete --self-hosted`, `--finish-split` | PET-87 | implemented (hardware proof pending) |
+| `hydra cluster delete --self-hosted`, `--finish-split` | PET-87 | implemented, proven on hardware |
 
 ## Layout
 

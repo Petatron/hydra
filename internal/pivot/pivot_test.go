@@ -585,6 +585,19 @@ func TestPivotForwardMoveFailureIsResumable(t *testing.T) {
 	}
 }
 
+// A caller that runs the pivot under another command (create --self-hosted)
+// names that command in every rerun hint, never pivot.
+func TestPivotRerunHintNamesTheCaller(t *testing.T) {
+	src := newClient(t, append(clusterObjects("src", true), labelledCRDs()...)...)
+	tgt := newClient(t, labelledCRDs()...)
+	p := pivotFor(t, src, tgt, &recorder{failFwd: true})
+	p.Rerun = "`hydra cluster create --self-hosted`"
+	err := p.Run(context.Background(), time.Second)
+	if err == nil || !strings.Contains(err.Error(), "rerun `hydra cluster create --self-hosted`") || strings.Contains(err.Error(), "rerun pivot") {
+		t.Fatalf("got %v", err)
+	}
+}
+
 // Both kubeconfigs reaching one cluster (pivot run again with the cluster's
 // own kubeconfig as the source) must not look like a split, and must never
 // print a clusterctl move: on one cluster that deletes the only copy.

@@ -149,6 +149,7 @@ used.`,
 					po.clusterKubeconfig = kubeconfigOut
 				}
 				po.configFile = file
+				po.rerun = "`hydra cluster create --self-hosted`"
 				return runSelfHosted(ctx, cmd, cfg, objs, credentials, co, po)
 			}
 			t, err := manager(cmd, mgmt, cfg.Metadata.Name)
