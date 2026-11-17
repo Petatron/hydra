@@ -103,7 +103,9 @@ func ReadLive(ctx context.Context, c client.Client, cfg *config.ClusterConfig) (
 	}
 	l.Exists, l.Terminating = s.Exists, s.Terminating
 	l.Available = s.Available == cluster.ConditionTrue
-	l.Settled = l.Available && s.RolledOut
+	// Settled is decided below, once the machine-based rollout state of the
+	// control plane and every pool is known: the status counters alone can
+	// look finished just after a template changes.
 	if !l.Exists {
 		return l, nil
 	}
@@ -160,7 +162,8 @@ func ReadLive(ctx context.Context, c client.Client, cfg *config.ClusterConfig) (
 		obj := name + "-" + p.Name
 		md, ok := byName[obj]
 		if !ok {
-			// A pool hydra.yaml adds: create makes it, at hydra.yaml's version.
+			// A pool hydra.yaml adds, not created yet.
+			l.Missing = append(l.Missing, p.Name)
 			continue
 		}
 		delete(byName, obj)
@@ -172,6 +175,10 @@ func ReadLive(ctx context.Context, c client.Client, cfg *config.ClusterConfig) (
 		l.Pools = append(l.Pools, Part{Name: p.Name, Version: pv, RolledOut: cluster.UpToDate(md) && machinesAt(md, byDeployment[obj], v)})
 	}
 	l.Strays = slices.Sorted(maps.Keys(byName))
+	l.Settled = l.Available && s.RolledOut && l.ControlPlane.RolledOut && len(l.Missing) == 0
+	for _, p := range l.Pools {
+		l.Settled = l.Settled && p.RolledOut
+	}
 	return l, nil
 }
 
@@ -418,12 +425,16 @@ func (u *Upgrader) Next(ctx context.Context) (Live, Stage, error) {
 	if err != nil {
 		return l, s, err
 	}
-	if s.Kind != Done {
-		if err := u.checkInSync(ctx, l); err != nil {
-			return l, s, err
-		}
+	err = u.checkInSync(ctx, l)
+	var r *Refusal
+	if s.Kind == Done && errors.As(err, &r) {
+		// The upgrade is finished; other edits are create's to apply, once
+		// hydra.yaml says the new version. Say so instead of claiming the
+		// file matches.
+		u.logf("note: %s; apply them with `hydra cluster create` once kubernetesVersion says %s", r.Reason, u.Target)
+		return l, s, nil
 	}
-	return l, s, nil
+	return l, s, err
 }
 
 // Plan prints the next stage and what it would change, without changing
@@ -463,7 +474,7 @@ func (u *Upgrader) Run(ctx context.Context) error {
 	u.logf("%s", SkewRules)
 	start := time.Now()
 	preflighted := false
-	for range 64 {
+	for range maxPasses(len(u.Config.Spec.NodePools)) {
 		_, s, err := u.Next(ctx)
 		if err != nil {
 			return err
@@ -497,6 +508,13 @@ func (u *Upgrader) Run(ctx context.Context) error {
 	}
 	return errors.New("the upgrade made no progress after many stages; inspect the cluster with `hydra cluster status`")
 }
+
+// maxPasses bounds Run's loop for a cluster with pools pools. Each pass
+// applies a stage and waits it out, or waits out one already under way; the
+// control plane and each pool take at most two passes. The bound only stops
+// a bug from looping forever: it grows with the pools, so no real cluster
+// reaches it.
+func maxPasses(pools int) int { return 2*(pools+1) + 2 }
 
 func (u *Upgrader) finish(start time.Time) {
 	u.logf("cluster %s/%s runs %s: control plane and every pool (%s)", u.ns(), u.name(), u.Target, time.Since(start).Round(time.Second))

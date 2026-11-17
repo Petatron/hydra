@@ -66,6 +66,8 @@ type Live struct {
 	ControlPlane Part
 	// Pools are in hydra.yaml's order.
 	Pools []Part
+	// Missing are pools hydra.yaml names that have no MachineDeployment yet.
+	Missing []string
 	// Strays are MachineDeployments labelled for this cluster that hydra.yaml
 	// does not name: an upgrade would leave them behind.
 	Strays []string
@@ -147,28 +149,32 @@ func (l Live) at(v Version) bool {
 	return true
 }
 
-// Decide returns the next stage of upgrading to target, or why not. file is
-// hydra.yaml's kubernetesVersion. It reads nothing but its arguments.
-//
-// The control plane goes first, and only from a settled cluster whose pools
-// all run what it runs; pools follow in hydra.yaml's order, each only once
-// the control plane and the pools before it are rolled out. A rollout already
-// under way at the target is waited for, never re-applied, so a rerun after
-// an interrupt continues where the last run stopped.
-func Decide(l Live, target, file Version) (Stage, error) {
+// checkShape refuses a cluster no upgrade should start from or continue:
+// gone, being deleted, pools missing or stray, or versions that a downgrade
+// or a skew violation would follow from.
+func checkShape(l Live, target Version) error {
 	cp := l.ControlPlane
 	switch {
 	case !l.Exists:
-		return Stage{}, &Refusal{Reason: "the cluster does not exist on this management cluster", Fix: "check --management-kubeconfig; create the cluster with `hydra cluster create`"}
+		return &Refusal{Reason: "the cluster does not exist on this management cluster", Fix: "check --management-kubeconfig; create the cluster with `hydra cluster create`"}
 	case l.Terminating:
-		return Stage{}, &Refusal{Reason: "the cluster is being deleted"}
+		return &Refusal{Reason: "the cluster is being deleted"}
+	case len(l.Missing) > 0:
+		fix := "create them first with `hydra cluster create`, then rerun"
+		if l.ControlPlane.Version != l.Lowest() {
+			fix = "an upgrade is under way: take them out of hydra.yaml, finish the upgrade, then add them back and run `hydra cluster create`"
+		}
+		return &Refusal{
+			Reason: fmt.Sprintf("pools in hydra.yaml have no MachineDeployment yet: %v. The upgrade would report them done without creating them", l.Missing),
+			Fix:    fix,
+		}
 	case len(l.Strays) > 0:
-		return Stage{}, &Refusal{
+		return &Refusal{
 			Reason: fmt.Sprintf("MachineDeployments labelled for this cluster are not pools in hydra.yaml: %v. The upgrade would leave them on the old version", l.Strays),
 			Fix:    "add them back to hydra.yaml, or delete them, then rerun",
 		}
 	case target.Less(cp.Version):
-		return Stage{}, &Refusal{
+		return &Refusal{
 			Reason: fmt.Sprintf("the control plane runs %s, newer than %s: Kubernetes does not support downgrading", cp.Version, target),
 			Fix:    "recovering an older version means restoring etcd from a backup taken before the upgrade",
 		}
@@ -179,7 +185,7 @@ func Decide(l Live, target, file Version) (Stage, error) {
 			if p.Version.Minor-cp.Version.Minor <= 1 {
 				fix = fmt.Sprintf("upgrade to the pool's version instead: `hydra cluster upgrade --to %s`", p.Version)
 			}
-			return Stage{}, &Refusal{
+			return &Refusal{
 				Reason: fmt.Sprintf("pool %s runs %s, newer than %s: Kubernetes does not support downgrading", p.Name, p.Version, target),
 				Fix:    fix,
 			}
@@ -192,13 +198,35 @@ func Decide(l Live, target, file Version) (Stage, error) {
 			if p.Version.Minor-cp.Version.Minor > 1 {
 				fix = fmt.Sprintf("set pool %s back to %s by hand: it is too far ahead to catch up in one step", p.Name, cp.Version)
 			}
-			return Stage{}, &Refusal{
+			return &Refusal{
 				Reason: fmt.Sprintf("pool %s runs %s, newer than the control plane's %s, which the version-skew policy forbids", p.Name, p.Version, cp.Version),
 				Fix:    fix,
 			}
 		}
 	}
+	return nil
+}
+
+// Decide returns the next stage of upgrading to target, or why not. file is
+// hydra.yaml's kubernetesVersion. It reads nothing but its arguments.
+//
+// The control plane goes first, and only from a settled cluster whose pools
+// all run what it runs; pools follow in hydra.yaml's order, each only once
+// the control plane and the pools before it are rolled out. A rollout already
+// under way at the target is waited for, never re-applied, so a rerun after
+// an interrupt continues where the last run stopped.
+func Decide(l Live, target, file Version) (Stage, error) {
+	cp := l.ControlPlane
+	if err := checkShape(l, target); err != nil {
+		return Stage{}, err
+	}
 	if l.at(target) {
+		if !l.Available {
+			return Stage{}, &Refusal{
+				Reason: "every part runs " + target.String() + ", but the cluster is not Available: the upgrade is not done until it is",
+				Fix:    "check `hydra cluster status`, then rerun to confirm",
+			}
+		}
 		// Whatever hydra.yaml says: the run that finished the last pool
 		// started from the old version, and says to set the new one.
 		return Stage{Kind: Done}, nil

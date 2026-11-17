@@ -628,3 +628,69 @@ func TestControlPlaneNotRolledOutWhileAMachineRunsTheOldVersion(t *testing.T) {
 		t.Fatalf("a machine at v1.35.3: want not rolled out, got %+v %v", l.ControlPlane, err)
 	}
 }
+
+// Settled comes from the machines too: a pool whose status looks finished
+// while its Machines run another version keeps the control plane waiting.
+func TestNotSettledWhileAPoolsMachinesLag(t *testing.T) {
+	cfg := loadConfig(t, "v1.35.3")
+	fc := newFakeCluster(t, cfg, "v1.35.3", nil)
+	ctx := context.Background()
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(machineGVK.GroupVersion().WithKind("MachineList"))
+	if err := fc.c.List(ctx, list, client.MatchingLabels{deploymentNameLabel: "c-a"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = unstructured.SetNestedField(list.Items[0].Object, "v1.35.1", "spec", "version")
+	if err := fc.c.Update(ctx, &list.Items[0]); err != nil {
+		t.Fatal(err)
+	}
+	u, out := fc.upgrader(cfg, okRemote)
+	err := u.Run(ctx)
+	if err == nil || !strings.Contains(err.Error(), "not settled") {
+		t.Fatalf("want a not-settled refusal, got %v\n%s", err, out)
+	}
+	if len(fc.applied) != 0 {
+		t.Fatalf("applied %v", fc.applied)
+	}
+}
+
+// A pool hydra.yaml names but the cluster lacks is refused, never reported
+// done.
+func TestMissingPoolIsRefused(t *testing.T) {
+	cfg := loadConfig(t, "v1.36.6")
+	live := loadConfig(t, "v1.36.6")
+	live.Spec.NodePools = live.Spec.NodePools[:1]
+	fc := newFakeCluster(t, live, "v1.36.6", nil)
+	u, out := fc.upgrader(cfg, okRemote)
+	err := u.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "no MachineDeployment yet: [b]") {
+		t.Fatalf("want a missing-pool refusal, got %v\n%s", err, out)
+	}
+}
+
+// A finished upgrade with other hydra.yaml edits says so, instead of
+// implying the file matches.
+func TestDoneNotesOtherEdits(t *testing.T) {
+	cfg := loadConfig(t, "v1.36.6")
+	fc := newFakeCluster(t, cfg, "v1.36.6", nil)
+	edited := loadConfig(t, "v1.36.6")
+	edited.Spec.NodePools[0].Replicas = 5
+	u, out := fc.upgrader(edited, okRemote)
+	if err := u.Run(context.Background()); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if !strings.Contains(out.String(), "note: hydra.yaml differs from the live cluster in more than the version") {
+		t.Errorf("want a note about the other edits:\n%s", out)
+	}
+}
+
+// The stage loop's bound grows with the pools: every part of a cluster with
+// many pools gets its passes (the control plane and each pool may need two:
+// a resumed wait, then their own).
+func TestMaxPassesFollowsThePools(t *testing.T) {
+	for _, n := range []int{0, 2, 63, 64, 500} {
+		if need := 2 * (n + 1); maxPasses(n) < need {
+			t.Errorf("%d pools: bound %d, need at least %d", n, maxPasses(n), need)
+		}
+	}
+}
