@@ -17,7 +17,7 @@ The CLI is a **stateless orchestrator**: every cluster's desired and actual stat
 Kubernetes, never on your machine. There is no local database, cache or inventory, and an
 interrupted command can always be re-run.
 
-> **Status:** early, first release v0.1.0. `validate`, `render`, `bootstrap`,
+> **Status:** early, latest release v0.2.0. `validate`, `render`, `bootstrap`,
 > `cluster create/plan/status/delete`, the self-hosting pivot and self-hosted teardown work today.
 
 ## Install
@@ -26,7 +26,7 @@ Release binaries for Linux and macOS (amd64 and arm64), with SHA256 sums in `che
 the [releases page](https://github.com/Petatron/hydra/releases). For example, on Linux amd64:
 
 ```bash
-v=v0.1.0; os=linux; arch=amd64
+v=v0.2.0; os=linux; arch=amd64
 curl -fsSLO https://github.com/Petatron/hydra/releases/download/$v/hydra-$os-$arch
 curl -fsSLO https://github.com/Petatron/hydra/releases/download/$v/checksums.txt
 grep " hydra-$os-$arch\$" checksums.txt | sha256sum -c -   # macOS: shasum -a 256 -c -
