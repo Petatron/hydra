@@ -22,6 +22,7 @@ import (
 	"github.com/Petatron/hydra/internal/cluster"
 	"github.com/Petatron/hydra/internal/config"
 	"github.com/Petatron/hydra/internal/render"
+	"github.com/Petatron/hydra/internal/upgrade"
 )
 
 // managementTarget says which management cluster the cluster commands act on.
@@ -209,6 +210,11 @@ func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.C
 	if err := m.CheckOwnership(ctx, objs, name, adopt); err != nil {
 		return "", err
 	}
+	if drift, err := upgrade.Drift(ctx, m.C, cfg); err != nil {
+		return "", err
+	} else if len(drift) > 0 {
+		return "", fmt.Errorf("hydra.yaml says kubernetesVersion %s, but %s: create would change the control plane and every pool at once, which the version-skew policy forbids. Upgrade with `hydra cluster upgrade --to %s`, or set kubernetesVersion back to what runs", cfg.Spec.KubernetesVersion, strings.Join(drift, ", "), cfg.Spec.KubernetesVersion)
+	}
 	if err := m.Apply(ctx, objs, name, forceConflicts); err != nil {
 		return "", err
 	}
@@ -276,6 +282,13 @@ anything stored locally.`,
 			orphans, err := t.m.Orphans(contextOf(cmd), objs, cfg.Metadata.Namespace, cfg.Metadata.Name)
 			if err != nil {
 				return err
+			}
+			drift, err := upgrade.Drift(contextOf(cmd), t.m.C, cfg)
+			if err != nil {
+				return err
+			}
+			if len(drift) > 0 {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "! version: hydra.yaml says %s, but %s. create refuses this; `hydra cluster upgrade --to %s --dry-run` shows the ordered upgrade\n", cfg.Spec.KubernetesVersion, strings.Join(drift, ", "), cfg.Spec.KubernetesVersion)
 			}
 			return printPlan(cmd.OutOrStdout(), changes, orphans)
 		},

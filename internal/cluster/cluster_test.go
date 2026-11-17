@@ -355,26 +355,26 @@ func TestUpToDate(t *testing.T) {
 		}
 		return u
 	}
-	if !upToDate(withReady(mk(2, 2, 3, 3, true), 3)) {
+	if !UpToDate(withReady(mk(2, 2, 3, 3, true), 3)) {
 		t.Error("all up to date")
 	}
-	if upToDate(mk(3, 2, 3, 3, true)) {
+	if UpToDate(mk(3, 2, 3, 3, true)) {
 		t.Error("an unobserved generation is still rolling")
 	}
-	if upToDate(mk(2, 2, 3, 1, true)) {
+	if UpToDate(mk(2, 2, 3, 1, true)) {
 		t.Error("replicas not yet up to date")
 	}
-	if upToDate(mk(2, 2, 3, 3, true)) {
+	if UpToDate(mk(2, 2, 3, 3, true)) {
 		t.Error("up to date but not Ready must keep waiting")
 	}
-	if !upToDate(mk(1, 1, 0, 0, false)) {
+	if !UpToDate(mk(1, 1, 0, 0, false)) {
 		t.Error("an autoscaled pool at zero is up to date")
 	}
 	// Scaled down from 2 to 1: the surplus Machine is still being deleted, so
 	// status.replicas is 2 while 2 are Ready and up to date.
 	down := withReady(mk(2, 2, 2, 2, false), 2)
 	_ = unstructured.SetNestedField(down.Object, int64(1), "spec", "replicas")
-	if upToDate(down) {
+	if UpToDate(down) {
 		t.Error("a scale-down is not done while a surplus Machine remains")
 	}
 }
