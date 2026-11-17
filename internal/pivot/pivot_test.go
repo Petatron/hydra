@@ -20,6 +20,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 const ns, name = "ns", "c"
@@ -639,5 +640,30 @@ func TestPivotVerifyNeedsALiveTargetWithCNI(t *testing.T) {
 				t.Fatalf("want %q, got %v", tc.want, err)
 			}
 		})
+	}
+}
+
+// Ctrl-C landing while a verification read is in flight: that read fails
+// with the context's error, and the message must still carry the last state
+// actually observed, not "context canceled".
+func TestPivotInterruptReportsLastObservedState(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	gets := 0
+	inner := newClient(t, append(clusterObjects("tgt", false), labelledCRDs()...)...) // never verifies
+	tgt := interceptor.NewClient(inner.(client.WithWatch), interceptor.Funcs{
+		Get: func(c context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			gets++
+			if gets == 12 { // a later round: interrupt with this read in flight
+				cancel()
+				return c.Err()
+			}
+			return cl.Get(c, key, obj, opts...)
+		},
+	})
+	src := newClient(t, labelledCRDs()...)
+	err := pivotFor(t, src, tgt, &recorder{}).Run(ctx, time.Hour)
+	if err == nil || !strings.Contains(err.Error(), "has not taken its VM over") || strings.Contains(err.Error(), "context canceled") {
+		t.Fatalf("want the last observed state, got %v", err)
 	}
 }

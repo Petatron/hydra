@@ -520,24 +520,34 @@ func (p *Pivot) verify(parent context.Context, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	last := ""
+	// seen is the last state observed while the context was live. A check cut
+	// off by the cancellation or the deadline fails with the context's own
+	// error, which says nothing about the cluster.
+	var seen error
 	for {
 		err := p.verifyOnce(ctx)
 		if err == nil {
 			p.logf("verified: %s manages cluster %s/%s", p.Target.Name, p.Namespace, p.Name)
 			return nil
 		}
-		if msg := err.Error(); msg != last {
-			p.logf("  waiting: %s", msg)
-			last = msg
+		if ctx.Err() == nil {
+			seen = err
+			if msg := err.Error(); msg != last {
+				p.logf("  waiting: %s", msg)
+				last = msg
+			}
 		}
 		select {
 		case <-ctx.Done():
+			if seen == nil {
+				seen = err // nothing observed before the cut-off
+			}
 			// The caller's own cancellation (Ctrl-C) is not a timeout: return
 			// the last state seen and let the caller say it was interrupted.
 			if parent.Err() != nil {
-				return err
+				return seen
 			}
-			return fmt.Errorf("not verified within %s: %w", timeout, err)
+			return fmt.Errorf("not verified within %s: %w", timeout, seen)
 		case <-time.After(p.poll()):
 		}
 	}
