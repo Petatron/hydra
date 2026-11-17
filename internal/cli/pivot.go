@@ -107,6 +107,8 @@ type pivotOptions struct {
 	// finishSplit completes a move interrupted part way, after proving which
 	// copy is the source.
 	finishSplit bool
+	// rerun names the command to run again in messages; empty means pivot.
+	rerun string
 }
 
 // targetKubeconfigFile returns a file holding the target kubeconfig, for
@@ -175,6 +177,7 @@ func runPivot(ctx context.Context, cmd *cobra.Command, src *target, cfg config.M
 		Hooks:       pivotHooks(out, "cluster "+cfg.Name),
 		Out:         out,
 		FinishSplit: o.finishSplit,
+		Rerun:       o.rerun,
 	}
 	if err := p.Run(ctx, o.timeout); errors.Is(err, pivot.ErrAlreadySelfHosted) {
 		_, _ = fmt.Fprintf(out, "cluster %s/%s already manages itself (%s is the cluster itself); nothing to move\n", cfg.Namespace, cfg.Name, src.source)

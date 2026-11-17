@@ -276,9 +276,9 @@ func (p *Pivot) Run(ctx context.Context, verifyTimeout time.Duration) error {
 func (p *Pivot) verifyMoved(ctx context.Context, verifyTimeout time.Duration) error {
 	if err := p.verify(ctx, verifyTimeout); err != nil {
 		if ctx.Err() != nil {
-			return fmt.Errorf("interrupted before %s verified (last seen: %w). The cluster has moved and stays there; rerun pivot to keep verifying", p.Target.Name, err)
+			return fmt.Errorf("interrupted before %s verified (last seen: %w). The cluster has moved and stays there; rerun %s to keep verifying", p.Target.Name, err, p.rerun())
 		}
-		return fmt.Errorf("the cluster moved to %s but did not verify there: %w. It stays on %s, which manages it now; pivot never moves a cluster back automatically, because a VM may already have been taken over and moving it back would strand that machine. Inspect it with `hydra cluster status --management-kubeconfig %s` and rerun pivot to keep verifying. To undo the move by hand, first confirm in the target provider's log that no machine was taken over (\"Took over a machine moved from another management cluster\"), then: %s", p.Target.Name, err, p.Target.Name, p.Target.ref(),
+		return fmt.Errorf("the cluster moved to %s but did not verify there: %w. It stays on %s, which manages it now; pivot never moves a cluster back automatically, because a VM may already have been taken over and moving it back would strand that machine. Inspect it with `hydra cluster status --management-kubeconfig %s` and rerun %s to keep verifying. To undo the move by hand, first confirm in the target provider's log that no machine was taken over (\"Took over a machine moved from another management cluster\"), then: %s", p.Target.Name, err, p.Target.Name, p.Target.ref(), p.rerun(),
 			steps([]Side{p.Source}, fmt.Sprintf("clusterctl move --kubeconfig %s --to-kubeconfig %s --namespace %s", p.Target.ref(), p.Source.ref(), p.Namespace)))
 	}
 	return nil
