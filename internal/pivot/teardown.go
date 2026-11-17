@@ -38,8 +38,8 @@ const (
 type TeardownHooks struct {
 	// EnsureKind brings the bootstrap kind cluster up with the pinned
 	// providers and without hypervisor credentials (they arrive with the
-	// move), and returns it.
-	EnsureKind func(ctx context.Context) (Side, error)
+	// move), and returns it, and whether it had to create it.
+	EnsureKind func(ctx context.Context) (kind Side, created bool, err error)
 	// EnsureProviders and Move are as for Pivot.
 	EnsureProviders func(ctx context.Context, kubeconfig []byte) error
 	Move            func(ctx context.Context, from, to []byte, namespace string, dryRun bool) error
@@ -78,6 +78,8 @@ type Teardown struct {
 	Hooks           TeardownHooks
 	Out             io.Writer
 	Poll            time.Duration
+	// createdKind records that EnsureKind created kind in this run.
+	createdKind bool
 	// steps counts state transitions within one Run, so a step that does
 	// not change anything stops instead of looping.
 	steps int
@@ -156,7 +158,7 @@ func (t *Teardown) Run(ctx context.Context) error {
 	// finished move proves its copy is gone: a move that paused it and then
 	// failed leaves it running, paused, with nothing in kind.
 	if tomb != nil && (self != holdsUnknown || tomb.Data["phase"] == phaseMoved) {
-		return t.cleanup(ctx, tomb.Data["ca"], true)
+		return t.cleanup(ctx, tomb.Data["ca"], tomb.Data["createdKind"] == recordTrue)
 	}
 	if self == holdsUnknown {
 		return fmt.Errorf("%s cannot be reached (%v), and nothing shows a teardown under way: it may have been deleted already, or it may be down and never moved. hydra cannot tell which, so it changes nothing. If the cluster is gone, remove its kubeconfig file yourself", t.Self.Name, selfErr)
@@ -233,11 +235,11 @@ func (t *Teardown) moveToKind(ctx context.Context, tomb *corev1.ConfigMap) error
 			return err
 		}
 	}
-	kind, err := t.Hooks.EnsureKind(ctx)
+	kind, created, err := t.Hooks.EnsureKind(ctx)
 	if err != nil {
 		return err
 	}
-	t.Kind = kind
+	t.Kind, t.createdKind = kind, created
 	if err := t.kindNamespaceClean(ctx); err != nil {
 		return err
 	}
@@ -330,6 +332,11 @@ func (t *Teardown) finishInKind(ctx context.Context, tomb *corev1.ConfigMap) err
 		return fmt.Errorf("the Cluster in the %s carries the %s annotation, which clusterctl does not set: someone paused it on purpose. Remove it yourself, then rerun", t.Kind.Name, pausedAnnotation)
 	}
 	if specPaused, _, _ := unstructured.NestedBool(cl.Object, "spec", "paused"); specPaused && cl.GetDeletionTimestamp() == nil {
+		// spec.paused is also an operator's pause. Only this teardown's
+		// record shows the pause is its own interrupted move's.
+		if tomb == nil {
+			return fmt.Errorf("the Cluster in the %s is paused, and no teardown record shows this teardown paused it: it may be an operator's pause. If it is not, %s, then rerun", t.Kind.Name, unpauseAdvice(cl, t.Kind, t.Namespace, t.Name))
+		}
 		// A move interrupted after it deleted the source copy and before it
 		// resumed this one. The cluster itself is shown not to hold the
 		// Cluster (or the move is recorded as finished), so this is the
@@ -356,7 +363,7 @@ func (t *Teardown) finishInKind(ctx context.Context, tomb *corev1.ConfigMap) err
 	if err := t.Hooks.DeleteCluster(ctx, t.Kind); err != nil {
 		return err
 	}
-	return t.cleanup(ctx, ca, tomb != nil)
+	return t.cleanup(ctx, ca, tomb != nil && tomb.Data["createdKind"] == recordTrue)
 }
 
 // waitTakenOver waits until every HydraMachine in the namespace in kind has
@@ -395,7 +402,7 @@ func (t *Teardown) waitTakenOver(ctx context.Context) error {
 
 // cleanup removes the cluster's kubeconfig file, when it is this cluster's,
 // and the bootstrap kind cluster.
-func (t *Teardown) cleanup(ctx context.Context, caB64 string, tombstoned bool) error {
+func (t *Teardown) cleanup(ctx context.Context, caB64 string, deleteKind bool) error {
 	if t.Self.Kubeconfig != nil && t.Hooks.RemoveKubeconfig != nil {
 		ca, _ := base64.StdEncoding.DecodeString(caB64)
 		switch {
@@ -413,16 +420,21 @@ func (t *Teardown) cleanup(ctx context.Context, caB64 string, tombstoned bool) e
 	if t.Kind.C == nil {
 		return nil
 	}
-	if !tombstoned {
-		t.logf("the %s was not brought up by this teardown; leaving it", t.Kind.Name)
+	if !deleteKind {
+		t.logf("the %s existed before this teardown; leaving it", t.Kind.Name)
 		return nil
 	}
 	return t.Hooks.DeleteKind(ctx)
 }
 
 var (
-	mhcGVK = schema.GroupVersionKind{Group: clusterGVK.Group, Version: capiVersion, Kind: "MachineHealthCheck"}
+	mhcGVK       = schema.GroupVersionKind{Group: clusterGVK.Group, Version: capiVersion, Kind: "MachineHealthCheck"}
+	secretGVK    = schema.GroupVersionKind{Version: "v1", Kind: "Secret"}
+	configMapGVK = schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}
 )
+
+// recordTrue is the record's value for a fact that holds.
+const recordTrue = "true"
 
 func (t *Teardown) tombstone(ctx context.Context) (*corev1.ConfigMap, error) {
 	if t.Kind.C == nil {
@@ -459,6 +471,13 @@ func (t *Teardown) writeTombstone(ctx context.Context, phase string) error {
 	}
 	cm.Data["cluster"] = t.Name
 	cm.Data["phase"] = phase
+	// Whether this teardown created kind, kept once true: a later run finds
+	// kind already there, and only the first run's word counts.
+	if t.createdKind {
+		cm.Data["createdKind"] = recordTrue
+	} else if _, ok := cm.Data["createdKind"]; !ok {
+		cm.Data["createdKind"] = "false"
+	}
 	if t.Self.Kubeconfig != nil {
 		cm.Data["ca"] = base64.StdEncoding.EncodeToString(cluster.KubeconfigCA(t.Self.Kubeconfig))
 	}
@@ -492,6 +511,26 @@ func (t *Teardown) kindNamespaceClean(ctx context.Context) error {
 		}
 		for _, o := range list.Items {
 			found = append(found, gvk.Kind+" "+o.GetName())
+		}
+	}
+	// Secrets and ConfigMaps too: the move carries the credentials Secret
+	// and the CNI ConfigMap, and a stale one would be mixed in.
+	secrets := &corev1.SecretList{}
+	if err := t.Kind.C.List(ctx, secrets, client.InNamespace(t.Namespace)); err != nil {
+		return fmt.Errorf("listing Secrets in the %s: %w", t.Kind.Name, err)
+	}
+	for _, o := range secrets.Items {
+		found = append(found, "Secret "+o.Name)
+	}
+	cms := &corev1.ConfigMapList{}
+	if err := t.Kind.C.List(ctx, cms, client.InNamespace(t.Namespace)); err != nil {
+		return fmt.Errorf("listing ConfigMaps in the %s: %w", t.Kind.Name, err)
+	}
+	for _, o := range cms.Items {
+		// Kubernetes puts kube-root-ca.crt in every namespace; the record is
+		// this teardown's own.
+		if o.Name != "kube-root-ca.crt" && o.Name != TombstoneName {
+			found = append(found, "ConfigMap "+o.Name)
 		}
 	}
 	if len(found) > 0 {

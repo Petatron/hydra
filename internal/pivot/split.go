@@ -142,10 +142,46 @@ func (p *Pivot) finishDeletion(ctx context.Context, plan SplitPlan) error {
 			}
 		}
 	}
+	// The rest of what the move carries, as clusterctl's graph does: the
+	// cluster's Secrets (and any labelled for move, the credentials Secret),
+	// its ConfigMaps (the CNI one) and MachineHealthChecks.
+	if err := p.deleteLeftoverExtras(ctx, plan.Source); err != nil {
+		return err
+	}
 	if specPaused, _, _ := unstructured.NestedBool(tcl.Object, "spec", "paused"); specPaused {
 		patch := client.RawPatch(types.MergePatchType, []byte(`{"spec":{"paused":false}}`))
 		if err := plan.Target.C.Patch(ctx, tcl, patch); err != nil {
 			return fmt.Errorf("resuming the Cluster on %s: %w", plan.Target.Name, err)
+		}
+	}
+	return nil
+}
+
+// deleteLeftoverExtras removes from the source the objects the move carries
+// beyond movableKinds: this cluster's Secrets and ConfigMaps (by its labels or
+// an owner reference to its Cluster), Secrets labelled for move, and
+// MachineHealthChecks.
+func (p *Pivot) deleteLeftoverExtras(ctx context.Context, source Side) error {
+	for _, kind := range []schema.GroupVersionKind{
+		secretGVK, configMapGVK, mhcGVK,
+	} {
+		list := &unstructured.UnstructuredList{}
+		list.SetGroupVersionKind(kind.GroupVersion().WithKind(kind.Kind + "List"))
+		if err := source.C.List(ctx, list, client.InNamespace(p.Namespace)); err != nil {
+			if meta.IsNoMatchError(err) {
+				continue
+			}
+			return fmt.Errorf("listing %s on the %s: %w", kind.Kind, source.Name, err)
+		}
+		for i := range list.Items {
+			o := &list.Items[i]
+			_, moveLabelled := o.GetLabels()[moveLabel]
+			if o.GetName() == TombstoneName || (!p.belongs(o) && (kind != secretGVK || !moveLabelled)) {
+				continue
+			}
+			if err := deleteForMove(ctx, source.C, o); err != nil {
+				return fmt.Errorf("removing %s %s from the %s: %w", kind.Kind, o.GetName(), source.Name, err)
+			}
 		}
 	}
 	return nil

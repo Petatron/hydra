@@ -482,7 +482,7 @@ func (p *Pivot) preflight(ctx context.Context) error {
 		// reads these keys, and once the bootstrap cluster is gone nothing
 		// else can reach the VMs.
 		sec := &unstructured.Unstructured{}
-		sec.SetGroupVersionKind(schema.GroupVersionKind{Version: "v1", Kind: "Secret"})
+		sec.SetGroupVersionKind(secretGVK)
 		if err := src.CheckCredentials(ctx, p.Namespace, secret); err != nil {
 			problems = append(problems, err.Error())
 		} else if err := p.Source.C.Get(ctx, client.ObjectKey{Namespace: p.Namespace, Name: secret}, sec); err != nil {

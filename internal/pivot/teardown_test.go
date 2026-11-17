@@ -11,6 +11,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -36,6 +37,7 @@ type tdRecorder struct {
 	takeOver                    bool
 	failAfterCreate             bool
 	failAfterDeleting           int
+	kindExisted                 bool // the bootstrap cluster was there before
 }
 
 // teardownFor wires a Teardown from self (the cluster, reached with
@@ -53,7 +55,7 @@ func teardownFor(t *testing.T, self, kind client.Client, rec *tdRecorder) *Teard
 		Poll:            time.Millisecond,
 		Out:             &bytes.Buffer{},
 		Hooks: TeardownHooks{
-			EnsureKind:      func(context.Context) (Side, error) { return kindSide, nil },
+			EnsureKind:      func(context.Context) (Side, bool, error) { return kindSide, !rec.kindExisted, nil },
 			EnsureProviders: func(context.Context, []byte) error { return nil },
 			Move: func(ctx context.Context, from, to []byte, _ string, dryRun bool) error {
 				if dryRun {
@@ -208,6 +210,7 @@ func TestTeardownFinishesCleanupFromTheRecord(t *testing.T) {
 	rec := &tdRecorder{}
 	td := teardownFor(t, nil, kind, rec)
 	td.Self.C, td.SelfErr = nil, errors.New("no such host") // the cluster is gone
+	td.createdKind = true                                   // the interrupted run had created kind
 	if err := td.writeTombstone(context.Background(), phaseMoved); err != nil {
 		t.Fatal(err)
 	}
@@ -495,5 +498,103 @@ func TestTeardownRefusesAStaleHealthCheckInKind(t *testing.T) {
 	err := teardownFor(t, self, kind, rec).Run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "MachineHealthCheck old-mhc") || len(rec.moves) != 0 {
 		t.Fatalf("got %v, moves %v", err, rec.moves)
+	}
+}
+
+// A bootstrap kind cluster that existed before the teardown is not the
+// teardown's to delete.
+func TestTeardownLeavesAPreexistingKind(t *testing.T) {
+	rec := &tdRecorder{takeOver: true, kindExisted: true}
+	if err := teardownFor(t, newClient(t, selfObjects(t)...), newClient(t, labelledCRDs()...), rec).Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !rec.deletedCluster || rec.deletedKind {
+		t.Errorf("the cluster goes, a kind that was already there stays: %+v", rec)
+	}
+}
+
+// A run that created kind and was interrupted: a later run finds kind
+// already there, and still removes it, from the record.
+func TestTeardownRemembersItCreatedKind(t *testing.T) {
+	self := newClient(t, selfObjects(t)...)
+	kind := newClient(t, labelledCRDs()...)
+	first := teardownFor(t, self, kind, &tdRecorder{takeOver: true})
+	first.Hooks.DeleteCluster = func(context.Context, Side) error { return errors.New("interrupted") }
+	if err := first.Run(context.Background()); err == nil {
+		t.Fatal("the first run must stop at the delete")
+	}
+	rec := &tdRecorder{takeOver: true, kindExisted: true} // kind is there now
+	if err := teardownFor(t, self, kind, rec).Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !rec.deletedKind {
+		t.Error("kind this teardown created must be removed, whichever run finishes")
+	}
+}
+
+// Without a teardown record, a paused kind copy may be an operator's pause:
+// refused, never resumed.
+func TestTeardownWithoutRecordLeavesAPausedCopy(t *testing.T) {
+	kindObjs := selfObjects(t)
+	_ = unstructured.SetNestedField(kindObjs[0].(*unstructured.Unstructured).Object, true, "spec", "paused")
+	kind := newClient(t, kindObjs...)
+	self := newClient(t, labelledCRDs()...) // the cluster itself, holding nothing
+	rec := &tdRecorder{takeOver: true}
+	err := teardownFor(t, self, kind, rec).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "operator's pause") || rec.deletedCluster {
+		t.Fatalf("got %v, rec %+v", err, rec)
+	}
+	cl := &unstructured.Unstructured{}
+	cl.SetGroupVersionKind(clusterGVK)
+	if err := kind.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: name}, cl); err != nil {
+		t.Fatal(err)
+	}
+	if !paused(cl) {
+		t.Error("the copy must stay paused")
+	}
+}
+
+// Kind's namespace must hold no stale Secret or ConfigMap either, except
+// what Kubernetes puts in every namespace.
+func TestTeardownStaleSecretsAndConfigMaps(t *testing.T) {
+	stale := u(secGVK, ns, "old-pki", nil)
+	rec := &tdRecorder{takeOver: true}
+	err := teardownFor(t, newClient(t, selfObjects(t)...), newClient(t, append(labelledCRDs(), stale)...), rec).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "Secret old-pki") {
+		t.Fatalf("got %v", err)
+	}
+	rootCA := u(configMapGVK, ns, "kube-root-ca.crt", nil)
+	rec = &tdRecorder{takeOver: true}
+	if err := teardownFor(t, newClient(t, selfObjects(t)...), newClient(t, append(labelledCRDs(), rootCA)...), rec).Run(context.Background()); err != nil {
+		t.Fatalf("kube-root-ca.crt is in every namespace and must not count: %v", err)
+	}
+}
+
+// Finishing a split interrupted while deleting removes every leftover the
+// move would have carried: the cluster's Secrets (credentials included),
+// ConfigMaps and MachineHealthChecks too.
+func TestFinishDeletionRemovesTheWholeGraph(t *testing.T) {
+	ctx := context.Background()
+	mhc := u(mhcGVK, ns, name+"-mhc", nil)
+	mhc.SetLabels(map[string]string{clusterNameLabel: name})
+	cm := u(configMapGVK, ns, name+"-cilium", nil)
+	cm.SetLabels(map[string]string{"hydra.io/cluster": name})
+	src := newClient(t, append(append(clusterObjects("src", true), mhc, cm), labelledCRDs()...)...)
+	tgt := newClient(t, labelledCRDs()...)
+	if err := pivotFor(t, src, tgt, &recorder{failAfterDeleting: deletionsLeavingClusterAndKCP}).Run(ctx, time.Second); err == nil {
+		t.Fatal("the interrupted move must fail")
+	}
+	p := pivotFor(t, src, tgt, &recorder{})
+	p.FinishSplit = true
+	_ = p.Run(ctx, 20*time.Millisecond)
+	for _, k := range []struct {
+		gvk schema.GroupVersionKind
+		n   string
+	}{{mhcGVK, name + "-mhc"}, {configMapGVK, name + "-cilium"}, {secGVK, "c-pki"}} {
+		o := &unstructured.Unstructured{}
+		o.SetGroupVersionKind(k.gvk)
+		if err := src.Get(ctx, client.ObjectKey{Namespace: ns, Name: k.n}, o); err == nil {
+			t.Errorf("%s %s must be removed from the source", k.gvk.Kind, k.n)
+		}
 	}
 }

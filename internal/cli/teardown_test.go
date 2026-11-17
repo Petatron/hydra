@@ -52,3 +52,16 @@ func TestTeardownNothingLocal(t *testing.T) {
 		})
 	}
 }
+
+// Hydra chose the endpoint (a managed network): with nothing local there is
+// nothing to probe, so nothing proves the cluster is gone.
+func TestTeardownNothingLocalWithoutAnEndpointRefuses(t *testing.T) {
+	withFakeKind(t, &fakeKind{})
+	cmd := &cobra.Command{}
+	cmd.SetErr(&bytes.Buffer{})
+	o := teardownOptions{clusterKubeconfig: filepath.Join(t.TempDir(), "missing.kubeconfig")}
+	err := runTeardown(context.Background(), cmd, selfHostedConfig(""), o)
+	if err == nil || !strings.Contains(err.Error(), "no endpoint to check") {
+		t.Fatalf("got %v", err)
+	}
+}

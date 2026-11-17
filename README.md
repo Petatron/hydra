@@ -30,11 +30,12 @@ v=v0.1.0; os=linux; arch=amd64
 curl -fsSLO https://github.com/Petatron/hydra/releases/download/$v/hydra-$os-$arch
 curl -fsSLO https://github.com/Petatron/hydra/releases/download/$v/checksums.txt
 grep " hydra-$os-$arch\$" checksums.txt | sha256sum -c -   # macOS: shasum -a 256 -c -
-install -m 0755 hydra-$os-$arch ~/.local/bin/hydra && hydra version
+mkdir -p ~/.local/bin && install -m 0755 hydra-$os-$arch ~/.local/bin/hydra
+~/.local/bin/hydra version   # add ~/.local/bin to PATH to call it as plain `hydra`
 ```
 
-For an unreleased commit, `go install github.com/Petatron/hydra/cmd/hydra@latest`, or `make build`
-in a checkout (the binary lands in `bin/hydra`).
+For the latest commit on main, `go install github.com/Petatron/hydra/cmd/hydra@main`. For your own
+checkout, `go install ./cmd/hydra`, or `make build` (the binary lands in `bin/hydra`).
 
 ## Quickstart: a self-hosted cluster and back
 

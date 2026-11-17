@@ -84,15 +84,19 @@ func runTeardown(ctx context.Context, cmd *cobra.Command, cfg *config.ClusterCon
 	// Nothing local at all: say so only if the cluster's endpoint is silent,
 	// never while something answers there.
 	if self.Kubeconfig == nil && !kindExists {
-		if ep := cfg.Spec.Network.ControlPlaneEndpoint; ep != "" {
-			answers, err := endpointAnswers(ep)
-			switch {
-			case answers:
-				return fmt.Errorf("no kubeconfig at %s and no %s, but something answers on %s, this cluster's endpoint: it may still run. Pass --cluster-kubeconfig with its kubeconfig", path, kindName, ep)
-			case err != nil:
-				// A dial error is not evidence the endpoint is empty.
-				return fmt.Errorf("no kubeconfig at %s and no %s, and this machine cannot reach %s (%v) to show the cluster is gone. If it still runs, pass --cluster-kubeconfig; if you know it is gone, there is nothing to tear down", path, kindName, ep, err)
-			}
+		ep := cfg.Spec.Network.ControlPlaneEndpoint
+		if ep == "" {
+			// Hydra chose the endpoint (a managed network): nothing here can
+			// show whether the cluster still runs.
+			return fmt.Errorf("no kubeconfig at %s and no %s, and hydra.yaml states no endpoint to check (Hydra chose it): nothing here shows whether cluster %s is gone. Pass --cluster-kubeconfig with its kubeconfig", path, kindName, md.Name)
+		}
+		answers, err := endpointAnswers(ep)
+		switch {
+		case answers:
+			return fmt.Errorf("no kubeconfig at %s and no %s, but something answers on %s, this cluster's endpoint: it may still run. Pass --cluster-kubeconfig with its kubeconfig", path, kindName, ep)
+		case err != nil:
+			// A dial error is not evidence the endpoint is empty.
+			return fmt.Errorf("no kubeconfig at %s and no %s, and this machine cannot reach %s (%v) to show the cluster is gone. If it still runs, pass --cluster-kubeconfig; if you know it is gone, there is nothing to tear down", path, kindName, ep, err)
 		}
 		_, _ = fmt.Fprintf(out, "found nothing to tear down for cluster %s/%s here: no kubeconfig at %s, no %s\n", md.Namespace, md.Name, path, kindName)
 		return nil
@@ -110,11 +114,16 @@ func runTeardown(ctx context.Context, cmd *cobra.Command, cfg *config.ClusterCon
 		TakeoverTimeout: o.takeoverTimeout,
 		Out:             out,
 		Hooks: pivot.TeardownHooks{
-			EnsureKind: func(ctx context.Context) (pivot.Side, error) {
-				if err := b.Create(ctx, cfg, bootstrap.Options{NoCredentials: true}); err != nil {
-					return pivot.Side{}, err
+			EnsureKind: func(ctx context.Context) (pivot.Side, bool, error) {
+				existed, err := b.Kind.Exists(kindName)
+				if err != nil {
+					return pivot.Side{}, false, fmt.Errorf("looking for %s: %w", kindName, err)
 				}
-				return connectKind()
+				if err := b.Create(ctx, cfg, bootstrap.Options{NoCredentials: true}); err != nil {
+					return pivot.Side{}, false, err
+				}
+				k, err := connectKind()
+				return k, !existed, err
 			},
 			EnsureProviders: pivotHooks(out, kindName).EnsureProviders,
 			Move:            bootstrap.MoveNamespace,
