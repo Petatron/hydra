@@ -14,6 +14,9 @@ import (
 	"github.com/Petatron/hydra/internal/render"
 )
 
+// deleteVerb is the delete subcommand of both cluster and bootstrap.
+const deleteVerb = "delete"
+
 // Version is set at build time with -ldflags "-X github.com/Petatron/hydra/internal/cli.Version=...".
 var Version = "dev"
 

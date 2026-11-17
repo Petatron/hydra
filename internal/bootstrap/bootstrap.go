@@ -156,6 +156,11 @@ type Options struct {
 	// credentials Secret (created or replaced). When nil the Secret must
 	// already exist in the management cluster.
 	Credentials *Credentials
+	// NoCredentials brings the cluster up without the credentials Secret:
+	// neither required nor written. Only for a cluster about to receive the
+	// Secret through clusterctl move (tearing down a self-hosted cluster).
+	// It cannot be combined with Credentials.
+	NoCredentials bool
 }
 
 // ErrNoHypervisor is returned for a config that names no hypervisor.
@@ -168,6 +173,9 @@ func (b *Bootstrapper) Create(ctx context.Context, c *config.ClusterConfig, opts
 		return ErrNoHypervisor
 	}
 	name := KindName(c.Metadata.Name)
+	if opts.NoCredentials && opts.Credentials != nil {
+		return errors.New("bootstrap: credentials were given for a bootstrap told to take none")
+	}
 
 	exists, err := b.Kind.Exists(name)
 	if err != nil {
@@ -178,7 +186,7 @@ func (b *Bootstrapper) Create(ctx context.Context, c *config.ClusterConfig, opts
 	} else {
 		// A new cluster cannot already hold the Secret: fail before minutes of
 		// installing, not after.
-		if opts.Credentials == nil {
+		if opts.Credentials == nil && !opts.NoCredentials {
 			return fmt.Errorf("the first bootstrap needs --hypervisor-credentials <dir> holding %s, %s and %s for Secret %s/%s",
 				CACertFile, ClientCertFile, ClientKeyFile, c.Metadata.Namespace, h.CredentialsSecretName)
 		}
@@ -196,7 +204,9 @@ func (b *Bootstrapper) Create(ctx context.Context, c *config.ClusterConfig, opts
 	if err := b.ensureProviders(ctx, cl, "bootstrap cluster "+KindName(c.Metadata.Name), "delete the bootstrap cluster with hydra bootstrap delete, or use a hydra release that pins them"); err != nil {
 		return err
 	}
-	if err := b.ensureCredentials(ctx, cl, c, opts); err != nil {
+	if opts.NoCredentials {
+		b.logf("credentials Secret %s/%s not written: it arrives with the move", c.Metadata.Namespace, h.CredentialsSecretName)
+	} else if err := b.ensureCredentials(ctx, cl, c, opts); err != nil {
 		return err
 	}
 	b.logf("bootstrap cluster %s is ready", name)

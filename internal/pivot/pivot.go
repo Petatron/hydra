@@ -100,6 +100,15 @@ type Pivot struct {
 	Namespace      string
 	Name           string
 	Hooks          Hooks
+	// FinishSplit lets Run complete a move interrupted part way (a split),
+	// after proving from the takeover evidence that the Source holds the
+	// source copy. Without it, a split is only reported.
+	FinishSplit bool
+	// Rerun names the command to run again in messages; default "pivot".
+	Rerun string
+	// allowUnsettled skips preflight's Available-and-rolled-out check: set
+	// by Teardown, which must be able to remove a degraded cluster.
+	allowUnsettled bool
 	// credentialsSecret is read from the live HydraCluster by preflight.
 	credentialsSecret string
 	Out               io.Writer
@@ -108,6 +117,13 @@ type Pivot struct {
 
 func (p *Pivot) logf(format string, args ...any) {
 	_, _ = fmt.Fprintf(p.Out, format+"\n", args...)
+}
+
+func (p *Pivot) rerun() string {
+	if p.Rerun != "" {
+		return p.Rerun
+	}
+	return "pivot"
 }
 
 func (p *Pivot) poll() time.Duration {
@@ -208,10 +224,25 @@ func (p *Pivot) Run(ctx context.Context, verifyTimeout time.Duration) error {
 	case Nowhere:
 		return fmt.Errorf("the Cluster %s/%s exists on neither management cluster", p.Namespace, p.Name)
 	case Split:
-		return fmt.Errorf("%w. Do not delete either copy. clusterctl paused the source copy and has not finished creating the target. To finish the move, unpause the source copy and run the move again with clusterctl itself, which updates the objects already on the target: %s. Then rerun this command to verify", ErrSplit,
-			steps([]Side{p.Source, p.Target},
-				unpauseCommand(p.Source.ref(), p.Namespace, p.Name),
-				fmt.Sprintf("clusterctl move --kubeconfig %s --to-kubeconfig %s --namespace %s", p.Source.ref(), p.Target.ref(), p.Namespace)))
+		plan, cerr := ClassifySplit(ctx, p.Source, p.Target, p.Namespace)
+		if cerr == nil && plan.Source.Name != p.Source.Name {
+			return fmt.Errorf("%w. The evidence says the source copy is on %s, but this command moves from the %s: the split was left by a move the other way. Finish it with that command's --finish-split, never this one", ErrSplit, plan.Source.Name, p.Source.Name)
+		}
+		if !p.FinishSplit {
+			return fmt.Errorf("%w. Do not delete either copy. %s", ErrSplit, splitAdvice(plan, cerr, p.rerun(), manualFinish(p.Source, p.Target, p.Namespace, p.Name)))
+		}
+		if cerr != nil {
+			return cerr
+		}
+		if plan.Deleting {
+			err = p.finishDeletion(ctx, plan)
+		} else {
+			err = p.finishSplit(ctx, p.Source, p.Target)
+		}
+		if err != nil {
+			return err
+		}
+		return p.verifyMoved(ctx, verifyTimeout)
 	case OnTarget:
 		cl, err := p.getCluster(ctx, p.Target.C)
 		if err != nil {
@@ -237,6 +268,12 @@ func (p *Pivot) Run(ctx context.Context, verifyTimeout time.Duration) error {
 	if err := p.move(ctx); err != nil {
 		return err
 	}
+	return p.verifyMoved(ctx, verifyTimeout)
+}
+
+// verifyMoved verifies after this run moved the cluster, and explains what
+// a failure leaves where.
+func (p *Pivot) verifyMoved(ctx context.Context, verifyTimeout time.Duration) error {
 	if err := p.verify(ctx, verifyTimeout); err != nil {
 		if ctx.Err() != nil {
 			return fmt.Errorf("interrupted before %s verified (last seen: %w). The cluster has moved and stays there; rerun pivot to keep verifying", p.Target.Name, err)
@@ -398,9 +435,9 @@ func (p *Pivot) preflight(ctx context.Context) error {
 		return err
 	}
 	if why := pauseReason(cl); why != "" {
-		return fmt.Errorf("the Cluster %s/%s is paused on the %s (%s), and clusterctl refuses to move a paused cluster. An earlier move that failed before reaching the target can leave it so. If no move is in progress and no one paused it on purpose, %s, then rerun pivot", p.Namespace, p.Name, p.Source.Name, why, unpauseAdvice(cl, p.Source, p.Namespace, p.Name))
+		return fmt.Errorf("the Cluster %s/%s is paused on the %s (%s), and clusterctl refuses to move a paused cluster. An earlier move that failed before reaching the target can leave it so. If no move is in progress and no one paused it on purpose, %s, then rerun %s", p.Namespace, p.Name, p.Source.Name, why, unpauseAdvice(cl, p.Source, p.Namespace, p.Name), p.rerun())
 	}
-	if st.Available != cluster.ConditionTrue || !st.RolledOut {
+	if !p.allowUnsettled && (st.Available != cluster.ConditionTrue || !st.RolledOut) {
 		return fmt.Errorf("the Cluster %s/%s is not settled (%s); move only an Available cluster with no rollout in progress. If it was just created, moved or scaled, wait for Cluster API to settle it, then rerun", p.Namespace, p.Name, st.Line())
 	}
 
@@ -445,7 +482,7 @@ func (p *Pivot) preflight(ctx context.Context) error {
 		// reads these keys, and once the bootstrap cluster is gone nothing
 		// else can reach the VMs.
 		sec := &unstructured.Unstructured{}
-		sec.SetGroupVersionKind(schema.GroupVersionKind{Version: "v1", Kind: "Secret"})
+		sec.SetGroupVersionKind(secretGVK)
 		if err := src.CheckCredentials(ctx, p.Namespace, secret); err != nil {
 			problems = append(problems, err.Error())
 		} else if err := p.Source.C.Get(ctx, client.ObjectKey{Namespace: p.Namespace, Name: secret}, sec); err != nil {
@@ -507,7 +544,7 @@ func crdsLabelled(ctx context.Context, c client.Client) error {
 func (p *Pivot) move(ctx context.Context) error {
 	p.logf("moving namespace %s from the %s to %s", p.Namespace, p.Source.Name, p.Target.Name)
 	if err := p.Hooks.Move(ctx, p.Source.Kubeconfig, p.Target.Kubeconfig, p.Namespace, false); err != nil {
-		return fmt.Errorf("clusterctl move: %w (rerun pivot: it finds where the objects are and continues)", err)
+		return fmt.Errorf("clusterctl move: %w (rerun %s: it finds where the objects are and continues)", err, p.rerun())
 	}
 	return nil
 }

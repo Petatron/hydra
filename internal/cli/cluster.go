@@ -359,10 +359,11 @@ var confirmIn io.Reader = os.Stdin
 
 func newDeleteCommand() *cobra.Command {
 	var file, mgmt string
-	var yes, adopt bool
+	var yes, adopt, selfHosted bool
 	var timeout time.Duration
+	var to teardownOptions
 	c := &cobra.Command{
-		Use:   "delete",
+		Use:   deleteVerb,
 		Short: "Delete the cluster: its machines, their VMs and disks",
 		Long: `delete deletes the Cluster object and waits while Cluster API and the Hydra
 provider tear down its machines, VMs and disks; a network Hydra created for it
@@ -373,9 +374,32 @@ This cannot be undone. It shows which management cluster it will act on, then
 asks for the cluster's name unless --yes is given, and refuses without --yes
 when there is no terminal to ask on. It refuses outright to delete a cluster
 from itself (a self-hosted management cluster). Only metadata.name and
-metadata.namespace are read from hydra.yaml.`,
+metadata.namespace are read from hydra.yaml.
+
+With --self-hosted it tears down a cluster that manages itself instead: it
+brings up the cluster's bootstrap kind cluster (no hypervisor credentials
+needed: they come back with the move), moves the cluster into it, waits until
+kind's provider has taken every VM over, deletes the cluster from there, then
+removes the cluster's kubeconfig file and kind. Before moving it proves the
+kubeconfig is the cluster itself and that the cluster is this CLI's to delete.
+It leaves a record in kind, so an interrupted teardown is finished by running
+the same command again; a move interrupted part way is reported, and finished
+with --finish-split.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if selfHosted {
+				if mgmt != "" {
+					return fmt.Errorf("--self-hosted reaches the cluster with its own kubeconfig (--cluster-kubeconfig); it cannot be combined with --management-kubeconfig")
+				}
+				cfg, err := config.Load(file)
+				if err != nil {
+					return err
+				}
+				ctx, stop := interruptible(cmd)
+				defer stop()
+				to.yes, to.adopt, to.timeout, to.configFile = yes, adopt, timeout, file
+				return runTeardown(ctx, cmd, cfg, to)
+			}
 			md, err := config.LoadMetadata(file)
 			if err != nil {
 				return err
@@ -417,7 +441,7 @@ metadata.namespace are read from hydra.yaml.`,
 				return fmt.Errorf("cannot tell whether %s manages itself, so not deleting: %w", md.Name, err)
 			}
 			if self {
-				return fmt.Errorf("refusing to delete cluster %s/%s on itself: %s. Its controllers run on the machines being deleted, so the teardown would stop half way. Move it to another management cluster first (clusterctl move), then delete it from there", md.Namespace, md.Name, why)
+				return fmt.Errorf("refusing to delete cluster %s/%s on itself: %s. Its controllers run on the machines being deleted, so the teardown would stop half way. Use `hydra cluster delete --self-hosted`, which moves it into a bootstrap cluster and deletes it from there", md.Namespace, md.Name, why)
 			}
 			if !yes {
 				if err := confirm(cmd, md, t.source); err != nil {
@@ -432,6 +456,10 @@ metadata.namespace are read from hydra.yaml.`,
 	c.Flags().BoolVar(&yes, "yes", false, "do not ask for confirmation")
 	c.Flags().BoolVar(&adopt, "adopt", false, "delete a Cluster hydra did not make (unlabelled); one labelled for another cluster is always refused")
 	c.Flags().DurationVar(&timeout, "timeout", 20*time.Minute, "how long to wait for the teardown")
+	c.Flags().BoolVar(&selfHosted, "self-hosted", false, "tear down a cluster that manages itself: move it into its bootstrap kind cluster, delete it there, remove kind")
+	c.Flags().StringVar(&to.clusterKubeconfig, "cluster-kubeconfig", "", "with --self-hosted: the cluster's own kubeconfig (default ./<name>.kubeconfig)")
+	c.Flags().BoolVar(&to.finishSplit, "finish-split", false, "with --self-hosted: finish a move interrupted part way, after proving which copy is the source")
+	c.Flags().DurationVar(&to.takeoverTimeout, "takeover-timeout", 10*time.Minute, "with --self-hosted: how long to wait for the bootstrap cluster to take every VM over before deleting")
 	return c
 }
 
