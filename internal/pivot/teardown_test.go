@@ -105,8 +105,8 @@ func TestTeardownEndToEnd(t *testing.T) {
 	if strings.Join(rec.moves, ",") != "dry,move" || !rec.deletedCluster || !rec.removedFile || !rec.deletedKind {
 		t.Fatalf("moves %v deletedCluster %v removedFile %v deletedKind %v", rec.moves, rec.deletedCluster, rec.removedFile, rec.deletedKind)
 	}
-	if tb := tombstoneIn(t, kind); tb == nil || tb.Data["phase"] != phaseMoved {
-		t.Errorf("the teardown record must say the move finished, got %+v", tb)
+	if tb := tombstoneIn(t, kind); tb == nil || tb.Data["phase"] != phaseDeleted {
+		t.Errorf("the teardown record must say the cluster was deleted, got %+v", tb)
 	}
 }
 
@@ -596,5 +596,86 @@ func TestFinishDeletionRemovesTheWholeGraph(t *testing.T) {
 		if err := src.Get(ctx, client.ObjectKey{Namespace: ns, Name: k.n}, o); err == nil {
 			t.Errorf("%s %s must be removed from the source", k.gvk.Kind, k.n)
 		}
+	}
+}
+
+// No record outlives a finished teardown: with kind kept, its record is
+// removed, so it cannot stand in for proof for a later cluster of the name.
+func TestTeardownConsumesItsRecordWhenKindStays(t *testing.T) {
+	kind := newClient(t, labelledCRDs()...)
+	rec := &tdRecorder{takeOver: true, kindExisted: true}
+	if err := teardownFor(t, newClient(t, selfObjects(t)...), kind, rec).Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if rec.deletedKind {
+		t.Fatal("a kind that was there before stays")
+	}
+	if tombstoneIn(t, kind) != nil {
+		t.Error("the record must be removed from a kind that stays")
+	}
+}
+
+// A pause found after the move was recorded as finished is someone's, not
+// the move's: refused, not resumed.
+func TestTeardownLeavesAPauseAfterAFinishedMove(t *testing.T) {
+	kindObjs := selfObjects(t)
+	_ = unstructured.SetNestedField(kindObjs[0].(*unstructured.Unstructured).Object, true, "spec", "paused")
+	kind := newClient(t, kindObjs...)
+	td := teardownFor(t, newClient(t, labelledCRDs()...), kind, &tdRecorder{})
+	if err := td.writeTombstone(context.Background(), phaseMoved); err != nil {
+		t.Fatal(err)
+	}
+	rec := &tdRecorder{takeOver: true}
+	err := teardownFor(t, newClient(t, labelledCRDs()...), kind, rec).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "operator's pause") || rec.deletedCluster {
+		t.Fatalf("got %v, rec %+v", err, rec)
+	}
+}
+
+// A record with an unknown phase, or without a valid CA, is no evidence.
+func TestTeardownRefusesAMalformedRecord(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		data map[string]string
+		want string
+	}{
+		{"unknown phase", map[string]string{"cluster": name, "phase": "done", "ca": "Y2EtYw=="}, "unknown phase"},
+		{"no CA", map[string]string{"cluster": name, "phase": phaseMoved}, "no valid certificate authority"},
+		{"CA not base64", map[string]string{"cluster": name, "phase": phaseMoved, "ca": "%%%"}, "no valid certificate authority"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cm := &corev1.ConfigMap{}
+			cm.Namespace, cm.Name, cm.Data = ns, TombstoneName, tc.data
+			kind := newClient(t, append(labelledCRDs(), cm)...)
+			rec := &tdRecorder{}
+			td := teardownFor(t, nil, kind, rec)
+			td.Self.C, td.SelfErr = nil, errors.New("gone")
+			err := td.Run(context.Background())
+			if err == nil || !strings.Contains(err.Error(), tc.want) || rec.deletedKind || rec.removedFile {
+				t.Fatalf("got %v, rec %+v", err, rec)
+			}
+		})
+	}
+}
+
+// The record (and that this teardown created kind) is written before checks
+// that can fail: a rerun after a failed check still removes the kind it made.
+func TestTeardownRecordsKindCreationBeforeChecks(t *testing.T) {
+	self := newClient(t, selfObjects(t)...)
+	kind := newClient(t, append(labelledCRDs(), u(secGVK, ns, "stale", nil))...)
+	if err := teardownFor(t, self, kind, &tdRecorder{takeOver: true}).Run(context.Background()); err == nil {
+		t.Fatal("a stale kind namespace must be refused")
+	}
+	if tb := tombstoneIn(t, kind); tb == nil || tb.Data["createdKind"] != recordTrue {
+		t.Fatalf("the record must say this run created kind: %+v", tb)
+	}
+	// The operator clears the stale object; the rerun finds kind already there.
+	_ = kind.Delete(context.Background(), u(secGVK, ns, "stale", nil))
+	rec := &tdRecorder{takeOver: true, kindExisted: true}
+	if err := teardownFor(t, self, kind, rec).Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !rec.deletedKind {
+		t.Error("the kind this teardown created must still be removed")
 	}
 }
