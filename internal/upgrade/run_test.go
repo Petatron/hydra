@@ -461,7 +461,7 @@ func TestPreflightRefusals(t *testing.T) {
 		edit   func(*config.ClusterConfig)
 		refuse string
 	}{
-		{name: "no packages", remote: fakeRemote{packages: false, tags: []string{"v1.36.0"}}, refuse: "pkgs.k8s.io has no kubelet"},
+		{name: "no packages", remote: fakeRemote{packages: false, tags: []string{"v1.36.0"}}, refuse: "pkgs.k8s.io lacks kubelet, kubeadm or kubectl"},
 		{name: "no autoscaler release", remote: fakeRemote{packages: true}, refuse: "no Cluster Autoscaler release"},
 		{name: "unreachable", remote: fakeRemote{err: errors.New("dial tcp: no route")}, refuse: "--skip-remote-checks"},
 		{name: "prebaked", remote: okRemote, edit: func(c *config.ClusterConfig) { c.Spec.Image.Bootstrap = config.BootstrapPrebaked }, refuse: "prebaked"},

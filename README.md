@@ -225,9 +225,9 @@ change on a running cluster, and `plan` flags it. `upgrade` does it in order ins
   upgrade is finished by running the same command again; a rollout already under way is waited
   on, never re-applied.
 - **It refuses** a downgrade, a jump of more than one minor version, a cluster that is not settled,
-  `hydra.yaml` edits beyond the version (apply them with `create` first), a version
-  pkgs.k8s.io does not carry, and, when a pool is autoscaled, a minor with no Cluster Autoscaler
-  release. Each refusal says what to do. `--skip-remote-checks` skips the two internet checks.
+  `hydra.yaml` edits beyond the version (apply them with `create` first), a version whose
+  kubelet, kubeadm and kubectl pkgs.k8s.io does not carry, and, when a pool is autoscaled, a minor
+  with no Cluster Autoscaler release. Each refusal says what to do. `--skip-remote-checks` skips the two internet checks.
 - Clusters with `bootstrap: prebaked` images are not supported yet: the image carries one version.
 
 `hydra.yaml` may say the running version or the target while the upgrade runs. Afterwards, set

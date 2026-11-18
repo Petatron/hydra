@@ -56,7 +56,7 @@ type RenderFunc func(*config.ClusterConfig) ([]*unstructured.Unstructured, error
 // Remote answers the preflight questions that need the internet. A nil
 // Remote skips them (--skip-remote-checks).
 type Remote interface {
-	// HasPackages reports whether pkgs.k8s.io carries kubelet and kubeadm v.
+	// HasPackages reports whether pkgs.k8s.io carries kubelet, kubeadm and kubectl v.
 	HasPackages(ctx context.Context, v Version) (bool, error)
 	// AutoscalerTags lists Cluster Autoscaler image tags for v's minor.
 	AutoscalerTags(ctx context.Context, v Version) ([]string, error)
@@ -371,16 +371,16 @@ func (u *Upgrader) preflight(ctx context.Context) error {
 	switch {
 	case err != nil:
 		return &Refusal{
-			Reason: fmt.Sprintf("could not check pkgs.k8s.io for kubelet and kubeadm %s: %v", u.Target, err),
+			Reason: fmt.Sprintf("could not check pkgs.k8s.io for kubelet, kubeadm and kubectl %s: %v", u.Target, err),
 			Fix:    "machines install them from there at boot; check it is reachable, or pass --skip-remote-checks once you have checked by hand",
 		}
 	case !ok:
 		return &Refusal{
-			Reason: fmt.Sprintf("pkgs.k8s.io has no kubelet and kubeadm %s, which new machines install at boot", u.Target),
+			Reason: fmt.Sprintf("pkgs.k8s.io lacks kubelet, kubeadm or kubectl %s, which new machines install at boot", u.Target),
 			Fix:    fmt.Sprintf("pick a released %s patch (https://kubernetes.io/releases/)", u.Target.MinorString()),
 		}
 	}
-	u.logf("pkgs.k8s.io carries kubelet and kubeadm %s", u.Target)
+	u.logf("pkgs.k8s.io carries kubelet, kubeadm and kubectl %s", u.Target)
 	// Whatever the first stage of this run is: a run that resumes on a pool
 	// must stop for a missing Cluster Autoscaler release just as one that
 	// starts the control plane does.

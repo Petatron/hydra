@@ -11,6 +11,10 @@ import (
 	"time"
 )
 
+// pinnedPackages are the packages the rendered node setup installs at the
+// exact Kubernetes version (templates/cluster.yaml.tmpl, bootstrap: packages).
+var pinnedPackages = []string{"kubelet", "kubeadm", "kubectl"}
+
 // HTTPRemote answers the remote preflight questions from pkgs.k8s.io and
 // registry.k8s.io.
 type HTTPRemote struct {
@@ -40,7 +44,8 @@ func (r *HTTPRemote) get(ctx context.Context, url string) (*http.Response, error
 }
 
 // HasPackages reads the minor's Debian package index on pkgs.k8s.io, which
-// the rendered node setup installs from, for kubelet and kubeadm at v.
+// the rendered node setup installs from, for every package it pins to v:
+// kubelet, kubeadm and (on control-plane machines) kubectl.
 func (r *HTTPRemote) HasPackages(ctx context.Context, v Version) (bool, error) {
 	url := fmt.Sprintf("https://pkgs.k8s.io/core:/stable:/%s/deb/Packages", v.MinorString())
 	if r.PackagesURL != nil {
@@ -68,7 +73,7 @@ func (r *HTTPRemote) HasPackages(ctx context.Context, v Version) (bool, error) {
 		switch {
 		case strings.HasPrefix(line, "Package: "):
 			pkg = strings.TrimPrefix(line, "Package: ")
-		case strings.HasPrefix(line, "Version: ") && (pkg == "kubelet" || pkg == "kubeadm"):
+		case strings.HasPrefix(line, "Version: ") && slices.Contains(pinnedPackages, pkg):
 			if strings.HasPrefix(strings.TrimPrefix(line, "Version: "), want) {
 				found[pkg] = true
 			}
@@ -77,7 +82,12 @@ func (r *HTTPRemote) HasPackages(ctx context.Context, v Version) (bool, error) {
 	if err := sc.Err(); err != nil {
 		return false, fmt.Errorf("reading %s: %w", url, err)
 	}
-	return found["kubelet"] && found["kubeadm"], nil
+	for _, p := range pinnedPackages {
+		if !found[p] {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // AutoscalerTags lists registry.k8s.io's Cluster Autoscaler tags for v's
