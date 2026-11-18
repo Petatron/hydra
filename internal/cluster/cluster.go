@@ -346,7 +346,7 @@ func (m *Manager) Status(ctx context.Context, namespace, name string) (Summary, 
 		desired, _, _ := unstructured.NestedInt64(kcp.Object, "spec", "replicas")
 		ready, _, _ := unstructured.NestedInt64(kcp.Object, "status", "readyReplicas")
 		s.ControlPlane = fmt.Sprintf("%d/%d ready", ready, desired)
-		s.RolledOut = s.RolledOut && upToDate(kcp)
+		s.RolledOut = s.RolledOut && UpToDate(kcp)
 	} else if apierrors.IsNotFound(err) {
 		s.RolledOut = false
 	} else {
@@ -360,7 +360,7 @@ func (m *Manager) Status(ctx context.Context, namespace, name string) (Summary, 
 		return s, fmt.Errorf("listing MachineDeployments: %w", err)
 	}
 	for i := range mds.Items {
-		s.RolledOut = s.RolledOut && upToDate(&mds.Items[i])
+		s.RolledOut = s.RolledOut && UpToDate(&mds.Items[i])
 	}
 
 	machines := &unstructured.UnstructuredList{}
@@ -387,7 +387,7 @@ func (m *Manager) Status(ctx context.Context, namespace, name string) (Summary, 
 	return s, nil
 }
 
-// upToDate reports whether a KubeadmControlPlane or MachineDeployment has
+// UpToDate reports whether a KubeadmControlPlane or MachineDeployment has
 // observed its latest generation, has every desired replica both up to date
 // and Ready, and has no more replicas than desired: a scale-down is not done
 // while the surplus Machines are still being deleted. upToDateReplicas alone is not enough: in Cluster API v1.14 a
@@ -396,7 +396,7 @@ func (m *Manager) Status(ctx context.Context, namespace, name string) (Summary, 
 // defaults it to the min-size annotation when the pool is created, so that
 // minimum is what is waited for. Without spec.replicas, status.replicas is
 // used.
-func upToDate(o *unstructured.Unstructured) bool {
+func UpToDate(o *unstructured.Unstructured) bool {
 	observed, _, _ := unstructured.NestedInt64(o.Object, "status", "observedGeneration")
 	if observed < o.GetGeneration() {
 		return false

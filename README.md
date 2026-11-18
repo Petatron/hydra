@@ -205,6 +205,35 @@ current kubectl context is never used.
   cluster from itself (a self-hosted management cluster), and then removes everything labelled
   for the cluster once Cluster API has torn down its machines. The credentials Secret is kept.
 
+## Upgrade Kubernetes
+
+```bash
+hydra cluster upgrade -f hydra.yaml --to v1.36.6 --dry-run   # the next stage and what it changes
+hydra cluster upgrade -f hydra.yaml --to v1.36.6             # control plane, then each pool
+```
+
+Changing `kubernetesVersion` and rerunning `create` would roll the control plane and every pool at
+once, so a worker could briefly run a kubelet newer than the API server. `create` refuses that
+change on a running cluster, and `plan` flags it. `upgrade` does it in order instead:
+
+- **Control plane first.** It sets the version on the KubeadmControlPlane only, and waits until
+  every control-plane machine runs it and the cluster is Available.
+- **Then each pool**, in `hydra.yaml`'s order: the pool's new KubeadmConfigTemplate and its
+  MachineDeployment. Machines being drained are shown, including pods a PodDisruptionBudget
+  holds; drains are waited on, never forced.
+- **Resumable.** Each run reads the live versions and continues from there. An interrupted
+  upgrade is finished by running the same command again; a rollout already under way is waited
+  on, never re-applied.
+- **It refuses** a downgrade, a jump of more than one minor version, a cluster that is not settled,
+  `hydra.yaml` edits beyond the version (apply them with `create` first), a version whose
+  kubelet, kubeadm and kubectl pkgs.k8s.io does not carry, and, when a pool is autoscaled, a minor
+  with no Cluster Autoscaler release. Each refusal says what to do. `--skip-remote-checks` skips the two internet checks.
+- Clusters with `bootstrap: prebaked` images are not supported yet: the image carries one version.
+
+`hydra.yaml` may say the running version or the target while the upgrade runs. Afterwards, set
+`kubernetesVersion` to the target; then `plan` shows no changes. A control plane cannot go back a
+minor version: the way back is restoring etcd from a backup taken before the upgrade.
+
 ## Make a cluster manage itself
 
 ```bash

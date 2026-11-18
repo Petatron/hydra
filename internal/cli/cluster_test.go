@@ -7,8 +7,10 @@ import (
 	"strings"
 	"testing"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -191,5 +193,35 @@ func TestDeleteHandBuiltClusterNeedsAdopt(t *testing.T) {
 	_, _, err := run(t, "cluster", "delete", "-f", "../../examples/hydra-mgmt.yaml", "--yes")
 	if err == nil || !strings.Contains(err.Error(), "--adopt") {
 		t.Fatalf("got %v", err)
+	}
+}
+
+// create never changes the Kubernetes version of a running cluster: that
+// would roll the control plane and every pool at once.
+func TestCreateRefusesAVersionChange(t *testing.T) {
+	kcp := &unstructured.Unstructured{Object: map[string]any{}}
+	kcp.SetAPIVersion("controlplane.cluster.x-k8s.io/v1beta2")
+	kcp.SetKind("KubeadmControlPlane")
+	kcp.SetNamespace("default")
+	kcp.SetName("hydra-mgmt-cp")
+	kcp.SetLabels(map[string]string{"hydra.io/cluster": "hydra-mgmt"})
+	_ = unstructured.SetNestedField(kcp.Object, "v1.34.2", "spec", "version")
+	c := withFakeManagement(t, capiCluster("default", "hydra-mgmt", "192.168.15.11", 6443), kcp)
+	// A management cluster: the Cluster API kinds resolve.
+	mapper := meta.NewDefaultRESTMapper(nil)
+	mapper.Add(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta2", Kind: "Cluster"}, meta.RESTScopeNamespace)
+	withCAPI := fake.NewClientBuilder().WithScheme(c.Scheme()).WithRESTMapper(mapper).
+		WithObjects(capiCluster("default", "hydra-mgmt", "192.168.15.11", 6443), kcp).Build()
+	connectManagement = func([]byte) (client.Client, error) { return withCAPI, nil }
+	_, _, err := run(t, "cluster", "create", "-f", "../../examples/hydra-mgmt.yaml", "--management-kubeconfig", "/x", "--wait=false")
+	if err == nil || !strings.Contains(err.Error(), "hydra cluster upgrade --to v1.35.3") || !strings.Contains(err.Error(), "control plane v1.34.2") {
+		t.Fatalf("want a refusal pointing at upgrade, got %v", err)
+	}
+	out, _, err := run(t, "cluster", "plan", "-f", "../../examples/hydra-mgmt.yaml", "--management-kubeconfig", "/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "! version: hydra.yaml says v1.35.3, but control plane v1.34.2") {
+		t.Errorf("plan must flag the version change:\n%s", out)
 	}
 }
