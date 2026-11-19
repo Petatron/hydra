@@ -92,6 +92,13 @@ spec:
       vcpus: {{ .Spec.ControlPlane.VCPUs }}
       memory: {{ q .Spec.ControlPlane.Memory.String }}
       diskSize: {{ q .Spec.ControlPlane.DiskSize.String }}
+      # Before Cluster API drains a control-plane machine -- and so before KCP
+      # removes its etcd member -- the provider runs this in the guest: it
+      # hands the control-plane VIP to another node while this one still
+      # serves the API (PET-88). Needs provider v0.2.0 or later.
+      preDrainHook:
+        path: {{ .PreDrainHookPath }}
+        timeoutSeconds: {{ .PreDrainHookTimeout }}
 ---
 apiVersion: controlplane.cluster.x-k8s.io/v1beta2
 kind: KubeadmControlPlane
@@ -135,6 +142,43 @@ spec:
         content: |
           [Login]
           InhibitDelayMaxSec=60
+      # Run by the provider before this machine is drained (preDrainHook on
+      # the control-plane template, PET-88). If this node holds the VIP and
+      # another control-plane node is Ready, it stops kube-vip here, waits
+      # until another node holds kube-vip's lease, then drops the VIP from
+      # this node. kube-vip v0.8.9 neither releases its lease nor removes the
+      # address when stopped, so both are done here. Idempotent.
+      - path: {{ .PreDrainHookPath }}
+        owner: root:root
+        permissions: "0755"
+        content: |
+          #!/bin/sh
+          set -u
+          IFACE={{ .Spec.Network.VIPInterface }}
+          MANIFEST=/etc/kubernetes/manifests/kube-vip.yaml
+          PARKED=/etc/kubernetes/kube-vip.yaml.pre-drain
+          NODE=$(hostname)
+          src=$MANIFEST; [ -f "$src" ] || src=$PARKED
+          if [ ! -f "$src" ]; then echo "no kube-vip manifest: nothing to hand over"; exit 0; fi
+          VIP=$(awk '/- name: address$/ { getline; gsub(/"/, "", $2); print $2; exit }' "$src")
+          if [ -z "$VIP" ]; then echo "no VIP address in $src"; exit 1; fi
+          if ! ip -4 -o addr show dev "$IFACE" | grep -q " $VIP/"; then echo "$NODE does not hold $VIP"; exit 0; fi
+          # This node's own API server: the way in that does not depend on the VIP.
+          K="kubectl --kubeconfig /etc/kubernetes/admin.conf --server https://127.0.0.1:6443 --tls-server-name kubernetes --request-timeout=3s"
+          others=$($K get nodes -l node-role.kubernetes.io/control-plane \
+            -o jsonpath='{range .items[*]}{.metadata.name}={.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' |
+            grep -v "^$NODE=" | grep -c '=True$')
+          if [ "$others" -eq 0 ]; then echo "no other Ready control-plane node: keeping $VIP"; exit 0; fi
+          [ -f "$MANIFEST" ] && mv -f "$MANIFEST" "$PARKED"
+          end=$(( $(date +%s) + {{ .PreDrainHandoverSeconds }} ))
+          while :; do
+            h=$($K -n kube-system get lease plndr-cp-lock -o jsonpath='{.spec.holderIdentity}' 2>/dev/null)
+            if [ -n "$h" ] && [ "$h" != "$NODE" ]; then break; fi
+            if [ "$(date +%s)" -ge "$end" ]; then echo "lease still on $NODE after {{ .PreDrainHandoverSeconds }}s: keeping $VIP"; exit 1; fi
+            sleep 0.5
+          done
+          ip addr del "$VIP/32" dev "$IFACE" 2>/dev/null || true
+          echo "handed $VIP to $h"
       - path: /etc/kubernetes/manifests/kube-vip.yaml
         owner: root:root
         permissions: "0644"

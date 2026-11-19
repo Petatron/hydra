@@ -201,6 +201,13 @@ current kubectl context is never used.
   not make (`--adopt` allows the latter), and refuses while the cluster is being deleted.
 - `plan` diffs against the live cluster only, and lists objects labelled for the cluster that
   `hydra.yaml` no longer produces (a removed pool, an old template). Neither command deletes them.
+- **Replacing a control-plane machine keeps the API up (PET-88).** The control-plane template asks
+  the provider (v0.2.0 or later) to run `/usr/local/sbin/hydra-pre-drain` in the guest before
+  Cluster API drains the machine. If that node holds the control-plane VIP, the script stops
+  kube-vip there, waits until another control-plane node holds kube-vip's lease, then drops the
+  VIP from the node. That happens before the node's etcd member is removed, so the API stays
+  served throughout. A cluster created with an earlier hydra rolls its control plane once on its
+  next `create`, because the control-plane template changed.
 - `delete` shows which management cluster it will act on before asking, refuses to delete a
   cluster from itself (a self-hosted management cluster), and then removes everything labelled
   for the cluster once Cluster API has torn down its machines. The credentials Secret is kept.
