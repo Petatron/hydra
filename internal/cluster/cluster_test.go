@@ -402,7 +402,7 @@ func TestDeleteRemovesUnownedInfrastructureFirst(t *testing.T) {
 	// A create interrupted after the HydraCluster but before the Cluster:
 	// the HydraCluster has no owner, and delete must still remove it.
 	hc := labelled(hydraClusterGVK, "c", "c")
-	tmpl := labelled(schema.GroupVersionKind{Group: "infrastructure.cluster.x-k8s.io", Version: "v1alpha1", Kind: "HydraMachineTemplate"}, "c-cp-1", "c")
+	tmpl := labelled(schema.GroupVersionKind{Group: "infrastructure.cluster.x-k8s.io", Version: "v1alpha1", Kind: kindHydraMachineTemplate}, "c-cp-1", "c")
 	cm := labelled(schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}, "c-cilium", "c")
 	var order []string
 	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(hc, tmpl, cm).WithInterceptorFuncs(interceptor.Funcs{
@@ -499,7 +499,7 @@ func TestDeleteExactlySkipsChangedObjects(t *testing.T) {
 // An apply the provider's schema refuses names the field and the provider
 // version hydra needs, instead of only the API server's message.
 func TestApplyNamesAnOldProvider(t *testing.T) {
-	o := obj(schema.GroupVersionKind{Group: infraGroup, Version: infraVersion, Kind: "HydraMachineTemplate"}, "ns", "c-cp-1", nil)
+	o := obj(schema.GroupVersionKind{Group: infraGroup, Version: infraVersion, Kind: kindHydraMachineTemplate}, "ns", "c-cp-1", nil)
 	refused := errors.New(`failed to create typed patch object (ns/c-cp-1; infrastructure.cluster.x-k8s.io/v1alpha1, Kind=HydraMachineTemplate): .spec.template.spec.preDrainHook: field not declared in schema`)
 	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithInterceptorFuncs(interceptor.Funcs{
 		Apply: func(_ context.Context, _ client.WithWatch, ac runtime.ApplyConfiguration, _ ...client.ApplyOption) error {

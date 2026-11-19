@@ -38,12 +38,13 @@ const (
 	// cluster's manager owns (see FieldManagerFor).
 	FieldManagerPrefix = "hydra-"
 
-	capiGroup        = "cluster.x-k8s.io"
-	capiVersion      = "v1beta2"
-	kindConfigMap    = "ConfigMap"
-	clusterNameLabel = "cluster.x-k8s.io/cluster-name"
-	infraGroup       = "infrastructure.cluster.x-k8s.io"
-	infraVersion     = "v1alpha1"
+	capiGroup                = "cluster.x-k8s.io"
+	capiVersion              = "v1beta2"
+	kindConfigMap            = "ConfigMap"
+	kindHydraMachineTemplate = "HydraMachineTemplate"
+	clusterNameLabel         = "cluster.x-k8s.io/cluster-name"
+	infraGroup               = "infrastructure.cluster.x-k8s.io"
+	infraVersion             = "v1alpha1"
 )
 
 // ConditionTrue is a condition's status when it holds.

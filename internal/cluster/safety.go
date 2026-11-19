@@ -35,7 +35,7 @@ var ownedKinds = []schema.GroupVersionKind{
 	mdGVK,
 	{Group: capiGroup, Version: capiVersion, Kind: "MachineHealthCheck"},
 	{Group: "bootstrap.cluster.x-k8s.io", Version: capiVersion, Kind: "KubeadmConfigTemplate"},
-	{Group: infraGroup, Version: infraVersion, Kind: "HydraMachineTemplate"},
+	{Group: infraGroup, Version: infraVersion, Kind: kindHydraMachineTemplate},
 	{Group: "addons.cluster.x-k8s.io", Version: capiVersion, Kind: "ClusterResourceSet"},
 	{Group: "", Version: "v1", Kind: kindConfigMap},
 }
