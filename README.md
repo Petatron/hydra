@@ -206,8 +206,13 @@ current kubectl context is never used.
   Cluster API drains the machine. If that node holds the control-plane VIP, the script stops
   kube-vip there, waits until another control-plane node holds kube-vip's lease, then drops the
   VIP from the node. That happens before the node's etcd member is removed, so the API stays
-  served throughout. A cluster created with an earlier hydra rolls its control plane once on its
-  next `create`, because the control-plane template changed.
+  served throughout.
+- **Existing clusters roll once.** A cluster created with an earlier hydra rolls its control plane
+  once on its next `create`, because the control-plane template changed. That migration roll is
+  not protected: the machines it deletes came from the old template and have no hook. Every roll
+  after it is.
+- **Upgrade the provider first.** Against an older provider, `create` refuses with the field the
+  provider does not know, and changes nothing of that object.
 - `delete` shows which management cluster it will act on before asking, refuses to delete a
   cluster from itself (a self-hosted management cluster), and then removes everything labelled
   for the cluster once Cluster API has torn down its machines. The credentials Secret is kept.

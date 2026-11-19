@@ -150,6 +150,9 @@ func (m *Manager) Apply(ctx context.Context, objs []*unstructured.Unstructured, 
 	}
 	for _, o := range objs {
 		if err := m.C.Apply(ctx, client.ApplyConfigurationFromUnstructured(o.DeepCopy()), applyOptions(cluster, forceConflicts)...); err != nil {
+			if f := undeclaredField(err); f != "" && o.GroupVersionKind().Group == infraGroup {
+				return fmt.Errorf("applying %s: the Hydra provider on this management cluster does not know %s, which this hydra renders: it is older than the provider hydra pins (%s). Upgrade the provider first; nothing of %s was changed: %w", describe(o), f, bootstrap.HydraVersion, describe(o), err)
+			}
 			if apierrors.IsConflict(err) {
 				return fmt.Errorf("applying %s: another manager owns fields hydra.yaml sets differently (another cluster, or a hand edit); nothing of theirs was changed. Inspect it, or rerun with --force-conflicts to take them over: %w", describe(o), err)
 			}
@@ -158,6 +161,20 @@ func (m *Manager) Apply(ctx context.Context, objs []*unstructured.Unstructured, 
 	}
 	m.logf("applied %d objects", len(objs))
 	return nil
+}
+
+// undeclaredField returns the field an apply was refused for because the
+// object's schema does not declare it ("... .spec.x: field not declared in
+// schema"), or "".
+func undeclaredField(err error) string {
+	const marker = ": field not declared in schema"
+	msg := err.Error()
+	i := strings.Index(msg, marker)
+	if i < 0 {
+		return ""
+	}
+	start := strings.LastIndexAny(msg[:i], " (") + 1
+	return msg[start:i]
 }
 
 // Change is one difference plan found.

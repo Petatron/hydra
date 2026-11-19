@@ -495,3 +495,26 @@ func TestDeleteExactlySkipsChangedObjects(t *testing.T) {
 		t.Error("the relabelled object must survive")
 	}
 }
+
+// An apply the provider's schema refuses names the field and the provider
+// version hydra needs, instead of only the API server's message.
+func TestApplyNamesAnOldProvider(t *testing.T) {
+	o := obj(schema.GroupVersionKind{Group: infraGroup, Version: infraVersion, Kind: "HydraMachineTemplate"}, "ns", "c-cp-1", nil)
+	refused := errors.New(`failed to create typed patch object (ns/c-cp-1; infrastructure.cluster.x-k8s.io/v1alpha1, Kind=HydraMachineTemplate): .spec.template.spec.preDrainHook: field not declared in schema`)
+	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithInterceptorFuncs(interceptor.Funcs{
+		Apply: func(_ context.Context, _ client.WithWatch, ac runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+			if _, isNS := ac.(interface{ GetName() *string }); isNS {
+				return nil
+			}
+			return refused
+		},
+	}).Build()
+	err := (&Manager{C: c, Out: &bytes.Buffer{}}).Apply(context.Background(), []*unstructured.Unstructured{o}, "c", false)
+	if err == nil || !strings.Contains(err.Error(), ".spec.template.spec.preDrainHook") ||
+		!strings.Contains(err.Error(), "Upgrade the provider first") || !errors.Is(err, refused) {
+		t.Fatalf("got %v", err)
+	}
+	if undeclaredField(errors.New("some other failure")) != "" {
+		t.Error("only a schema refusal names a field")
+	}
+}
