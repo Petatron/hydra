@@ -79,6 +79,8 @@ func newGuest(t *testing.T) *guest {
 	}
 	d := g.dir
 	stub("hostname", "echo "+thisNode+"\n")
+	stub("getent", `[ "$2" = api.example.test ] && echo "`+vip+`  STREAM api.example.test"; true
+`)
 	stub("sleep", ":\n")
 	// kubectl: "get nodes" prints nodes.out or fails when nodes.fail exists;
 	// "get lease" prints the first line of lease (then drops it, so a
@@ -204,6 +206,34 @@ func TestPreDrainScript(t *testing.T) {
 		g.write("lease", "cp-b\n")
 		code, out := g.run(script)
 		if code == 0 || !strings.Contains(out, "could not be removed") {
+			t.Fatalf("exit %d: %s", code, out)
+		}
+	})
+
+}
+
+func TestPreDrainScriptEndpointsAndReruns(t *testing.T) {
+	script := preDrainScript(t)
+	readyPeer := thisNode + "=True\ncp-b=True\n"
+
+	t.Run("resolves a DNS endpoint to the address it hands over", func(t *testing.T) {
+		g := newGuest(t)
+		g.write("manifest", "    - name: address\n      value: \"api.example.test\"\n")
+		g.write("vip.on", "")
+		g.write("nodes.out", readyPeer)
+		g.write("lease", "cp-b\n")
+		code, out := g.run(script)
+		if code != 0 || !strings.Contains(out, "handed "+vip) || g.exists("vip.on") {
+			t.Fatalf("exit %d: %s", code, out)
+		}
+	})
+
+	t.Run("an endpoint name that does not resolve leaves kube-vip alone", func(t *testing.T) {
+		g := newGuest(t)
+		g.write("manifest", "    - name: address\n      value: \"nowhere.example.test\"\n")
+		g.write("vip.on", "")
+		code, out := g.run(script)
+		if code == 0 || !strings.Contains(out, "cannot resolve") || !g.exists("manifest") {
 			t.Fatalf("exit %d: %s", code, out)
 		}
 	})

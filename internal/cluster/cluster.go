@@ -152,7 +152,7 @@ func (m *Manager) Apply(ctx context.Context, objs []*unstructured.Unstructured, 
 	for _, o := range objs {
 		if err := m.C.Apply(ctx, client.ApplyConfigurationFromUnstructured(o.DeepCopy()), applyOptions(cluster, forceConflicts)...); err != nil {
 			if f := undeclaredField(err); f != "" && o.GroupVersionKind().Group == infraGroup {
-				return fmt.Errorf("applying %s: the Hydra provider on this management cluster does not know %s, which this hydra renders: it is older than the provider hydra pins (%s). Upgrade the provider first; nothing of %s was changed: %w", describe(o), f, bootstrap.HydraVersion, describe(o), err)
+				return fmt.Errorf("applying %s: the Hydra provider on this management cluster does not know %s, which this hydra renders: it is older than %s, the oldest provider this hydra works with. Upgrade the provider first; nothing of %s was changed: %w", describe(o), f, bootstrap.MinHydraVersion, describe(o), err)
 			}
 			if apierrors.IsConflict(err) {
 				return fmt.Errorf("applying %s: another manager owns fields hydra.yaml sets differently (another cluster, or a hand edit); nothing of theirs was changed. Inspect it, or rerun with --force-conflicts to take them over: %w", describe(o), err)
@@ -163,6 +163,56 @@ func (m *Manager) Apply(ctx context.Context, objs []*unstructured.Unstructured, 
 	m.logf("applied %d objects", len(objs))
 	return nil
 }
+
+// UnprotectedRoll reports whether applying objs replaces the control plane's
+// machines with ones whose template sets preDrainHook, while the live machines
+// come from a template without it: the one roll that hands nothing over,
+// because the machines it deletes have no hook (PET-88).
+func (m *Manager) UnprotectedRoll(ctx context.Context, objs []*unstructured.Unstructured, namespace, name string) (bool, error) {
+	cpRef := func(kcp *unstructured.Unstructured) string {
+		n, _, _ := unstructured.NestedString(kcp.Object, "spec", "machineTemplate", "spec", "infrastructureRef", "name")
+		return n
+	}
+	var rendered string
+	hooked := map[string]bool{}
+	for _, o := range objs {
+		switch o.GetKind() {
+		case kcpGVK.Kind:
+			rendered = cpRef(o)
+		case kindHydraMachineTemplate:
+			_, has, _ := unstructured.NestedMap(o.Object, "spec", "template", "spec", "preDrainHook")
+			hooked[o.GetName()] = has
+		}
+	}
+	if rendered == "" || !hooked[rendered] {
+		return false, nil
+	}
+	live := &unstructured.Unstructured{}
+	live.SetGroupVersionKind(kcpGVK)
+	switch err := m.C.Get(ctx, client.ObjectKey{Namespace: namespace, Name: render.ControlPlaneName(name)}, live); {
+	case apierrors.IsNotFound(err), meta.IsNoMatchError(err):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("reading the KubeadmControlPlane: %w", err)
+	}
+	current := cpRef(live)
+	if current == "" || current == rendered {
+		return false, nil
+	}
+	tmpl := &unstructured.Unstructured{}
+	tmpl.SetGroupVersionKind(schema.GroupVersionKind{Group: infraGroup, Version: infraVersion, Kind: kindHydraMachineTemplate})
+	switch err := m.C.Get(ctx, client.ObjectKey{Namespace: namespace, Name: current}, tmpl); {
+	case apierrors.IsNotFound(err):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("reading HydraMachineTemplate %s: %w", current, err)
+	}
+	_, has, _ := unstructured.NestedMap(tmpl.Object, "spec", "template", "spec", "preDrainHook")
+	return !has, nil
+}
+
+// UnprotectedRollNote is what create and plan say about such a roll.
+const UnprotectedRollNote = "this apply rolls the control plane onto machines that hand the control-plane VIP over before they are drained (PET-88). The machines it replaces predate that and hand nothing over, so this one roll can interrupt the API for about 5 s when it replaces the VIP holder; every roll after it is protected"
 
 // undeclaredField returns the field an apply was refused for because the
 // object's schema does not declare it ("... .spec.x: field not declared in

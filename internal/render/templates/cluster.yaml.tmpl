@@ -164,6 +164,14 @@ spec:
           if [ ! -f "$src" ]; then echo "no kube-vip manifest: nothing to hand over"; exit 0; fi
           VIP=$(awk '/- name: address$/ { getline; gsub(/"/, "", $2); print $2; exit }' "$src")
           if [ -z "$VIP" ]; then echo "no VIP address in $src"; exit 1; fi
+          # The endpoint may be a DNS name; kube-vip puts the address it
+          # resolves to on the interface, so compare and remove that.
+          case "$VIP" in
+            *[!0-9.]*)
+              name=$VIP
+              VIP=$(getent ahostsv4 "$name" | awk 'NR == 1 { print $1 }')
+              if [ -z "$VIP" ]; then echo "cannot resolve $name: keeping kube-vip"; exit 1; fi ;;
+          esac
           if ! ip -4 -o addr show dev "$IFACE" | grep -q " $VIP/"; then echo "$NODE does not hold $VIP"; exit 0; fi
           # This node's own API server: the way in that does not depend on the VIP.
           K="kubectl --kubeconfig /etc/kubernetes/admin.conf --server https://127.0.0.1:6443 --tls-server-name kubernetes --request-timeout=3s"
@@ -194,12 +202,16 @@ spec:
             fi
             sleep 0.5
           done
-          for try in 1 2 3; do
+          # Another node holds the lease now: keep removing the address until
+          # it is gone, or until the hand-over time is up.
+          end=$(( $(date +%s) + HANDOVER ))
+          while :; do
             ip addr del "$VIP/32" dev "$IFACE" 2>/dev/null
             if ! ip -4 -o addr show dev "$IFACE" | grep -q " $VIP/"; then
               echo "handed $VIP to $h"
               exit 0
             fi
+            [ "$(date +%s)" -ge "$end" ] && break
             sleep 1
           done
           echo "$h holds the lease, but $VIP could not be removed from $IFACE"

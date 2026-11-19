@@ -215,6 +215,11 @@ func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.C
 	} else if len(drift) > 0 {
 		return "", fmt.Errorf("hydra.yaml says kubernetesVersion %s, but %s: create would change the control plane and every pool at once, which the version-skew policy forbids. Upgrade with `hydra cluster upgrade --to %s`, or set kubernetesVersion back to what runs", cfg.Spec.KubernetesVersion, strings.Join(drift, ", "), cfg.Spec.KubernetesVersion)
 	}
+	if unprotected, err := m.UnprotectedRoll(ctx, objs, ns, name); err != nil {
+		return "", err
+	} else if unprotected {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "note: %s\n", cluster.UnprotectedRollNote)
+	}
 	if err := m.Apply(ctx, objs, name, forceConflicts); err != nil {
 		return "", err
 	}
@@ -282,6 +287,11 @@ anything stored locally.`,
 			orphans, err := t.m.Orphans(contextOf(cmd), objs, cfg.Metadata.Namespace, cfg.Metadata.Name)
 			if err != nil {
 				return err
+			}
+			if unprotected, err := t.m.UnprotectedRoll(contextOf(cmd), objs, cfg.Metadata.Namespace, cfg.Metadata.Name); err != nil {
+				return err
+			} else if unprotected {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "! note: %s\n", cluster.UnprotectedRollNote)
 			}
 			drift, err := upgrade.Drift(contextOf(cmd), t.m.C, cfg)
 			if err != nil {

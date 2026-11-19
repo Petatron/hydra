@@ -28,6 +28,9 @@ const (
 	CertManagerVersion = "v1.21.1"
 	CAPIVersion        = "v1.14.0"
 	HydraVersion       = "v0.1.0"
+	// MinHydraVersion is the oldest Hydra provider whose schema accepts what
+	// render produces (preDrainHook, PET-88).
+	MinHydraVersion = "v0.2.0"
 
 	// HydraComponentsURL is where clusterctl finds the Hydra provider: the
 	// pinned release itself, so no "latest" lookup (and no GitHub API call to

@@ -518,3 +518,40 @@ func TestApplyNamesAnOldProvider(t *testing.T) {
 		t.Error("only a schema refusal names a field")
 	}
 }
+
+// The roll from a template without preDrainHook to one with it is the one
+// that hands nothing over, and only it is reported.
+func TestUnprotectedRoll(t *testing.T) {
+	ctx := context.Background()
+	hmtGVK := schema.GroupVersionKind{Group: infraGroup, Version: infraVersion, Kind: kindHydraMachineTemplate}
+	kcp := func(ref string) *unstructured.Unstructured {
+		return obj(kcpGVK, "ns", "c-cp", map[string]any{"spec": map[string]any{"machineTemplate": map[string]any{"spec": map[string]any{
+			"infrastructureRef": map[string]any{"name": ref}}}}})
+	}
+	tmpl := func(name string, hook bool) *unstructured.Unstructured {
+		spec := map[string]any{"vcpus": int64(2)}
+		if hook {
+			spec["preDrainHook"] = map[string]any{"path": "/usr/local/sbin/hydra-pre-drain"}
+		}
+		return obj(hmtGVK, "ns", name, map[string]any{"spec": map[string]any{"template": map[string]any{"spec": spec}}})
+	}
+	rendered := []*unstructured.Unstructured{kcp("c-cp-new"), tmpl("c-cp-new", true)}
+	for _, tc := range []struct {
+		name string
+		live []client.Object
+		want bool
+	}{
+		{"old template without the hook", []client.Object{kcp("c-cp-old"), tmpl("c-cp-old", false)}, true},
+		{"old template already hooked", []client.Object{kcp("c-cp-old"), tmpl("c-cp-old", true)}, false},
+		{"no change of template", []client.Object{kcp("c-cp-new"), tmpl("c-cp-new", true)}, false},
+		{"a new cluster", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(tc.live...).Build()
+			got, err := (&Manager{C: c}).UnprotectedRoll(ctx, rendered, "ns", "c")
+			if err != nil || got != tc.want {
+				t.Fatalf("got %v, %v; want %v", got, err, tc.want)
+			}
+		})
+	}
+}
