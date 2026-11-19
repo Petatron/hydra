@@ -1,0 +1,24 @@
+# Coverage comes from `make test`, which writes cover.out at the repo root.
+#
+# Both statuses target 85%. They are informational for now: the project is at
+# about 72% today, so a blocking status would fail every PR on day one. Set
+# `informational: false` on both once coverage reaches the target (and mark the
+# Codecov checks required in branch protection if they should gate the merge).
+coverage:
+  status:
+    project:
+      default:
+        target: 85%
+        threshold: 1%
+        informational: true
+    patch:
+      default:
+        target: 85%
+        informational: true
+
+comment:
+  layout: "reach, diff, files"
+  require_changes: true
+
+ignore:
+  - "cmd/hydra/**" # process entry point; no unit tests by design
