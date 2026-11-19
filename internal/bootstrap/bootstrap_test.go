@@ -474,3 +474,65 @@ func TestNoCredentialsBootstrap(t *testing.T) {
 		t.Error("credentials and NoCredentials together must be refused")
 	}
 }
+
+// imageKind records the node image each Create asks for.
+type imageKind struct {
+	*fakeKind
+	images []string
+}
+
+func (k *imageKind) Create(name, image string) error {
+	k.images = append(k.images, image)
+	return k.fakeKind.Create(name, image)
+}
+
+func TestOverridesReplacePins(t *testing.T) {
+	k, c, b, _ := newFakes()
+	ik := &imageKind{fakeKind: k}
+	b.Kind = ik
+	b.NodeImage = "kindest/node:test"
+	only := Providers()[3:]
+	b.ProviderFn = func() []Provider { return only }
+	if err := b.Create(context.Background(), cfg(t, cfgYAML), Options{Credentials: testCredentials(t)}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(ik.images, ",") != "kindest/node:test" {
+		t.Errorf("node image override ignored: %v", ik.images)
+	}
+	if len(c.inited) != 1 || len(c.inited[0]) != 1 || c.inited[0][0].Name != "infrastructure-hydra" {
+		t.Errorf("provider override ignored: %v", c.inited)
+	}
+
+	k2, _, b2, _ := newFakes()
+	ik2 := &imageKind{fakeKind: k2}
+	b2.Kind = ik2
+	if err := b2.Create(context.Background(), cfg(t, cfgYAML), Options{Credentials: testCredentials(t)}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(ik2.images, ",") != NodeImage {
+		t.Errorf("default node image must be the pinned one: %v", ik2.images)
+	}
+}
+
+func TestExistingClusterWithoutSecretNeedsCredentials(t *testing.T) {
+	k, c, b, _ := newFakes()
+	k.clusters["hydra-bootstrap-lab"] = true
+	for _, p := range Providers() {
+		c.installed[p.Name] = p.Version
+	}
+	err := b.Create(context.Background(), cfg(t, cfgYAML), Options{})
+	if err == nil || !strings.Contains(err.Error(), "does not exist") || !strings.Contains(err.Error(), "--hypervisor-credentials") {
+		t.Errorf("got %v", err)
+	}
+}
+
+func TestKindLookupFailures(t *testing.T) {
+	k, _, b, _ := newFakes()
+	k.err = errors.New("docker down")
+	if _, err := b.KubeConfig("lab"); err == nil || !strings.Contains(err.Error(), "docker down") {
+		t.Errorf("KubeConfig: %v", err)
+	}
+	if err := b.Create(context.Background(), cfg(t, cfgYAML), Options{Credentials: testCredentials(t)}); err == nil || len(k.created) != 0 {
+		t.Errorf("Create must stop when it cannot tell whether the cluster exists: %v, created %v", err, k.created)
+	}
+}
