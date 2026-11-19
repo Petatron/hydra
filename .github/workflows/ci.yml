@@ -31,6 +31,19 @@ jobs:
       # committed with its regenerated golden, so it shows up in review.
       - name: Test
         run: make test
+      # Fork pull requests do not receive CODECOV_TOKEN, so the upload is
+      # skipped there rather than failing a contributor's PR on something they
+      # cannot fix. It is also skipped when the secret is simply not set.
+      - name: Upload coverage to Codecov
+        if: ${{ github.event.pull_request.head.repo.fork != true && env.CODECOV_TOKEN != '' }}
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: cover.out
+          disable_search: true
+          fail_ci_if_error: true
       - name: Build
         run: make build
 
