@@ -150,7 +150,16 @@ spec:
           # Overridable only so the render tests can run this script.
           MANIFEST=${MANIFEST:-/etc/kubernetes/manifests/kube-vip.yaml}
           PARKED=${PARKED:-/etc/kubernetes/kube-vip.yaml.pre-drain}
-          HANDOVER=${HANDOVER:-30}
+          # One deadline for all of it, well inside the provider's timeout
+          # (60s), which releases the hook whether or
+          # not this has finished: listing nodes gets the first quarter, the
+          # lease hand-over runs to three quarters, removing the address to the
+          # end.
+          BUDGET=${BUDGET:-45}
+          START=$(date +%s)
+          LIST_END=$(( START + BUDGET / 4 ))
+          LEASE_END=$(( START + BUDGET * 3 / 4 ))
+          DEADLINE=$(( START + BUDGET ))
           NODE=$(hostname)
           src=$MANIFEST; [ -f "$src" ] || src=$PARKED
           if [ ! -f "$src" ]; then echo "no kube-vip manifest: nothing to hand over"; exit 0; fi
@@ -170,40 +179,35 @@ spec:
           # Only a list that succeeded may say there is nobody to hand over
           # to; one that keeps failing leaves kube-vip and the VIP alone.
           nodes=""
-          for try in 1 2 3 4 5; do
-            if nodes=$($K get nodes -l node-role.kubernetes.io/control-plane \
-              -o jsonpath='{range .items[*]}{.metadata.name}={.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}'); then
-              break
-            fi
-            if [ "$try" -eq 5 ]; then echo "cannot list control-plane nodes: keeping $VIP"; exit 1; fi
+          until nodes=$($K get nodes -l node-role.kubernetes.io/control-plane \
+            -o jsonpath='{range .items[*]}{.metadata.name}={.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}'); do
+            if [ "$(date +%s)" -ge "$LIST_END" ]; then echo "cannot list control-plane nodes: keeping $VIP"; exit 1; fi
             sleep 1
           done
           others=$(printf '%s\n' "$nodes" | grep -v "^$NODE=" | grep -c '=True$')
           if [ "$others" -eq 0 ]; then echo "no other Ready control-plane node: keeping $VIP"; exit 0; fi
           [ -f "$MANIFEST" ] && mv -f "$MANIFEST" "$PARKED"
-          end=$(( $(date +%s) + HANDOVER ))
           while :; do
             h=$($K -n kube-system get lease plndr-cp-lock -o jsonpath='{.spec.holderIdentity}' 2>/dev/null)
             if [ -n "$h" ] && [ "$h" != "$NODE" ]; then break; fi
-            if [ "$(date +%s)" -ge "$end" ]; then
+            if [ "$(date +%s)" -ge "$LEASE_END" ]; then
               # Nobody took over: run kube-vip here again, so this node goes
               # on serving the VIP it still holds.
               mv -f "$PARKED" "$MANIFEST"
-              echo "lease still on $NODE after ${HANDOVER}s: kube-vip restored, keeping $VIP"
+              echo "lease still on $NODE: kube-vip restored, keeping $VIP"
               exit 1
             fi
             sleep 0.5
           done
           # Another node holds the lease now: keep removing the address until
-          # it is gone, or until the hand-over time is up.
-          end=$(( $(date +%s) + HANDOVER ))
+          # it is gone, or until the deadline.
           while :; do
             ip addr del "$VIP/32" dev "$IFACE" 2>/dev/null
             if ! ip -4 -o addr show dev "$IFACE" | grep -q " $VIP/"; then
               echo "handed $VIP to $h"
               exit 0
             fi
-            [ "$(date +%s)" -ge "$end" ] && break
+            [ "$(date +%s)" -ge "$DEADLINE" ] && break
             sleep 1
           done
           echo "$h holds the lease, but $VIP could not be removed from $IFACE"

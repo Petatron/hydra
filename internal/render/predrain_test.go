@@ -2,11 +2,13 @@ package render
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"sigs.k8s.io/yaml"
 
@@ -120,14 +122,20 @@ func (g *guest) run(script string) (int, string) {
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		g.t.Fatal(err)
 	}
-	cmd := exec.Command("sh", path)
+	// A run that outlives its budget is a failure, not a hung test.
+	ctx, cancel := context.WithTimeout(g.t.Context(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sh", path)
 	cmd.Env = append(os.Environ(),
 		"PATH="+filepath.Join(g.dir, "bin")+":"+os.Getenv("PATH"),
 		"MANIFEST="+filepath.Join(g.dir, "manifest"),
 		"PARKED="+filepath.Join(g.dir, "parked"),
-		"HANDOVER=1",
+		"BUDGET=4",
 	)
 	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		g.t.Fatalf("the script did not finish within 20 s with a 4 s budget: %s", out)
+	}
 	if ee, ok := err.(*exec.ExitError); ok {
 		return ee.ExitCode(), string(out)
 	}
@@ -251,4 +259,19 @@ func TestPreDrainScriptEndpointsAndReruns(t *testing.T) {
 			t.Fatalf("rerun: %d %s", code, out)
 		}
 	})
+}
+
+// The script's whole run fits inside the provider's timeout, so the hook is
+// never released while it is still changing the node.
+func TestPreDrainScriptFitsTheHookTimeout(t *testing.T) {
+	if preDrainScriptBudget+kubectlRequestTimeout >= preDrainHookTimeout {
+		t.Fatalf("budget %ds + one kubectl request %ds must stay under the hook timeout %ds",
+			preDrainScriptBudget, kubectlRequestTimeout, preDrainHookTimeout)
+	}
+	script := preDrainScript(t)
+	for _, want := range []string{"BUDGET=${BUDGET:-45}", "--request-timeout=3s"} {
+		if !strings.Contains(script, want) {
+			t.Errorf("rendered script lacks %q", want)
+		}
+	}
 }
