@@ -81,3 +81,21 @@ jobs:
         run: make vuln
       - name: actionlint
         run: make actionlint
+
+  # A PR that changes VERSION is a release request (PET-92): merging it tags
+  # and publishes vX.Y.Z. Refuse a VERSION that is malformed or behind the
+  # newest tag before it can reach main.
+  version:
+    permissions:
+      contents: read
+    name: VERSION is releasable
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0   # the check compares VERSION with every v* tag
+      - name: Check VERSION
+        run: |
+          msg="$(hack/version.sh check)"
+          echo "::notice::$msg"
