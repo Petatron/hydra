@@ -27,7 +27,7 @@ const (
 	NodeImage          = "kindest/node:v1.35.8@sha256:07b2536e30b803ed61d1677a79df6115f798ce64c80f9e22f6ed45afd09323c0"
 	CertManagerVersion = "v1.21.1"
 	CAPIVersion        = "v1.14.0"
-	HydraVersion       = "v0.1.0"
+	HydraVersion       = "v0.2.0"
 	// MinHydraVersion is the oldest Hydra provider whose schema accepts what
 	// render produces (preDrainHook, PET-88).
 	MinHydraVersion = "v0.2.0"
@@ -57,7 +57,7 @@ const (
 type Provider struct {
 	// Name is the clusterctl inventory name, e.g. "infrastructure-hydra".
 	Name string
-	// Ref is what clusterctl init takes, e.g. "hydra:v0.1.0".
+	// Ref is what clusterctl init takes, e.g. "hydra:v0.2.0".
 	Ref string
 	// Version is the pinned version.
 	Version string

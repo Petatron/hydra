@@ -312,7 +312,7 @@ into its bootstrap kind cluster and deletes it from there:
 
 `hydra version` prints them: Kubernetes `v1.35.3` (default), Cilium `1.19.1`, kube-vip `v0.8.9`;
 and for `bootstrap`, kind node `v1.35.8`, cert-manager `v1.21.1`, Cluster API `v1.14.0` and the Hydra
-provider `v0.1.0`.
+provider `v0.2.0`.
 They change only in a hydra release.
 
 ## Contributing
