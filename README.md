@@ -202,6 +202,18 @@ current kubectl context is never used.
   not make (`--adopt` allows the latter), and refuses while the cluster is being deleted.
 - `plan` diffs against the live cluster only, and lists objects labelled for the cluster that
   `hydra.yaml` no longer produces (a removed pool, an old template). Neither command deletes them.
+- **Replacing a control-plane machine keeps the API up (PET-88).** The control-plane template asks
+  the provider (v0.2.0 or later) to run `/usr/local/sbin/hydra-pre-drain` in the guest before
+  Cluster API drains the machine. If that node holds the control-plane VIP, the script stops
+  kube-vip there, waits until another control-plane node holds kube-vip's lease, then drops the
+  VIP from the node. That happens before the node's etcd member is removed, so the API stays
+  served throughout.
+- **Existing clusters roll once.** A cluster created with an earlier hydra rolls its control plane
+  once on its next `create`, because the control-plane template changed. That migration roll is
+  not protected: the machines it deletes came from the old template and have no hook. Every roll
+  after it is.
+- **Upgrade the provider first.** Against an older provider, `create` refuses with the field the
+  provider does not know, and changes nothing of that object.
 - `delete` shows which management cluster it will act on before asking, refuses to delete a
   cluster from itself (a self-hosted management cluster), and then removes everything labelled
   for the cluster once Cluster API has torn down its machines. The credentials Secret is kept.
@@ -301,7 +313,7 @@ into its bootstrap kind cluster and deletes it from there:
 
 `hydra version` prints them: Kubernetes `v1.35.3` (default), Cilium `1.19.1`, kube-vip `v0.8.9`;
 and for `bootstrap`, kind node `v1.35.8`, cert-manager `v1.21.1`, Cluster API `v1.14.0` and the Hydra
-provider `v0.1.0`.
+provider `v0.2.0`.
 They change only in a hydra release.
 
 ## Contributing

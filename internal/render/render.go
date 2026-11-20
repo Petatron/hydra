@@ -85,10 +85,16 @@ type data struct {
 	// MHCMaxUnhealthy is how many control-plane machines may be remediated
 	// at once: what etcd can lose and keep quorum, at least 1.
 	MHCMaxUnhealthy int32
-	KubeVIPImage    string
-	CNILabelKey     string
-	ClusterLabelKey string
-	Pools           []pool
+	// PreDrainHookPath, PreDrainHookTimeout, PreDrainScriptBudget and KubectlRequestTimeout are
+	// the control plane's VIP hand-over before drain (PET-88).
+	PreDrainHookPath      string
+	PreDrainHookTimeout   int
+	PreDrainScriptBudget  int
+	KubectlRequestTimeout int
+	KubeVIPImage          string
+	CNILabelKey           string
+	ClusterLabelKey       string
+	Pools                 []pool
 }
 
 type pool struct {
@@ -123,17 +129,21 @@ func newNodeSetupArgs(d *data, controlPlane bool) nodeSetupArgs {
 // config.Parse (defaulted and validated).
 func Render(c *config.ClusterConfig, opts Options) ([]byte, error) {
 	d := &data{
-		ClusterConfig:   c,
-		Spec:            &c.Spec,
-		CLIVersion:      opts.CLIVersion,
-		Name:            c.Metadata.Name,
-		Namespace:       c.Metadata.Namespace,
-		CPName:          ControlPlaneName(c.Metadata.Name),
-		CPSchedulable:   c.Spec.ControlPlane.Schedulable != nil && *c.Spec.ControlPlane.Schedulable,
-		MHCMaxUnhealthy: max(1, (c.Spec.ControlPlane.Replicas-1)/2),
-		KubeVIPImage:    KubeVIPImage,
-		CNILabelKey:     CNILabelKey,
-		ClusterLabelKey: ClusterLabelKey,
+		ClusterConfig:         c,
+		Spec:                  &c.Spec,
+		CLIVersion:            opts.CLIVersion,
+		Name:                  c.Metadata.Name,
+		Namespace:             c.Metadata.Namespace,
+		CPName:                ControlPlaneName(c.Metadata.Name),
+		CPSchedulable:         c.Spec.ControlPlane.Schedulable != nil && *c.Spec.ControlPlane.Schedulable,
+		MHCMaxUnhealthy:       max(1, (c.Spec.ControlPlane.Replicas-1)/2),
+		KubeVIPImage:          KubeVIPImage,
+		PreDrainHookPath:      preDrainHookPath,
+		PreDrainHookTimeout:   preDrainHookTimeout,
+		PreDrainScriptBudget:  preDrainScriptBudget,
+		KubectlRequestTimeout: kubectlRequestTimeout,
+		CNILabelKey:           CNILabelKey,
+		ClusterLabelKey:       ClusterLabelKey,
 	}
 	if ep := c.Spec.Network.ControlPlaneEndpoint; ep != "" {
 		host, port, err := config.SplitEndpoint(ep)
@@ -145,7 +155,7 @@ func Render(c *config.ClusterConfig, opts Options) ([]byte, error) {
 	// The hash inputs are part of the naming contract: changing them renames
 	// every template, which rolls every existing cluster's machines on its next
 	// create. Change them only with a migration note in the release.
-	d.CPTemplateName = d.CPName + "-" + contentHash(c.Metadata.Name+" "+machineShape(c.Spec.ControlPlane.MachineSize))
+	d.CPTemplateName = d.CPName + "-" + contentHash(c.Metadata.Name+" "+machineShape(c.Spec.ControlPlane.MachineSize)+" "+cpPreDrainHook())
 	for _, p := range c.Spec.NodePools {
 		pl := pool{
 			Root:       d,
@@ -187,6 +197,24 @@ func ControlPlaneName(cluster string) string { return cluster + "-cp" }
 
 // CNIName is the CNI ConfigMap's and ClusterResourceSet's name for a cluster.
 func CNIName(cluster string) string { return cluster + "-cilium" }
+
+// The control plane's pre-drain hook (PET-88). The script finishes within
+// preDrainScriptBudget, plus at most one kubectl request it had started
+// (kubectlRequestTimeout), so the provider's timeout never releases the hook
+// while it is still changing the node. The hand-over itself waits for
+// kube-vip's 5 s lease to lapse and be taken: about 7 s on hardware.
+const (
+	preDrainHookPath      = "/usr/local/sbin/hydra-pre-drain"
+	preDrainHookTimeout   = 60
+	preDrainScriptBudget  = 45
+	kubectlRequestTimeout = 3
+)
+
+// cpPreDrainHook is the control-plane template's preDrainHook, as it enters
+// the template's content hash.
+func cpPreDrainHook() string {
+	return fmt.Sprintf("preDrainHook=%s,%d", preDrainHookPath, preDrainHookTimeout)
+}
 
 // machineShape is the content of a HydraMachineTemplate's spec.
 func machineShape(m config.MachineSize) string {

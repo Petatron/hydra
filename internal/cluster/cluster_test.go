@@ -402,7 +402,7 @@ func TestDeleteRemovesUnownedInfrastructureFirst(t *testing.T) {
 	// A create interrupted after the HydraCluster but before the Cluster:
 	// the HydraCluster has no owner, and delete must still remove it.
 	hc := labelled(hydraClusterGVK, "c", "c")
-	tmpl := labelled(schema.GroupVersionKind{Group: "infrastructure.cluster.x-k8s.io", Version: "v1alpha1", Kind: "HydraMachineTemplate"}, "c-cp-1", "c")
+	tmpl := labelled(schema.GroupVersionKind{Group: "infrastructure.cluster.x-k8s.io", Version: "v1alpha1", Kind: kindHydraMachineTemplate}, "c-cp-1", "c")
 	cm := labelled(schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}, "c-cilium", "c")
 	var order []string
 	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(hc, tmpl, cm).WithInterceptorFuncs(interceptor.Funcs{
@@ -493,5 +493,65 @@ func TestDeleteExactlySkipsChangedObjects(t *testing.T) {
 	}
 	if err := c.Get(ctx, client.ObjectKeyFromObject(cm), &live); err != nil {
 		t.Error("the relabelled object must survive")
+	}
+}
+
+// An apply the provider's schema refuses names the field and the provider
+// version hydra needs, instead of only the API server's message.
+func TestApplyNamesAnOldProvider(t *testing.T) {
+	o := obj(schema.GroupVersionKind{Group: infraGroup, Version: infraVersion, Kind: kindHydraMachineTemplate}, "ns", "c-cp-1", nil)
+	refused := errors.New(`failed to create typed patch object (ns/c-cp-1; infrastructure.cluster.x-k8s.io/v1alpha1, Kind=HydraMachineTemplate): .spec.template.spec.preDrainHook: field not declared in schema`)
+	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithInterceptorFuncs(interceptor.Funcs{
+		Apply: func(_ context.Context, _ client.WithWatch, ac runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+			if _, isNS := ac.(interface{ GetName() *string }); isNS {
+				return nil
+			}
+			return refused
+		},
+	}).Build()
+	err := (&Manager{C: c, Out: &bytes.Buffer{}}).Apply(context.Background(), []*unstructured.Unstructured{o}, "c", false)
+	if err == nil || !strings.Contains(err.Error(), ".spec.template.spec.preDrainHook") ||
+		!strings.Contains(err.Error(), "Upgrade the provider first") || !errors.Is(err, refused) {
+		t.Fatalf("got %v", err)
+	}
+	if undeclaredField(errors.New("some other failure")) != "" {
+		t.Error("only a schema refusal names a field")
+	}
+}
+
+// The roll from a template without preDrainHook to one with it is the one
+// that hands nothing over, and only it is reported.
+func TestUnprotectedRoll(t *testing.T) {
+	ctx := context.Background()
+	hmtGVK := schema.GroupVersionKind{Group: infraGroup, Version: infraVersion, Kind: kindHydraMachineTemplate}
+	kcp := func(ref string) *unstructured.Unstructured {
+		return obj(kcpGVK, "ns", "c-cp", map[string]any{"spec": map[string]any{"machineTemplate": map[string]any{"spec": map[string]any{
+			"infrastructureRef": map[string]any{"name": ref}}}}})
+	}
+	tmpl := func(name string, hook bool) *unstructured.Unstructured {
+		spec := map[string]any{"vcpus": int64(2)}
+		if hook {
+			spec["preDrainHook"] = map[string]any{"path": "/usr/local/sbin/hydra-pre-drain"}
+		}
+		return obj(hmtGVK, "ns", name, map[string]any{"spec": map[string]any{"template": map[string]any{"spec": spec}}})
+	}
+	rendered := []*unstructured.Unstructured{kcp("c-cp-new"), tmpl("c-cp-new", true)}
+	for _, tc := range []struct {
+		name string
+		live []client.Object
+		want bool
+	}{
+		{"old template without the hook", []client.Object{kcp("c-cp-old"), tmpl("c-cp-old", false)}, true},
+		{"old template already hooked", []client.Object{kcp("c-cp-old"), tmpl("c-cp-old", true)}, false},
+		{"no change of template", []client.Object{kcp("c-cp-new"), tmpl("c-cp-new", true)}, false},
+		{"a new cluster", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(tc.live...).Build()
+			got, err := (&Manager{C: c}).UnprotectedRoll(ctx, rendered, "ns", "c")
+			if err != nil || got != tc.want {
+				t.Fatalf("got %v, %v; want %v", got, err, tc.want)
+			}
+		})
 	}
 }
