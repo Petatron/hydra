@@ -59,6 +59,10 @@ bump-major: ## Bump VERSION's major number
 check-version: ## Fail unless VERSION is well formed and not behind the newest tag (needs tags fetched)
 	@hack/version.sh check
 
+.PHONY: test-version
+test-version: ## Test hack/version.sh (parsing, tag ordering, bumping, metadata.yaml)
+	bash hack/version_test.sh
+
 .PHONY: e2e
 e2e: ## Bootstrap a kind management cluster and dry-run every example against it (needs Docker)
 	./hack/e2e/run.sh
