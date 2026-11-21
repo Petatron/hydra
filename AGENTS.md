@@ -80,11 +80,12 @@ make actionlint    # lint .github/workflows
 make dist          # release binaries + checksums into dist/
 ```
 
-CI (`.github/workflows/`): `ci.yml` (verify, test, build, lint, govulncheck, actionlint) on every PR;
+CI (`.github/workflows/`): `ci.yml` (verify, test, build, lint, govulncheck, actionlint, and
+`VERSION is releasable`) on every PR;
 `e2e.yml` (the kind e2e) on PRs touching code or examples and on main; `cilium-drift.yml` weekly
-and on renderer changes; `release.yml` publishes binaries on a `v*` tag (manual runs build an
-artifact only). Every job runs on GitHub-hosted runners. Actions are pinned by commit SHA;
-Dependabot keeps them and the Go modules current.
+and on renderer changes; `release.yml` publishes binaries when `VERSION` is untagged on `main` (or
+on a hand-pushed `v*` tag; manual runs build an artifact only). Every job runs on GitHub-hosted
+runners. Actions are pinned by commit SHA; Dependabot keeps them and the Go modules current.
 
 **The Go toolchain is pinned in `go.mod` (`toolchain go1.26.x`).** `actions/setup-go` installs it, so
 CI and release binaries build with the latest patch, not the bare `go 1.26.0` floor; on 1.26.0
@@ -92,6 +93,31 @@ govulncheck finds 30 reachable standard-library vulnerabilities. Bump the patch 
 reports a standard-library fix. A locally installed Go that is newer than the pin (1.27) wins over
 the `toolchain` line, and golangci-lint's typecheck currently breaks on 1.27; run
 `GOTOOLCHAIN=go1.26.11 make lint` (the pinned version, never an older patch) until it is fixed.
+
+## Releasing — bump `VERSION`, never push a tag (PET-92)
+
+**A release is a PR that changes the `VERSION` file.** It holds the version `main` is at, without the
+`v` (`0.3.0`). When a commit reaches `main` with a `VERSION` that has no `v*` tag yet, `release.yml`
+re-runs the checks, builds and stamps the binaries, creates the annotated tag `vX.Y.Z` on that commit,
+and cuts the GitHub Release. Full procedure: [`docs/releasing.md`](docs/releasing.md).
+
+```bash
+make bump-patch      # fixes only
+make bump-minor      # new behaviour, new commands or flags
+make bump-major      # breaking changes to the CLI or hydra.yaml, once past v1
+make check-version   # what CI's "VERSION is releasable" job runs (needs tags: git fetch --tags)
+make test-version    # tests for hack/version.sh; run after changing it (CI runs it too)
+```
+
+- **Never edit `VERSION` by hand except to write or finalise a pre-release** (`X.Y.Z-rc.N`), and
+  never push a `v*` tag yourself — the hand-tag path is a documented fallback for when the workflow
+  is broken, and it is the user's call.
+- **Bumping `VERSION` is a release decision.** Do it only when the user asks for a release, in the
+  release PR or the change's own PR — never as a side effect of other work.
+- `hack/version.sh` is **identical in `hydra` and `cluster-api-provider-hydra`**; change both
+  together.
+- **A provider release does not change the CLI.** The provider `hydra bootstrap` installs is pinned
+  in `internal/bootstrap` (`HydraVersion`, `MinHydraVersion`) and moves only in a reviewed PR.
 
 ## Project context
 

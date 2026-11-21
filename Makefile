@@ -46,6 +46,23 @@ dist: ## Build release binaries for every DIST_PLATFORMS entry, with SHA256 chec
 	done
 	@cd dist && shasum -a 256 hydra-* > checksums.txt && cat checksums.txt
 
+# A release is a PR that changes VERSION (PET-92); see docs/releasing.md.
+.PHONY: bump-patch bump-minor bump-major
+bump-patch: ## Bump VERSION's patch number (fixes only)
+	@hack/version.sh bump patch
+bump-minor: ## Bump VERSION's minor number (new behaviour)
+	@hack/version.sh bump minor
+bump-major: ## Bump VERSION's major number
+	@hack/version.sh bump major
+
+.PHONY: check-version
+check-version: ## Fail unless VERSION is well formed and not behind the newest tag (needs tags fetched)
+	@hack/version.sh check
+
+.PHONY: test-version
+test-version: ## Test hack/version.sh (parsing, tag ordering, bumping, metadata.yaml)
+	bash hack/version_test.sh
+
 .PHONY: e2e
 e2e: ## Bootstrap a kind management cluster and dry-run every example against it (needs Docker)
 	./hack/e2e/run.sh

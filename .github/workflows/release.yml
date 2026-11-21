@@ -1,27 +1,113 @@
 name: Release
 
-# A v* tag publishes a GitHub Release carrying the hydra binaries for
-# linux/darwin x amd64/arm64 and their SHA256 checksums. A manual run builds
-# the same binaries as a workflow artifact and publishes nothing, so the
-# pipeline can be checked without cutting a release.
+# A release is a GitHub Release carrying the hydra binaries for linux/darwin x
+# amd64/arm64 and their SHA256 checksums. It is cut when:
+#
+#   push to main whose VERSION has no tag yet (PET-92) -> tag that commit
+#       vX.Y.Z and release it. The normal way: a PR that changes VERSION
+#       (make bump-patch|minor|major).
+#   push of a v* tag -> release that tag (fallback for a hand-pushed tag).
+#
+# Any other push to main stops after the version job. A manual run builds the
+# binaries as a workflow artifact and publishes nothing, so the pipeline can be
+# checked without cutting a release.
 #
 # Never runs on pull_request: a PR must not be able to publish.
 on:
   push:
+    branches: [main]
     tags: ['v*']
   workflow_dispatch:
 
+# One group for every release run, main pushes and tag pushes alike, so a
+# hand-pushed tag can never overlap a main run releasing the same version and
+# publish over it. GitHub keeps one pending run per group: a newer push
+# replaces a queued (never a running) one. A replaced main run is harmless,
+# the next one sees the same untagged VERSION; a replaced tag run is not,
+# see "Fallback: tagging by hand" in docs/releasing.md.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 permissions: {}
 
 jobs:
+  # Decides whether this run releases, and as which tag. A tag the publish job
+  # creates with GITHUB_TOKEN does not start another workflow run, so the
+  # main-push path cannot release twice. Runs on main are serialised by the
+  # concurrency group, so the next run sees the tag this one created.
+  version:
+    name: Resolve release version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      release: ${{ steps.v.outputs.release }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0   # the existing tags decide whether VERSION is released
+      # Main path, VERSION = vX.Y.Z:
+      #   tag absent                          -> release (fails if not releasable)
+      #   tag on this commit, no Release      -> release (finishes a half-done one)
+      #   tag present, Release exists         -> nothing
+      #   tag on another commit, no Release   -> nothing, warning (recover by hand)
+      - name: Resolve
+        id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            echo "Manual run: building an artifact, releasing nothing"
+            { echo "release=false"; echo "tag="; } >> "$GITHUB_OUTPUT"
+          elif [ "$REF_TYPE" = "tag" ]; then
+            # A hand-pushed tag name is untrusted: refuse anything but vX.Y.Z or
+            # vX.Y.Z-rc.N before it reaches a Make recipe, an image name or a shell.
+            hack/version.sh tag-ok "$REF_NAME"
+            # Runs are serialised, so an existing Release is finished work
+            # (usually the main run's, for the same version): never publish
+            # over it.
+            state="$(hack/version.sh release-state "$REF_NAME")"   # fails on any API error but 404
+            if [ "$state" = present ]; then
+              echo "::warning::$REF_NAME is already released; nothing to do"
+              { echo "release=false"; echo "tag=$REF_NAME"; } >> "$GITHUB_OUTPUT"
+            else
+              echo "Tag push: releasing $REF_NAME"
+              { echo "release=true"; echo "tag=$REF_NAME"; } >> "$GITHUB_OUTPUT"
+            fi
+          else
+            tag="v$(hack/version.sh get)"
+            if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+              state="$(hack/version.sh release-state "$tag")"   # fails on any API error but 404
+              if [ "$state" = present ]; then
+                echo "$tag is released; nothing to release"
+                rel=false
+              elif [ "$(git rev-parse "$tag^{commit}")" = "$GITHUB_SHA" ]; then
+                echo "::warning::$tag names this commit but has no GitHub Release; finishing the release"
+                rel=true
+              else
+                echo "::warning::$tag has no GitHub Release and names another commit; see 'Recovering a release' in docs/releasing.md"
+                rel=false
+              fi
+              { echo "release=$rel"; echo "tag=$tag"; } >> "$GITHUB_OUTPUT"
+            else
+              hack/version.sh check   # untagged must also be releasable
+              echo "::notice::VERSION is untagged; releasing $tag from $GITHUB_SHA"
+              { echo "release=true"; echo "tag=$tag"; } >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
   # Publishing re-runs the checks itself: the PR workflows do not run on tag
   # pushes, so nothing else guarantees the tagged commit passed them.
   verify:
     name: Verify before publishing
+    needs: version
+    if: needs.version.outputs.release == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -41,7 +127,7 @@ jobs:
 
   publish:
     name: Build and publish
-    needs: verify
+    needs: [version, verify]
     runs-on: ubuntu-latest
     permissions:
       contents: write   # create the GitHub Release on a tag
@@ -54,40 +140,80 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Build binaries
-        run: make dist
-
+      # A release is stamped with its tag explicitly: from main the tag does
+      # not exist yet, so `git describe` would give vX.Y.Z-N-g<sha> of the
+      # previous one. A manual run keeps the describe stamp.
+      #
       # The tag name reaches the shell only through the environment, never by
       # ${{ }} expansion into the script, so a tag containing quotes or $()
       # cannot become shell code in a job that can publish releases.
+      - name: Build binaries
+        env:
+          RELEASE: ${{ needs.version.outputs.release }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          if [ "$RELEASE" = "true" ]; then make dist VERSION="$TAG"; else make dist; fi
+
       - name: Check the version stamp
         env:
-          REF_NAME: ${{ github.ref_name }}
-          REF_TYPE: ${{ github.ref_type }}
+          RELEASE: ${{ needs.version.outputs.release }}
+          TAG: ${{ needs.version.outputs.tag }}
         run: |
           got="$(./dist/hydra-linux-amd64 version | head -1)"
           echo "$got"
-          if [ "$REF_TYPE" = "tag" ] && [ "$got" != "hydra $REF_NAME" ]; then
-            echo "::error::binary reports '$got', expected 'hydra $REF_NAME'"
+          if [ "$RELEASE" = "true" ] && [ "$got" != "hydra $TAG" ]; then
+            echo "::error::binary reports '$got', expected 'hydra $TAG'"
             exit 1
           fi
 
       - name: Upload binaries as an artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: hydra-${{ github.ref_name }}
+          name: hydra-${{ needs.version.outputs.release == 'true' && needs.version.outputs.tag || github.ref_name }}
           path: dist/*
           if-no-files-found: error
 
-      # Only a tag *push* publishes. A manual run can also be started on a
-      # tag (ref_type is then "tag" too) and must stay artifact-only.
-      - name: Create GitHub Release
-        if: github.event_name == 'push' && github.ref_type == 'tag'
+      # Annotated, like a hand-made `git tag -a`, and created only after the
+      # binaries built and passed the stamp check. Idempotent for this commit
+      # (the version job finishes a half-done release on re-run); a tag that
+      # already names a different commit is an error, never moved.
+      - name: Tag the release commit
+        if: needs.version.outputs.release == 'true' && github.ref_type != 'tag'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REF_NAME: ${{ github.ref_name }}
+          TAG: ${{ needs.version.outputs.tag }}
         run: |
+          if ref="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" 2>/dev/null)"; then
+            obj="$(echo "$ref" | jq -r .object.sha)"
+            if [ "$(echo "$ref" | jq -r .object.type)" = "tag" ]; then
+              obj="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$obj" --jq .object.sha)"
+            fi
+            [ "$obj" = "$GITHUB_SHA" ] || { echo "::error::$TAG already names $obj, not $GITHUB_SHA"; exit 1; }
+            echo "$TAG already names $GITHUB_SHA"
+            exit 0
+          fi
+          tag_obj="$(gh api "repos/$GITHUB_REPOSITORY/git/tags" \
+            -f tag="$TAG" -f message="$TAG" -f object="$GITHUB_SHA" -f type=commit --jq .sha)"
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$tag_obj" >/dev/null
+          echo "Tagged $GITHUB_SHA as $TAG"
+
+      # A manual run never publishes, even when started on a tag: the version
+      # job reports release=false for every workflow_dispatch.
+      - name: Create GitHub Release
+        if: needs.version.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          # Re-runnable: a Release left by an earlier attempt gets its assets
+          # (re)uploaded instead of failing on "already exists".
+          state="$(hack/version.sh release-state "$TAG")"   # fails on any API error but 404
+          if [ "$state" = present ]; then
+            gh release upload "$TAG" dist/* --clobber -R "$GITHUB_REPOSITORY"
+            echo "$TAG already existed; assets re-uploaded"
+            exit 0
+          fi
           # A tag with a "-" (v0.2.0-rc.1) is a pre-release.
-          set -- --title "$REF_NAME" --generate-notes
-          case "$REF_NAME" in *-*) set -- "$@" --prerelease ;; esac
-          gh release create "$REF_NAME" dist/* "$@"
+          set -- --title "$TAG" --generate-notes --verify-tag -R "$GITHUB_REPOSITORY"
+          case "$TAG" in *-*) set -- "$@" --prerelease ;; esac
+          gh release create "$TAG" dist/* "$@"
