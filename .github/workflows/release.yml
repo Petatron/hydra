@@ -66,10 +66,14 @@ jobs:
             echo "Manual run: building an artifact, releasing nothing"
             { echo "release=false"; echo "tag="; } >> "$GITHUB_OUTPUT"
           elif [ "$REF_TYPE" = "tag" ]; then
+            # A hand-pushed tag name is untrusted: refuse anything but vX.Y.Z or
+            # vX.Y.Z-rc.N before it reaches a Make recipe, an image name or a shell.
+            hack/version.sh tag-ok "$REF_NAME"
             # Runs are serialised, so an existing Release is finished work
             # (usually the main run's, for the same version): never publish
             # over it.
-            if gh release view "$REF_NAME" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            state="$(hack/version.sh release-state "$REF_NAME")"   # fails on any API error but 404
+            if [ "$state" = present ]; then
               echo "::warning::$REF_NAME is already released; nothing to do"
               { echo "release=false"; echo "tag=$REF_NAME"; } >> "$GITHUB_OUTPUT"
             else
@@ -79,7 +83,8 @@ jobs:
           else
             tag="v$(hack/version.sh get)"
             if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
-              if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              state="$(hack/version.sh release-state "$tag")"   # fails on any API error but 404
+              if [ "$state" = present ]; then
                 echo "$tag is released; nothing to release"
                 rel=false
               elif [ "$(git rev-parse "$tag^{commit}")" = "$GITHUB_SHA" ]; then
@@ -202,7 +207,8 @@ jobs:
         run: |
           # Re-runnable: a Release left by an earlier attempt gets its assets
           # (re)uploaded instead of failing on "already exists".
-          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          state="$(hack/version.sh release-state "$TAG")"   # fails on any API error but 404
+          if [ "$state" = present ]; then
             gh release upload "$TAG" dist/* --clobber -R "$GITHUB_REPOSITORY"
             echo "$TAG already existed; assets re-uploaded"
             exit 0
