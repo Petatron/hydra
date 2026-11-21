@@ -98,8 +98,8 @@ the `toolchain` line, and golangci-lint's typecheck currently breaks on 1.27; ru
 
 **A release is a PR that changes the `VERSION` file.** It holds the version `main` is at, without the
 `v` (`0.3.0`). When a commit reaches `main` with a `VERSION` that has no `v*` tag yet, `release.yml`
-re-runs the checks, publishes, creates the annotated tag `vX.Y.Z` on that commit and cuts the GitHub
-Release. Full procedure: [`docs/releasing.md`](docs/releasing.md).
+re-runs the checks, builds and stamps the binaries, creates the annotated tag `vX.Y.Z` on that commit,
+and cuts the GitHub Release. Full procedure: [`docs/releasing.md`](docs/releasing.md).
 
 ```bash
 make bump-patch      # fixes only

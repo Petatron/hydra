@@ -54,16 +54,28 @@ git push origin vX.Y.Z
 ```
 
 Then set `VERSION` to that version in a PR: until then it is behind the newest tag and every PR's
-`VERSION is releasable` check fails. Never hand-tag a version `VERSION` already names but has not
-released yet: the `main` run would build it from another commit and then refuse at its tag step.
+`VERSION is releasable` check fails.
+
+**Never hand-tag a version that `VERSION` already names but has not released yet.** A tag push runs
+in its own concurrency group, so it races the `main` run:
+
+- **Tag on another commit.** The `main` run refuses at its tag step, before it creates the Release.
+  The tag run releases the hand-tagged commit.
+- **Tag on the same commit.** The `main` run finds its own tag and carries on to create the
+  Release, and so does the tag run. Whichever `--clobber` upload lands last wins, so the assets and
+  their checksums can change under a published Release.
 
 ## Recovering a release
 
 The tag is the lock: once `vX.Y.Z` names a commit, only that commit can produce the release.
 
-- **The run failed after the tag was created.** Re-run it, with either "Re-run failed jobs" or
-  "Re-run all jobs". The version job sees the tag on this commit with no Release and finishes
-  the release. If a Release already exists, its assets are re-uploaded.
+- **The run failed after the tag was created, and there is no Release yet.** Use either re-run
+  button. "Re-run all jobs" works because the version job sees the tag on this commit with no
+  Release and finishes the release.
+- **The Release exists but its assets are incomplete.** This happens when `gh release create`
+  created it and then failed attaching the binaries. Use **"Re-run failed jobs"**: it keeps the
+  original decision to release and re-uploads the assets with `--clobber`. "Re-run all jobs" sees
+  the Release and treats the version as done.
 - **The tag names a commit that can never build**, or a newer commit's run warns
   "`vX.Y.Z` has no GitHub Release and names another commit". Delete the tag and let the next
   `main` run release from its own commit, or bump `VERSION` again:
