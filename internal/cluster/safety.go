@@ -79,12 +79,25 @@ func (st ClusterState) CheckOwner(cluster string, adopt bool) error {
 // top of whatever runs there. kubectl is the command prefix that reaches the
 // management cluster, so the printed fix never relies on the current context.
 func (st ClusterState) CNIConflict(hydraCNI bool, kubectl string) string {
-	if !hydraCNI || !st.Exists || st.object == nil || st.object.GetLabels()[render.CNILabelKey] != "" {
+	if !hydraCNI || !st.Exists || st.object == nil || HydraCNISelected(st.object) {
 		return ""
 	}
 	ns, name := st.object.GetNamespace(), st.object.GetName()
-	return fmt.Sprintf("cluster %s/%s exists without the %s label, so hydra's ClusterResourceSet does not select it, and cni: %s would apply hydra's Cilium on top of whatever CNI runs there. If that CNI is managed elsewhere, set spec.network.cni: %s. If it is hydra's own Cilium and only the label was removed, or no CNI runs there yet, put the label back (the set applies once, so it never installs a second copy over its own): %s label cluster -n %s %s %s=%s",
-		ns, name, render.CNILabelKey, config.CNIHydra, config.CNIExternal, kubectl, ns, name, render.CNILabelKey, name)
+	has := "exists without the " + render.CNILabelKey + " label"
+	if v := st.object.GetLabels()[render.CNILabelKey]; v != "" {
+		// Another value selects some other set (or none), never this
+		// cluster's: hydra's apply would retarget it onto this one.
+		has = fmt.Sprintf("carries the %s label with value %q, not %q", render.CNILabelKey, v, name)
+	}
+	return fmt.Sprintf("cluster %s/%s %s, so hydra's ClusterResourceSet does not select it, and cni: %s would apply hydra's Cilium on top of whatever CNI runs there. If that CNI is managed elsewhere, set spec.network.cni: %s. If it is hydra's own Cilium and only the label was removed, or no CNI runs there yet, set the label (the set applies once, so it never installs a second copy over its own): %s label --overwrite cluster -n %s %s %s=%s",
+		ns, name, has, config.CNIHydra, config.CNIExternal, kubectl, ns, name, render.CNILabelKey, name)
+}
+
+// HydraCNISelected reports whether hydra's CNI ClusterResourceSet for this
+// Cluster selects it: the set's selector is the CNI label with the cluster's
+// own name as its value, so any other value selects nothing of hydra's here.
+func HydraCNISelected(cl *unstructured.Unstructured) bool {
+	return cl.GetLabels()[render.CNILabelKey] == cl.GetName()
 }
 
 // CNILabelLeft explains a CNI label still on the Cluster although hydra.yaml

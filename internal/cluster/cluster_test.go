@@ -589,6 +589,15 @@ func TestStatusAndWaitWithExternalCNI(t *testing.T) {
 	if err := m.WaitAvailable(ctx, "ns", "c", 5*time.Second); err != nil {
 		t.Errorf("wait: %v", err)
 	}
+	// A label whose value is not the cluster's name selects none of hydra's
+	// sets here: the CNI is external, and no binding is read for it.
+	cl.SetLabels(map[string]string{render.CNILabelKey: "other"})
+	if err := c.Update(ctx, cl); err != nil {
+		t.Fatal(err)
+	}
+	if s, err := m.Status(ctx, "ns", "c"); err != nil || !s.CNIExternal {
+		t.Errorf("stale label: %+v, %v", s, err)
+	}
 }
 
 func TestCNIConflict(t *testing.T) {
@@ -596,12 +605,15 @@ func TestCNIConflict(t *testing.T) {
 	labelled := obj(clusterGVK, "ns", "c", nil)
 	labelled.SetLabels(map[string]string{render.CNILabelKey: "c"})
 	handBuilt := obj(clusterGVK, "ns", "h", nil)
-	m := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(labelled, handBuilt).Build()}
+	stale := obj(clusterGVK, "ns", "s", nil)
+	stale.SetLabels(map[string]string{render.CNILabelKey: "other"})
+	m := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(labelled, handBuilt, stale).Build()}
 	for _, tc := range []struct {
 		name     string
 		hydraCNI bool
 		conflict bool
 	}{
+		{"s", true, true},       // the label selects some other set: hydra's would be retargeted here
 		{"c", true, false},      // hydra installed its CNI: rerunning create is fine
 		{"h", true, true},       // CNI from elsewhere: hydra's would land on top
 		{"h", false, false},     // cni: external says so
@@ -615,7 +627,10 @@ func TestCNIConflict(t *testing.T) {
 		if (msg != "") != tc.conflict {
 			t.Errorf("%s hydraCNI=%v: got %q", tc.name, tc.hydraCNI, msg)
 		}
-		if tc.conflict && (!strings.Contains(msg, "spec.network.cni: external") || !strings.Contains(msg, "kubectl --kubeconfig m.yaml label cluster -n ns h cni.hydra.io/cilium=h")) {
+		if tc.conflict && (!strings.Contains(msg, "spec.network.cni: external") || !strings.Contains(msg, "kubectl --kubeconfig m.yaml label --overwrite cluster -n ns "+tc.name+" cni.hydra.io/cilium="+tc.name)) {
+			t.Errorf("message does not name both fixes: %q", msg)
+		}
+		if tc.name == "s" && !strings.Contains(msg, `with value "other", not "s"`) {
 			t.Errorf("message does not name both fixes: %q", msg)
 		}
 	}

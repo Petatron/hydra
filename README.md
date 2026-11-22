@@ -136,17 +136,18 @@ person owns the CNI, including a cluster built before hydra managed it.
 - The external CNI must use `podCIDR` as its pod address pool: kubeadm is given that CIDR either way.
 - Nodes stay NotReady until the CNI is installed, so `create` keeps waiting until it is. Install it
   while `create` waits, or pass `--wait=false` and follow with `status`.
-- `create` refuses `cni: hydra` for an existing Cluster that lacks the CNI label, because hydra's
-  ClusterResourceSet would then install Cilium on top of the CNI already there. `plan` warns about
-  the same case.
+- `create` refuses `cni: hydra` for an existing Cluster that lacks the CNI label (or carries it with
+  a value other than the cluster's name, which no hydra set of this cluster selects), because
+  hydra's ClusterResourceSet would then install Cilium on top of the CNI already there. `plan` warns
+  about the same case.
 - Switching a hydra-installed cluster to `external` leaves Cilium running: the ClusterResourceSet
   applied it once and never removes it. Whatever takes the CNI over must adopt that Cilium or
   replace it deliberately; installing a second CNI next to it breaks pod networking. `plan` and
   `create` list the ConfigMap and ClusterResourceSet as no longer rendered, and leave them in place.
   Server-side apply drops the Cluster's `cni.hydra.io/cilium` label only when hydra's field manager
   is its sole owner. A label that stays keeps the old ClusterResourceSet selecting the cluster, so
-  `create` fails after applying (rerunning is safe) and `plan` warns when its dry-run keeps the
-  label; both print the `kubectl label` command that removes it, aimed at the management cluster.
+  `create` fails after applying (rerunning is safe), `upgrade` refuses before rolling any machine,
+  and `plan` warns when its dry-run keeps the label; all three print the `kubectl label` command that removes it, aimed at the management cluster.
 
 Machine and bootstrap templates are named after their content (`<cluster>-cp-1a2b3c4d`), so
 changing a machine's size or a pool's labels produces a new template and a rolling replacement

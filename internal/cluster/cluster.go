@@ -409,7 +409,7 @@ func (m *Manager) Status(ctx context.Context, namespace, name string) (Summary, 
 		return s, err
 	}
 	s.Exists = true
-	s.CNIExternal = cl.GetLabels()[render.CNILabelKey] == ""
+	s.CNIExternal = !HydraCNISelected(cl)
 	if cl.GetDeletionTimestamp() != nil {
 		s.Terminating = true
 		if c := condition(cl, "Deleting"); c != nil {

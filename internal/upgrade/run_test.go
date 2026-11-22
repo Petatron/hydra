@@ -437,6 +437,37 @@ func TestRerunResumesMidWorkers(t *testing.T) {
 	}
 }
 
+// Switching to cni: external while the Cluster keeps hydra's CNI label (another
+// field manager owns it, so the dry-run leaves it) is refused: the old
+// ClusterResourceSet still selects the cluster.
+func TestRunRefusesALeftoverCNILabel(t *testing.T) {
+	cfg := loadConfig(t, "v1.35.3")
+	fc := newFakeCluster(t, cfg, "v1.35.3", nil)
+	external := loadConfig(t, "v1.35.3")
+	external.Spec.Network.CNI, external.Spec.Network.MTU = config.CNIExternal, 0
+	u, out := fc.upgrader(external, okRemote)
+	u.Kubectl = "kubectl --kubeconfig m.yaml"
+	// The server keeps a label another field manager also owns: the dry-run
+	// result still carries it, so the Cluster shows no change.
+	u.M.C = interceptor.NewClient(fc.c.(client.WithWatch), interceptor.Funcs{
+		Patch: func(_ context.Context, _ client.WithWatch, o client.Object, _ client.Patch, _ ...client.PatchOption) error {
+			if o.GetObjectKind().GroupVersionKind().Kind == "Cluster" {
+				l := o.GetLabels()
+				l[render.CNILabelKey] = o.GetName()
+				o.SetLabels(l)
+			}
+			return nil
+		},
+	})
+	err := u.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "still carries the cni.hydra.io/cilium label") || !strings.Contains(err.Error(), "kubectl --kubeconfig m.yaml label cluster -n ns c cni.hydra.io/cilium-") {
+		t.Fatalf("got %v\n%s", err, out)
+	}
+	if len(fc.applied) != 0 {
+		t.Fatalf("applied %v", fc.applied)
+	}
+}
+
 // hydra.yaml edits beyond the version are refused before anything is
 // applied: upgrade carries only the version.
 func TestRunRefusesOtherEdits(t *testing.T) {

@@ -839,7 +839,7 @@ func TestCluCreateRefusesHydraCNIOnAForeignCNI(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out, "! cni: create refuses this: cluster default/hydra-mgmt exists without the cni.hydra.io/cilium label") ||
-		!strings.Contains(out, "kubectl --kubeconfig /x label cluster -n default hydra-mgmt cni.hydra.io/cilium=hydra-mgmt") {
+		!strings.Contains(out, "kubectl --kubeconfig /x label --overwrite cluster -n default hydra-mgmt cni.hydra.io/cilium=hydra-mgmt") {
 		t.Errorf("plan does not warn with a runnable fix:\n%s", out)
 	}
 }
