@@ -58,7 +58,7 @@ the target. --dry-run prints the next stage and its changes.`,
 			defer stop()
 			u := &upgrade.Upgrader{
 				M: t.m, Config: cfg, Render: renderObjects, Target: target,
-				Timeout: timeout, Out: cmd.ErrOrStderr(),
+				Timeout: timeout, Out: cmd.ErrOrStderr(), Kubectl: t.kubectl(file),
 			}
 			if !skipRemote {
 				u.Remote = newRemote()

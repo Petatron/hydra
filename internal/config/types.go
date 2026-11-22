@@ -13,6 +13,12 @@ const (
 	Kind = "ClusterConfig"
 )
 
+// CNI modes. See NetworkSpec.CNI.
+const (
+	CNIHydra    = "hydra"
+	CNIExternal = "external"
+)
+
 // Node bootstrap modes. See ImageSpec.Bootstrap.
 const (
 	BootstrapPackages = "packages"
@@ -101,7 +107,15 @@ type NetworkSpec struct {
 	PodCIDR string `json:"podCIDR,omitempty"`
 	// ServiceCIDR. Default 10.96.0.0/12.
 	ServiceCIDR string `json:"serviceCIDR,omitempty"`
-	// MTU for Cilium. Default 1500.
+	// CNI is who installs the cluster's network plugin:
+	//   hydra     hydra installs Cilium through a ClusterResourceSet once the
+	//             API is up (the default)
+	//   external  hydra installs no CNI. Something else must (Argo CD, Helm, a
+	//             person), with a pod CIDR matching PodCIDR. Nodes stay
+	//             NotReady, and create keeps waiting, until it does.
+	CNI string `json:"cni,omitempty"`
+	// MTU for hydra's Cilium. Default 1500. Only valid with CNI hydra: an
+	// external CNI takes its MTU from its own configuration.
 	MTU int `json:"mtu,omitempty"`
 	// NodeInterface is the guest interface whose address a node registers
 	// with. Default enp1s0, the first virtio NIC.

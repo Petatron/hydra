@@ -71,6 +71,23 @@ type target struct {
 	kubeconfig []byte
 }
 
+// defaultConfigFile is --file's default, for commands printed in messages.
+const defaultConfigFile = "hydra.yaml"
+
+// kubectl is the kubectl invocation that reaches this management cluster, for
+// commands printed in messages: hydra never uses the current context, so the
+// commands it prints must not either. The bootstrap kind cluster's kubeconfig
+// exists only in memory, so it is written first.
+func (t *target) kubectl(configFile string) string {
+	if t.path != "" {
+		return "kubectl --kubeconfig " + t.path
+	}
+	if configFile == "" {
+		configFile = defaultConfigFile
+	}
+	return fmt.Sprintf("hydra bootstrap kubeconfig -f %s > bootstrap.kubeconfig && kubectl --kubeconfig bootstrap.kubeconfig", configFile)
+}
+
 // connectManagement builds the management-cluster client; tests replace it.
 var connectManagement = cluster.Connect
 
@@ -118,6 +135,10 @@ func newCreateCommand() *cobra.Command {
 cluster (field manager "hydra"), waits until Cluster API reports the cluster
 Available with its CNI applied, and writes the cluster's kubeconfig.
 
+With spec.network.cni: external, hydra installs no CNI and the nodes stay
+NotReady until something else does, so the wait ends only once it has. Install
+it while create waits, or pass --wait=false and follow with status.
+
 Progress is what the controllers report. --timeout ends the wait, not the
 creation: the controllers keep going, and running create again picks up where
 things are. Rerunning create is always safe; applying the same objects changes
@@ -138,7 +159,7 @@ used.`,
 			}
 			ctx, stop := interruptible(cmd)
 			defer stop()
-			co := createOptions{kubeconfigOut: kubeconfigOut, timeout: timeout, wait: wait, adopt: adopt, forceConflicts: forceConflicts}
+			co := createOptions{kubeconfigOut: kubeconfigOut, configFile: file, timeout: timeout, wait: wait, adopt: adopt, forceConflicts: forceConflicts}
 			if selfHosted {
 				if mgmt != "" {
 					return fmt.Errorf("--self-hosted builds its own bootstrap cluster; it cannot be combined with --management-kubeconfig (use pivot for that)")
@@ -176,7 +197,9 @@ used.`,
 }
 
 type createOptions struct {
-	kubeconfigOut               string
+	kubeconfigOut string
+	// configFile is hydra.yaml's path, for commands printed in messages.
+	configFile                  string
 	timeout                     time.Duration
 	wait, adopt, forceConflicts bool
 }
@@ -210,6 +233,9 @@ func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.C
 	if err := m.CheckOwnership(ctx, objs, name, adopt); err != nil {
 		return "", err
 	}
+	if msg := st.CNIConflict(render.HydraCNI(cfg), t.kubectl(o.configFile)); msg != "" {
+		return "", errors.New(msg)
+	}
 	if drift, err := upgrade.Drift(ctx, m.C, cfg); err != nil {
 		return "", err
 	} else if len(drift) > 0 {
@@ -222,6 +248,19 @@ func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.C
 	}
 	if err := m.Apply(ctx, objs, name, forceConflicts); err != nil {
 		return "", err
+	}
+	if !render.HydraCNI(cfg) {
+		// A label that survives the apply keeps hydra's ClusterResourceSet
+		// selecting the cluster, and it installs hydra's Cilium if it has not
+		// applied yet. The apply has landed and rerunning is safe; failing is
+		// what makes the leftover selector impossible to miss.
+		after, err := m.State(ctx, ns, name)
+		if err != nil {
+			return "", fmt.Errorf("applied, but could not re-read the Cluster to check that its CNI label is gone (rerun create): %w", err)
+		}
+		if msg := after.CNILabelLeft(false, t.kubectl(o.configFile)); msg != "" {
+			return "", fmt.Errorf("applied, but %s", msg)
+		}
 	}
 	switch orphans, err := m.Orphans(ctx, objs, ns, name); {
 	case err != nil:
@@ -292,6 +331,18 @@ anything stored locally.`,
 				return err
 			} else if unprotected {
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "! note: %s\n", cluster.UnprotectedRollNote)
+			}
+			st, err := t.m.State(contextOf(cmd), cfg.Metadata.Namespace, cfg.Metadata.Name)
+			if err != nil {
+				return err
+			}
+			if msg := st.CNIConflict(render.HydraCNI(cfg), t.kubectl(file)); msg != "" {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "! cni: create refuses this: %s\n", msg)
+			}
+			// Judge the label by what the apply would leave: when hydra is its
+			// only manager the dry-run already drops it, and the diff says so.
+			if msg := st.Planned(changes).CNILabelLeft(render.HydraCNI(cfg), t.kubectl(file)); msg != "" {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "! cni: %s\n", msg)
 			}
 			drift, err := upgrade.Drift(contextOf(cmd), t.m.C, cfg)
 			if err != nil {

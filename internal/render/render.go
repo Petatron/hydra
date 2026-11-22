@@ -41,7 +41,10 @@ const (
 	ClusterLabelKey = "hydra.io/cluster"
 )
 
-const kindConfigMap = "ConfigMap"
+const (
+	kindConfigMap          = "ConfigMap"
+	kindClusterResourceSet = "ClusterResourceSet"
+)
 
 // Sentinels hack/gen-cilium.sh renders in place of the per-cluster values.
 const (
@@ -92,9 +95,11 @@ type data struct {
 	PreDrainScriptBudget  int
 	KubectlRequestTimeout int
 	KubeVIPImage          string
-	CNILabelKey           string
-	ClusterLabelKey       string
-	Pools                 []pool
+	// CNILabelKey is empty when hydra installs no CNI (cni: external), so
+	// the Cluster carries no label for a ClusterResourceSet to select.
+	CNILabelKey     string
+	ClusterLabelKey string
+	Pools           []pool
 }
 
 type pool struct {
@@ -142,8 +147,10 @@ func Render(c *config.ClusterConfig, opts Options) ([]byte, error) {
 		PreDrainHookTimeout:   preDrainHookTimeout,
 		PreDrainScriptBudget:  preDrainScriptBudget,
 		KubectlRequestTimeout: kubectlRequestTimeout,
-		CNILabelKey:           CNILabelKey,
 		ClusterLabelKey:       ClusterLabelKey,
+	}
+	if HydraCNI(c) {
+		d.CNILabelKey = CNILabelKey
 	}
 	if ep := c.Spec.Network.ControlPlaneEndpoint; ep != "" {
 		host, port, err := config.SplitEndpoint(ep)
@@ -184,13 +191,19 @@ func Render(c *config.ClusterConfig, opts Options) ([]byte, error) {
 	if err := tmpl.Execute(&out, d); err != nil {
 		return nil, fmt.Errorf("rendering cluster manifests: %w", err)
 	}
-	cni, err := renderCNI(c)
-	if err != nil {
-		return nil, err
+	if HydraCNI(c) {
+		cni, err := renderCNI(c)
+		if err != nil {
+			return nil, err
+		}
+		out.Write(cni)
 	}
-	out.Write(cni)
 	return out.Bytes(), nil
 }
+
+// HydraCNI reports whether hydra installs c's CNI, rather than something
+// else (cni: external).
+func HydraCNI(c *config.ClusterConfig) bool { return c.Spec.Network.CNI == config.CNIHydra }
 
 // ControlPlaneName is the KubeadmControlPlane's name for a cluster.
 func ControlPlaneName(cluster string) string { return cluster + "-cp" }
@@ -263,7 +276,7 @@ func renderCNI(c *config.ClusterConfig) ([]byte, error) {
 	}
 	crs := map[string]any{
 		"apiVersion": "addons.cluster.x-k8s.io/v1beta2",
-		"kind":       "ClusterResourceSet",
+		"kind":       kindClusterResourceSet,
 		"metadata": map[string]any{
 			"name":      name,
 			"namespace": c.Metadata.Namespace,

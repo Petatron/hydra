@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Petatron/hydra/internal/render"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -369,6 +370,7 @@ func TestStatusTerminatingAndMissingControlPlane(t *testing.T) {
 
 func TestStatusReadErrors(t *testing.T) {
 	cl := obj(clusterGVK, "ns", "c", nil)
+	cl.SetLabels(map[string]string{render.CNILabelKey: "c"})
 	kcp := obj(kcpGVK, "ns", "c-cp", nil)
 	failOn := func(getKind, listKind string) client.Client {
 		return fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cl, kcp).WithInterceptorFuncs(interceptor.Funcs{

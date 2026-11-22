@@ -552,7 +552,8 @@ func (p *Pivot) move(ctx context.Context) error {
 // verify waits until the target manages the cluster: the Cluster is Available
 // and rolled out there, every HydraMachine has taken its VM over (owner-uid
 // rewritten to its new UID) and is Ready, the CNI ClusterResourceSet came
-// along, and the source no longer holds the Cluster.
+// along (when hydra installs the CNI), and the source no longer holds the
+// Cluster.
 func (p *Pivot) verify(parent context.Context, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
@@ -606,7 +607,7 @@ func (p *Pivot) verifyOnce(ctx context.Context) error {
 	// Being deleted, or a CNI only present as the moved ClusterResourceSet
 	// without its binding applied, is no management path to leave the
 	// cluster on: the bootstrap cluster is deleted once this passes.
-	if !st.Exists || st.Terminating || st.Available != cluster.ConditionTrue || !st.RolledOut || !st.CNIApplied {
+	if !st.Exists || st.Terminating || st.Available != cluster.ConditionTrue || !st.RolledOut || !st.CNIReady() {
 		return fmt.Errorf("the Cluster on %s: %s", p.Target.Name, st.Line())
 	}
 	if cl, err := p.getCluster(ctx, p.Target.C); err != nil {
@@ -628,6 +629,9 @@ func (p *Pivot) verifyOnce(ctx context.Context) error {
 		if !conditionTrue(&m, "Ready") {
 			return fmt.Errorf("HydraMachine %s is not Ready", m.GetName())
 		}
+	}
+	if st.CNIExternal {
+		return nil // no hydra ClusterResourceSet to carry
 	}
 	crs := &unstructured.Unstructured{}
 	crs.SetGroupVersionKind(crsGVK)

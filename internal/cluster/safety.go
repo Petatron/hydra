@@ -19,6 +19,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/Petatron/hydra/internal/config"
 	"github.com/Petatron/hydra/internal/render"
 )
 
@@ -68,6 +69,67 @@ func (st ClusterState) CheckOwner(cluster string, adopt bool) error {
 		return nil
 	}
 	return checkOwner(st.object, cluster, adopt)
+}
+
+// CNIConflict explains why applying hydra's CNI to an existing Cluster would
+// be wrong, or returns "". A Cluster without the CNI label never had hydra's
+// ClusterResourceSet select it (or had the label removed), so its CNI may have
+// come from somewhere else (a cluster built by hand, or created with cni:
+// external). Adding the label now would make the set apply hydra's Cilium on
+// top of whatever runs there. kubectl is the command prefix that reaches the
+// management cluster, so the printed fix never relies on the current context.
+func (st ClusterState) CNIConflict(hydraCNI bool, kubectl string) string {
+	if !hydraCNI || !st.Exists || st.object == nil || HydraCNISelected(st.object) {
+		return ""
+	}
+	ns, name := st.object.GetNamespace(), st.object.GetName()
+	has := "exists without the " + render.CNILabelKey + " label"
+	if v := st.object.GetLabels()[render.CNILabelKey]; v != "" {
+		// Another value selects some other set (or none), never this
+		// cluster's: hydra's apply would retarget it onto this one.
+		has = fmt.Sprintf("carries the %s label with value %q, not %q", render.CNILabelKey, v, name)
+	}
+	return fmt.Sprintf("cluster %s/%s %s, so hydra's ClusterResourceSet does not select it, and cni: %s would apply hydra's Cilium on top of whatever CNI runs there. If that CNI is managed elsewhere, set spec.network.cni: %s. If it is hydra's own Cilium and only the label was removed, or no CNI runs there yet, set the label (the set applies once, so it never installs a second copy over its own): %s label --overwrite cluster -n %s %s %s=%s",
+		ns, name, has, config.CNIHydra, config.CNIExternal, kubectl, ns, name, render.CNILabelKey, name)
+}
+
+// HydraCNISelected reports whether hydra's CNI ClusterResourceSet for this
+// Cluster selects it: the set's selector is the CNI label with the cluster's
+// own name as its value, so any other value selects nothing of hydra's here.
+func HydraCNISelected(cl *unstructured.Unstructured) bool {
+	return cl.GetLabels()[render.CNILabelKey] == cl.GetName()
+}
+
+// CNILabelLeft explains a CNI label still on the Cluster although hydra.yaml
+// says cni: external, or returns "". Server-side apply removes a label only
+// when hydra's field manager is its sole owner; one also owned by another
+// manager (a cluster built by hand and adopted, or created by an older hydra)
+// stays, and keeps hydra's ClusterResourceSet selecting the cluster: if that
+// set has not applied yet, it still installs hydra's Cilium. kubectl is the
+// command prefix that reaches the management cluster.
+func (st ClusterState) CNILabelLeft(hydraCNI bool, kubectl string) string {
+	if hydraCNI || !st.Exists || st.object == nil || st.object.GetLabels()[render.CNILabelKey] == "" {
+		return ""
+	}
+	ns, name := st.object.GetNamespace(), st.object.GetName()
+	return fmt.Sprintf("cluster %s/%s still carries the %s label although hydra.yaml says cni: %s, because another field manager also owns it; it keeps hydra's ClusterResourceSet selecting the cluster, which installs hydra's Cilium if it has not applied yet. Remove it, then delete the orphaned %s-cilium ClusterResourceSet and ConfigMap: %s label cluster -n %s %s %s-",
+		ns, name, render.CNILabelKey, config.CNIExternal, name, kubectl, ns, name, render.CNILabelKey)
+}
+
+// Planned is the state create would leave the Cluster in: the server's
+// dry-run result from Plan when it changes the Cluster, the live object
+// otherwise.
+func (st ClusterState) Planned(changes []Change) ClusterState {
+	if st.object == nil {
+		return st
+	}
+	for _, ch := range changes {
+		if r := ch.Result; r != nil && r.GroupVersionKind() == clusterGVK && r.GetNamespace() == st.object.GetNamespace() && r.GetName() == st.object.GetName() {
+			st.object = r
+			return st
+		}
+	}
+	return st
 }
 
 // State reads the Cluster object's existence, deletion and endpoint.

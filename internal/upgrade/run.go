@@ -74,6 +74,16 @@ type Upgrader struct {
 	Out     io.Writer
 	// Poll is the interval between reads while waiting.
 	Poll time.Duration
+	// Kubectl is the kubectl invocation that reaches the management
+	// cluster, for commands printed in refusals ("kubectl" if empty).
+	Kubectl string
+}
+
+func (u *Upgrader) kubectl() string {
+	if u.Kubectl != "" {
+		return u.Kubectl
+	}
+	return "kubectl"
 }
 
 func (u *Upgrader) logf(format string, args ...any) {
@@ -334,6 +344,17 @@ func (u *Upgrader) checkInSync(ctx context.Context, l Live) error {
 	if err != nil {
 		return err
 	}
+	// With cni: external, a CNI label the apply would leave (another field
+	// manager owns it too) is no change to the dry-run, yet it keeps hydra's
+	// old ClusterResourceSet selecting the cluster. create refuses to finish
+	// with it there; upgrade must not roll machines past it either.
+	st, err := u.M.State(ctx, u.ns(), u.name())
+	if err != nil {
+		return err
+	}
+	if msg := st.Planned(changes).CNILabelLeft(render.HydraCNI(u.Config), u.kubectl()); msg != "" {
+		return &Refusal{Reason: msg, Fix: "remove the label as shown, then run upgrade again", Always: true}
+	}
 	if len(changes) == 0 {
 		return nil
 	}
@@ -427,7 +448,7 @@ func (u *Upgrader) Next(ctx context.Context) (Live, Stage, error) {
 	}
 	err = u.checkInSync(ctx, l)
 	var r *Refusal
-	if s.Kind == Done && errors.As(err, &r) {
+	if s.Kind == Done && errors.As(err, &r) && !r.Always {
 		// The upgrade is finished; other edits are create's to apply, once
 		// hydra.yaml says the new version. Say so instead of claiming the
 		// file matches.

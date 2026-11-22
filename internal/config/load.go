@@ -165,7 +165,10 @@ func (c *ClusterConfig) applyDefaults() {
 	if n.ServiceCIDR == "" {
 		n.ServiceCIDR = DefaultServiceCIDR
 	}
-	if n.MTU == 0 {
+	if n.CNI == "" {
+		n.CNI = CNIHydra
+	}
+	if n.MTU == 0 && n.CNI == CNIHydra {
 		n.MTU = DefaultMTU
 	}
 	if n.NodeInterface == "" {
@@ -271,8 +274,17 @@ func (c *ClusterConfig) validateNetwork(errs *fieldErrors) {
 		n.validateManagedNetwork(errs)
 	}
 	c.validateCIDRs(errs)
-	if n.MTU < 1280 || n.MTU > 9000 {
-		errs.add("spec.network.mtu", "must be between 1280 and 9000, got %d", n.MTU)
+	switch n.CNI {
+	case CNIHydra:
+		if n.MTU < 1280 || n.MTU > 9000 {
+			errs.add("spec.network.mtu", "must be between 1280 and 9000, got %d", n.MTU)
+		}
+	case CNIExternal:
+		if n.MTU != 0 {
+			errs.add("spec.network.mtu", "sets the MTU of hydra's Cilium, which cni %q does not install; set it in the external CNI's own configuration", CNIExternal)
+		}
+	default:
+		errs.add("spec.network.cni", "must be %q or %q, got %q", CNIHydra, CNIExternal, n.CNI)
 	}
 	if !interfaceRE.MatchString(n.NodeInterface) {
 		errs.add("spec.network.nodeInterface", "must be a Linux interface name, got %q", n.NodeInterface)
