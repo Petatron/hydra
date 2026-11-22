@@ -71,6 +71,23 @@ type target struct {
 	kubeconfig []byte
 }
 
+// defaultConfigFile is --file's default, for commands printed in messages.
+const defaultConfigFile = "hydra.yaml"
+
+// kubectl is the kubectl invocation that reaches this management cluster, for
+// commands printed in messages: hydra never uses the current context, so the
+// commands it prints must not either. The bootstrap kind cluster's kubeconfig
+// exists only in memory, so it is written first.
+func (t *target) kubectl(configFile string) string {
+	if t.path != "" {
+		return "kubectl --kubeconfig " + t.path
+	}
+	if configFile == "" {
+		configFile = defaultConfigFile
+	}
+	return fmt.Sprintf("hydra bootstrap kubeconfig -f %s > bootstrap.kubeconfig && kubectl --kubeconfig bootstrap.kubeconfig", configFile)
+}
+
 // connectManagement builds the management-cluster client; tests replace it.
 var connectManagement = cluster.Connect
 
@@ -142,7 +159,7 @@ used.`,
 			}
 			ctx, stop := interruptible(cmd)
 			defer stop()
-			co := createOptions{kubeconfigOut: kubeconfigOut, timeout: timeout, wait: wait, adopt: adopt, forceConflicts: forceConflicts}
+			co := createOptions{kubeconfigOut: kubeconfigOut, configFile: file, timeout: timeout, wait: wait, adopt: adopt, forceConflicts: forceConflicts}
 			if selfHosted {
 				if mgmt != "" {
 					return fmt.Errorf("--self-hosted builds its own bootstrap cluster; it cannot be combined with --management-kubeconfig (use pivot for that)")
@@ -180,7 +197,9 @@ used.`,
 }
 
 type createOptions struct {
-	kubeconfigOut               string
+	kubeconfigOut string
+	// configFile is hydra.yaml's path, for commands printed in messages.
+	configFile                  string
 	timeout                     time.Duration
 	wait, adopt, forceConflicts bool
 }
@@ -214,7 +233,7 @@ func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.C
 	if err := m.CheckOwnership(ctx, objs, name, adopt); err != nil {
 		return "", err
 	}
-	if msg := st.CNIConflict(render.HydraCNI(cfg)); msg != "" {
+	if msg := st.CNIConflict(render.HydraCNI(cfg), t.kubectl(o.configFile)); msg != "" {
 		return "", errors.New(msg)
 	}
 	if drift, err := upgrade.Drift(ctx, m.C, cfg); err != nil {
@@ -231,11 +250,16 @@ func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.C
 		return "", err
 	}
 	if !render.HydraCNI(cfg) {
-		switch after, err := m.State(ctx, ns, name); {
-		case err != nil:
-			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not re-read the Cluster to check its CNI label: %v\n", err)
-		case after.CNILabelLeft(false) != "":
-			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s\n", after.CNILabelLeft(false))
+		// A label that survives the apply keeps hydra's ClusterResourceSet
+		// selecting the cluster, and it installs hydra's Cilium if it has not
+		// applied yet. The apply has landed and rerunning is safe; failing is
+		// what makes the leftover selector impossible to miss.
+		after, err := m.State(ctx, ns, name)
+		if err != nil {
+			return "", fmt.Errorf("applied, but could not re-read the Cluster to check that its CNI label is gone (rerun create): %w", err)
+		}
+		if msg := after.CNILabelLeft(false, t.kubectl(o.configFile)); msg != "" {
+			return "", fmt.Errorf("applied, but %s", msg)
 		}
 	}
 	switch orphans, err := m.Orphans(ctx, objs, ns, name); {
@@ -312,10 +336,12 @@ anything stored locally.`,
 			if err != nil {
 				return err
 			}
-			if msg := st.CNIConflict(render.HydraCNI(cfg)); msg != "" {
+			if msg := st.CNIConflict(render.HydraCNI(cfg), t.kubectl(file)); msg != "" {
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "! cni: create refuses this: %s\n", msg)
 			}
-			if msg := st.CNILabelLeft(render.HydraCNI(cfg)); msg != "" {
+			// Judge the label by what the apply would leave: when hydra is its
+			// only manager the dry-run already drops it, and the diff says so.
+			if msg := st.Planned(changes).CNILabelLeft(render.HydraCNI(cfg), t.kubectl(file)); msg != "" {
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "! cni: %s\n", msg)
 			}
 			drift, err := upgrade.Drift(contextOf(cmd), t.m.C, cfg)

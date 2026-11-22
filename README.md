@@ -144,8 +144,9 @@ person owns the CNI, including a cluster built before hydra managed it.
   replace it deliberately; installing a second CNI next to it breaks pod networking. `plan` and
   `create` list the ConfigMap and ClusterResourceSet as no longer rendered, and leave them in place.
   Server-side apply drops the Cluster's `cni.hydra.io/cilium` label only when hydra's field manager
-  is its sole owner, so `plan` and `create` warn when it is still there and print the
-  `kubectl label` command that removes it.
+  is its sole owner. A label that stays keeps the old ClusterResourceSet selecting the cluster, so
+  `create` fails after applying (rerunning is safe) and `plan` warns when its dry-run keeps the
+  label; both print the `kubectl label` command that removes it, aimed at the management cluster.
 
 Machine and bootstrap templates are named after their content (`<cluster>-cp-1a2b3c4d`), so
 changing a machine's size or a pool's labels produces a new template and a rolling replacement

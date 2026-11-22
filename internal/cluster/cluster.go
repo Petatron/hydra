@@ -238,6 +238,8 @@ type Change struct {
 	Diff string
 	// Note qualifies what the change will do, when that is less than it looks.
 	Note string
+	// Result is the server's dry-run of the object, for updates.
+	Result *unstructured.Unstructured
 }
 
 // cniNote explains that a changed CNI ConfigMap does not reach a running
@@ -274,7 +276,7 @@ func (m *Manager) Plan(ctx context.Context, objs []*unstructured.Unstructured, c
 		}
 		before, after := comparable(live), comparable(dry)
 		if before != after {
-			ch := Change{Object: describe(o), Action: "update", Diff: unifiedDiff(before, after)}
+			ch := Change{Object: describe(o), Action: "update", Diff: unifiedDiff(before, after), Result: dry}
 			if o.GetKind() == kindConfigMap && o.GetLabels()[render.CNILabelKey] != "" {
 				ch.Note = cniNote
 			}

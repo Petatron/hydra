@@ -165,7 +165,7 @@ func runPivot(ctx context.Context, cmd *cobra.Command, src *target, cfg config.M
 		srcSide.File = bootstrap.KindName(cfg.Name) + ".kubeconfig"
 		cf := o.configFile
 		if cf == "" {
-			cf = "hydra.yaml"
+			cf = defaultConfigFile
 		}
 		srcSide.Prep = fmt.Sprintf("hydra bootstrap kubeconfig -f %s > %s", cf, srcSide.File)
 	}
@@ -216,7 +216,8 @@ labels clusterctl move needs, and a dry run succeeds. It installs the pinned
 providers on the target first.
 
 After moving it verifies on the target that the cluster is Available, every
-machine has taken its VM over and is Ready, and the CNI objects came along. If
+machine has taken its VM over and is Ready, and, when hydra installs the CNI
+(cni: hydra), that its objects came along. If
 that fails, the cluster stays on the target: pivot never moves a cluster back
 on its own, because a VM may already have been taken over and moving that
 machine back would strand it. The error says how to inspect the cluster and

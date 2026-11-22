@@ -812,16 +812,23 @@ func TestCluCreateRefusesHydraCNIOnAForeignCNI(t *testing.T) {
 	}
 
 	// external, but the label survived the apply (another field manager
-	// owns it too; the fake client never prunes it): create warns.
+	// owns it too; the fake client never prunes it): the old
+	// ClusterResourceSet still selects the cluster, so create fails, and the
+	// fix it prints reaches the management cluster, not the current context.
 	labelled := foreign()
 	labelled.SetLabels(map[string]string{"hydra.io/cluster": "hydra-mgmt", "cni.hydra.io/cilium": "hydra-mgmt"})
 	tg, _ = cluTarget(t, true, &cluApplies{}, interceptor.Funcs{}, labelled)
-	cmd, errOut := cluCmd()
-	if _, err := runCreate(t.Context(), cmd, tg, cfg, objs, createOptions{wait: false}); err != nil {
-		t.Fatal(err)
+	cmd, _ = cluCmd()
+	_, err = runCreate(t.Context(), cmd, tg, cfg, objs, createOptions{wait: false, configFile: "mgmt.yaml"})
+	if err == nil || !strings.Contains(err.Error(), "applied, but cluster default/hydra-mgmt still carries the cni.hydra.io/cilium label") {
+		t.Fatalf("want a stale-label error, got %v", err)
 	}
-	if !strings.Contains(errOut.String(), "warning: cluster default/hydra-mgmt still carries the cni.hydra.io/cilium label") {
-		t.Errorf("no stale-label warning:\n%s", errOut.String())
+	if !strings.Contains(err.Error(), "hydra bootstrap kubeconfig -f mgmt.yaml > bootstrap.kubeconfig && kubectl --kubeconfig bootstrap.kubeconfig label cluster -n default hydra-mgmt cni.hydra.io/cilium-") {
+		t.Errorf("the fix does not reach the bootstrap cluster: %v", err)
+	}
+	tg.path = "/m.yaml"
+	if _, err := runCreate(t.Context(), cmd, tg, cfg, objs, createOptions{wait: false}); err == nil || !strings.Contains(err.Error(), "kubectl --kubeconfig /m.yaml label cluster") {
+		t.Errorf("the fix does not pass --management-kubeconfig: %v", err)
 	}
 
 	withFakeManagement(t)
@@ -831,7 +838,8 @@ func TestCluCreateRefusesHydraCNIOnAForeignCNI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, "! cni: create refuses this: cluster default/hydra-mgmt exists without the cni.hydra.io/cilium label") {
-		t.Errorf("plan does not warn:\n%s", out)
+	if !strings.Contains(out, "! cni: create refuses this: cluster default/hydra-mgmt exists without the cni.hydra.io/cilium label") ||
+		!strings.Contains(out, "kubectl --kubeconfig /x label cluster -n default hydra-mgmt cni.hydra.io/cilium=hydra-mgmt") {
+		t.Errorf("plan does not warn with a runnable fix:\n%s", out)
 	}
 }

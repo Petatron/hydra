@@ -611,12 +611,12 @@ func TestCNIConflict(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		msg := st.CNIConflict(tc.hydraCNI)
+		msg := st.CNIConflict(tc.hydraCNI, "kubectl --kubeconfig m.yaml")
 		if (msg != "") != tc.conflict {
 			t.Errorf("%s hydraCNI=%v: got %q", tc.name, tc.hydraCNI, msg)
 		}
-		if tc.conflict && !strings.Contains(msg, "spec.network.cni: external") {
-			t.Errorf("message does not name the fix: %q", msg)
+		if tc.conflict && (!strings.Contains(msg, "spec.network.cni: external") || !strings.Contains(msg, "kubectl --kubeconfig m.yaml label cluster -n ns h cni.hydra.io/cilium=h")) {
+			t.Errorf("message does not name both fixes: %q", msg)
 		}
 	}
 }
@@ -641,13 +641,46 @@ func TestCNILabelLeft(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		msg := st.CNILabelLeft(tc.hydraCNI)
+		msg := st.CNILabelLeft(tc.hydraCNI, "kubectl --kubeconfig m.yaml")
 		if (msg != "") != tc.left {
 			t.Errorf("%s hydraCNI=%v: got %q", tc.name, tc.hydraCNI, msg)
 		}
-		if tc.left && !strings.Contains(msg, "kubectl label cluster -n ns c cni.hydra.io/cilium-") {
+		if tc.left && !strings.Contains(msg, "kubectl --kubeconfig m.yaml label cluster -n ns c cni.hydra.io/cilium-") {
 			t.Errorf("message does not give the command: %q", msg)
 		}
+	}
+}
+
+// plan judges a leftover label by the dry-run: when the apply would drop it,
+// there is nothing to warn about; when it keeps it, the warning stands.
+func TestPlannedCNILabel(t *testing.T) {
+	ctx := context.Background()
+	labelled := obj(clusterGVK, "ns", "c", nil)
+	labelled.SetLabels(map[string]string{render.CNILabelKey: "c", "x": "y"})
+	m := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(labelled).Build()}
+	st, err := m.State(ctx, "ns", "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dropped := labelled.DeepCopy()
+	dropped.SetLabels(map[string]string{"x": "y"})
+	other := obj(clusterGVK, "ns", "other", nil)
+	for _, tc := range []struct {
+		name    string
+		changes []Change
+		left    bool
+	}{
+		{"no change to the Cluster", nil, true},
+		{"another Cluster changes", []Change{{Result: other}}, true},
+		{"the dry-run drops the label", []Change{{}, {Result: dropped}}, false},
+		{"the dry-run keeps it", []Change{{Result: labelled.DeepCopy()}}, true},
+	} {
+		if got := st.Planned(tc.changes).CNILabelLeft(false, "kubectl") != ""; got != tc.left {
+			t.Errorf("%s: left=%v, want %v", tc.name, got, tc.left)
+		}
+	}
+	if (ClusterState{}).Planned([]Change{{Result: dropped}}).Exists {
+		t.Error("a missing Cluster must stay missing")
 	}
 }
 
