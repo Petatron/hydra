@@ -466,6 +466,16 @@ func TestRunRefusesALeftoverCNILabel(t *testing.T) {
 	if len(fc.applied) != 0 {
 		t.Fatalf("applied %v", fc.applied)
 	}
+
+	// Already at the target: the upgrade is done, but the refusal stands
+	// rather than becoming a note for create.
+	u.Target = v("v1.35.3")
+	if err := u.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "still carries the cni.hydra.io/cilium label") {
+		t.Fatalf("done: got %v\n%s", err, out)
+	}
+	if err := u.Plan(context.Background()); err == nil || !strings.Contains(err.Error(), "still carries the cni.hydra.io/cilium label") {
+		t.Fatalf("done, --dry-run: got %v\n%s", err, out)
+	}
 }
 
 // hydra.yaml edits beyond the version are refused before anything is

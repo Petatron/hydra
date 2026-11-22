@@ -115,6 +115,10 @@ func (s Stage) String() string {
 // Refusal is a preflight decision not to proceed, with what to do instead.
 type Refusal struct {
 	Reason, Fix string
+	// Always marks a refusal that stands even when the upgrade is done: it
+	// guards the cluster, not the upgrade (a leftover CNI label), so it is
+	// not one of the edits create applies afterwards.
+	Always bool
 }
 
 func (r *Refusal) Error() string {
