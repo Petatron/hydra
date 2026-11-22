@@ -19,6 +19,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/Petatron/hydra/internal/config"
 	"github.com/Petatron/hydra/internal/render"
 )
 
@@ -68,6 +69,34 @@ func (st ClusterState) CheckOwner(cluster string, adopt bool) error {
 		return nil
 	}
 	return checkOwner(st.object, cluster, adopt)
+}
+
+// CNIConflict explains why applying hydra's CNI to an existing Cluster would
+// be wrong, or returns "". A Cluster without the CNI label never had hydra's
+// ClusterResourceSet select it, so its CNI came from somewhere else (a cluster
+// built by hand, or created with cni: external). Adding the label now would
+// make the set apply hydra's Cilium on top of whatever runs there.
+func (st ClusterState) CNIConflict(hydraCNI bool) string {
+	if !hydraCNI || !st.Exists || st.object == nil || st.object.GetLabels()[render.CNILabelKey] != "" {
+		return ""
+	}
+	ns, name := st.object.GetNamespace(), st.object.GetName()
+	return fmt.Sprintf("cluster %s/%s exists without the %s label, so hydra did not install its CNI, and cni: %s would apply hydra's Cilium on top of the CNI already there. If that CNI is managed elsewhere, set spec.network.cni: %s. If you have checked that no CNI runs there and want hydra's, label the Cluster first: kubectl label cluster -n %s %s %s=%s",
+		ns, name, render.CNILabelKey, config.CNIHydra, config.CNIExternal, ns, name, render.CNILabelKey, name)
+}
+
+// CNILabelLeft explains a CNI label still on the Cluster although hydra.yaml
+// says cni: external, or returns "". Server-side apply removes a label only
+// when hydra's field manager is its sole owner; one also owned by another
+// manager (a cluster built by hand and adopted, or created by an older hydra)
+// stays, and keeps hydra's ClusterResourceSet selecting the cluster.
+func (st ClusterState) CNILabelLeft(hydraCNI bool) string {
+	if hydraCNI || !st.Exists || st.object == nil || st.object.GetLabels()[render.CNILabelKey] == "" {
+		return ""
+	}
+	ns, name := st.object.GetNamespace(), st.object.GetName()
+	return fmt.Sprintf("cluster %s/%s still carries the %s label although hydra.yaml says cni: %s; hydra's apply removes it only when no other field manager also owns it. If it stays, remove it: kubectl label cluster -n %s %s %s-",
+		ns, name, render.CNILabelKey, config.CNIExternal, ns, name, render.CNILabelKey)
 }
 
 // State reads the Cluster object's existence, deletion and endpoint.

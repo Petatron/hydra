@@ -56,7 +56,8 @@ func capiCluster(ns, name, endpointHost string, port int64) *unstructured.Unstru
 	u.SetKind("Cluster")
 	u.SetNamespace(ns)
 	u.SetName(name)
-	u.SetLabels(map[string]string{"hydra.io/cluster": name})
+	// As hydra renders it, with the default cni: hydra.
+	u.SetLabels(map[string]string{"hydra.io/cluster": name, "cni.hydra.io/cilium": name})
 	if endpointHost != "" {
 		_ = unstructured.SetNestedField(u.Object, endpointHost, "spec", "controlPlaneEndpoint", "host")
 		_ = unstructured.SetNestedField(u.Object, port, "spec", "controlPlaneEndpoint", "port")
@@ -772,5 +773,65 @@ func TestCluDeleteCommandErrors(t *testing.T) {
 func TestCluWriteKubeconfigIntoAMissingDirectory(t *testing.T) {
 	if err := writeKubeconfig(filepath.Join(t.TempDir(), "nope", "c.kubeconfig"), []byte("x"), true); err == nil {
 		t.Error("want an error for a directory that does not exist")
+	}
+}
+
+// A Cluster whose CNI hydra did not install (no CNI label) must not get
+// hydra's Cilium layered on top: create refuses with cni: hydra before any
+// write, plan warns, and cni: external proceeds.
+func TestCluCreateRefusesHydraCNIOnAForeignCNI(t *testing.T) {
+	foreign := func() *unstructured.Unstructured {
+		cl := capiCluster("default", "hydra-mgmt", "", 0)
+		cl.SetLabels(map[string]string{"hydra.io/cluster": "hydra-mgmt"})
+		return cl
+	}
+	cfg, objs := cluLoad(t, "../../examples/hydra-mgmt.yaml")
+	ap := &cluApplies{}
+	tg, _ := cluTarget(t, true, ap, interceptor.Funcs{}, foreign())
+	cmd, _ := cluCmd()
+	if _, err := runCreate(t.Context(), cmd, tg, cfg, objs, createOptions{wait: false}); err == nil || !strings.Contains(err.Error(), "spec.network.cni: external") {
+		t.Fatalf("want a refusal naming cni: external, got %v", err)
+	}
+	if ap.n != 0 {
+		t.Errorf("%d applies before the refusal", ap.n)
+	}
+
+	cfg.Spec.Network.CNI, cfg.Spec.Network.MTU = config.CNIExternal, 0
+	objs, err := renderObjects(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ap = &cluApplies{}
+	tg, _ = cluTarget(t, true, ap, interceptor.Funcs{}, foreign())
+	cmd, _ = cluCmd()
+	if _, err := runCreate(t.Context(), cmd, tg, cfg, objs, createOptions{wait: false}); err != nil {
+		t.Fatalf("cni: external: %v", err)
+	}
+	if ap.n != len(objs)+1 {
+		t.Errorf("%d applies, want %d", ap.n, len(objs)+1)
+	}
+
+	// external, but the label survived the apply (another field manager
+	// owns it too; the fake client never prunes it): create warns.
+	labelled := foreign()
+	labelled.SetLabels(map[string]string{"hydra.io/cluster": "hydra-mgmt", "cni.hydra.io/cilium": "hydra-mgmt"})
+	tg, _ = cluTarget(t, true, &cluApplies{}, interceptor.Funcs{}, labelled)
+	cmd, errOut := cluCmd()
+	if _, err := runCreate(t.Context(), cmd, tg, cfg, objs, createOptions{wait: false}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(errOut.String(), "warning: cluster default/hydra-mgmt still carries the cni.hydra.io/cilium label") {
+		t.Errorf("no stale-label warning:\n%s", errOut.String())
+	}
+
+	withFakeManagement(t)
+	c := fake.NewClientBuilder().WithScheme(withFakeManagement(t).Scheme()).WithRESTMapper(cluMapper()).WithObjects(foreign()).Build()
+	connectManagement = func([]byte) (client.Client, error) { return c, nil }
+	out, _, err := run(t, "cluster", "plan", "-f", "../../examples/hydra-mgmt.yaml", "--management-kubeconfig", "/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "! cni: create refuses this: cluster default/hydra-mgmt exists without the cni.hydra.io/cilium label") {
+		t.Errorf("plan does not warn:\n%s", out)
 	}
 }

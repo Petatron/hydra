@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Petatron/hydra/internal/render"
+
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -49,6 +51,7 @@ func readyStatus() map[string]any {
 // uidSuffix makes UIDs differ per side, as a real move does.
 func clusterObjects(uidSuffix string, identityRecorded bool) []client.Object {
 	cl := u(clusterGVK, ns, name, map[string]any{"status": readyStatus()})
+	cl.SetLabels(map[string]string{render.CNILabelKey: name})
 	kcp := u(kcpGVK, ns, name+"-cp", map[string]any{
 		"spec":   map[string]any{"replicas": int64(1)},
 		"status": map[string]any{"readyReplicas": int64(1), "upToDateReplicas": int64(1), "replicas": int64(1)},

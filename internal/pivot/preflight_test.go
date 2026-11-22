@@ -243,6 +243,11 @@ func TestVerifyOnce(t *testing.T) {
 		{name: "no machines", mutate: drop(hydraMachineGVK), want: "no HydraMachines on cluster c yet"},
 		{name: "machine not Ready", mutate: machineNotReady, want: "HydraMachine c-cp-1 is not Ready"},
 		{name: "CNI set missing", tgtF: []*fault{{verb: "get", kind: "ClusterResourceSet", err: errBoom}}, want: "the CNI ClusterResourceSet did not arrive"},
+		// cni: external: no CNI label, no set and no binding to carry.
+		{name: "external CNI", mutate: func(o []client.Object) []client.Object {
+			o[0].SetLabels(nil)
+			return drop(crsGVK)(drop(bindGVK)(o))
+		}, tgtF: []*fault{{verb: "get", kind: crsGVK.Kind, err: errBoom}}, want: ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			src := newClient(t, tc.srcObjs...)

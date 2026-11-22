@@ -218,3 +218,29 @@ func TestLoadNameIgnoresTheNamespace(t *testing.T) {
 		t.Error("LoadMetadata must still validate the namespace")
 	}
 }
+
+func TestCNIModes(t *testing.T) {
+	c, err := Parse([]byte(valid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Spec.Network.CNI != CNIHydra || c.Spec.Network.MTU != DefaultMTU {
+		t.Errorf("default: cni %q mtu %d", c.Spec.Network.CNI, c.Spec.Network.MTU)
+	}
+	c, err = Parse([]byte(valid + "    cni: external\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Spec.Network.CNI != CNIExternal || c.Spec.Network.MTU != 0 {
+		t.Errorf("external: cni %q mtu %d (no MTU default: it is Cilium's)", c.Spec.Network.CNI, c.Spec.Network.MTU)
+	}
+	for in, want := range map[string]string{
+		"    cni: external\n    mtu: 1450\n": "spec.network.mtu: sets the MTU of hydra's Cilium",
+		"    cni: calico\n":                  `spec.network.cni: must be "hydra" or "external", got "calico"`,
+		"    cni: hydra\n    mtu: 100\n":     "spec.network.mtu: must be between 1280 and 9000",
+	} {
+		if _, err := Parse([]byte(valid + in)); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: want %q, got %v", in, want, err)
+		}
+	}
+}

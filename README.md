@@ -109,7 +109,8 @@ autoscaled node pools, are in [`examples/`](examples/).
 | `spec.image.bootstrap` | `packages` | `packages` installs containerd and Kubernetes at boot; `prebaked` expects an image that carries them |
 | `spec.network.controlPlaneEndpoint` | — | IPv4 or DNS name (port 6443 only). Required unless `managedNetwork` is set, in which case Hydra picks it |
 | `spec.network.podCIDR` / `serviceCIDR` | `10.244.0.0/16` / `10.96.0.0/12` | The pod CIDR is also Cilium's IPAM pool and must hold a /24 per node; the service CIDR may be at most a /12 |
-| `spec.network.mtu` | `1500` | Cilium MTU |
+| `spec.network.cni` | `hydra` | `hydra` installs Cilium; `external` installs no CNI, for a CNI managed elsewhere (see below) |
+| `spec.network.mtu` | `1500` | Cilium MTU. Only with `cni: hydra` |
 | `spec.network.nodeInterface` / `vipInterface` | `enp1s0` / derived | Guest NICs for the Node address and the API VIP |
 | `spec.controlPlane` | 3 × 4 vCPU / 8Gi / 40Gi | Replicas must be 1, 3 or 5 |
 | `spec.controlPlane.schedulable` | `true` if no node pools | Removes the control-plane taint |
@@ -125,6 +126,26 @@ hydra cluster render -f hydra.yaml -o out/    # to out/<name>.yaml
 The output contains the HydraCluster, Cluster, KubeadmControlPlane (with kube-vip holding the API
 endpoint), a MachineHealthCheck, a MachineDeployment for each node pool, and a
 **ClusterResourceSet that installs Cilium** once the cluster's API is up.
+
+### A CNI managed elsewhere: `cni: external`
+
+With `spec.network.cni: external`, the output has no Cilium ConfigMap, no ClusterResourceSet, and
+no `cni.hydra.io/cilium` label on the Cluster; nothing else changes. Use it when Argo CD, Helm or a
+person owns the CNI, including a cluster built before hydra managed it.
+
+- The external CNI must use `podCIDR` as its pod address pool: kubeadm is given that CIDR either way.
+- Nodes stay NotReady until the CNI is installed, so `create` keeps waiting until it is. Install it
+  while `create` waits, or pass `--wait=false` and follow with `status`.
+- `create` refuses `cni: hydra` for an existing Cluster that lacks the CNI label, because hydra's
+  ClusterResourceSet would then install Cilium on top of the CNI already there. `plan` warns about
+  the same case.
+- Switching a hydra-installed cluster to `external` leaves Cilium running: the ClusterResourceSet
+  applied it once and never removes it. Whatever takes the CNI over must adopt that Cilium or
+  replace it deliberately; installing a second CNI next to it breaks pod networking. `plan` and
+  `create` list the ConfigMap and ClusterResourceSet as no longer rendered, and leave them in place.
+  Server-side apply drops the Cluster's `cni.hydra.io/cilium` label only when hydra's field manager
+  is its sole owner, so `plan` and `create` warn when it is still there and print the
+  `kubectl label` command that removes it.
 
 Machine and bootstrap templates are named after their content (`<cluster>-cp-1a2b3c4d`), so
 changing a machine's size or a pool's labels produces a new template and a rolling replacement
@@ -196,8 +217,8 @@ These act on `--management-kubeconfig`, or else on the cluster's bootstrap kind 
 current kubectl context is never used.
 
 - `create` server-side applies the rendered objects (field manager `hydra`) and reports the
-  controllers' own conditions until the cluster is Available, its CNI applied, and any rollout
-  finished. `--timeout` ends the wait, not the creation; rerunning is always safe.
+  controllers' own conditions until the cluster is Available, its CNI applied (or, with
+  `cni: external`, its nodes Ready), and any rollout finished. `--timeout` ends the wait, not the creation; rerunning is always safe.
 - It refuses to take over objects of the same name that another cluster owns, or that hydra did
   not make (`--adopt` allows the latter), and refuses while the cluster is being deleted.
 - `plan` diffs against the live cluster only, and lists objects labelled for the cluster that

@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -370,6 +371,45 @@ func TestEveryObjectCarriesTheClusterLabel(t *testing.T) {
 		for _, o := range documents(t, out) {
 			if o.Metadata.Labels[ClusterLabelKey] != c.Metadata.Name {
 				t.Errorf("%s: %s %s lacks %s=%s", name, o.Kind, o.Metadata.Name, ClusterLabelKey, c.Metadata.Name)
+			}
+		}
+	}
+}
+
+// cni: external renders exactly the default output minus hydra's CNI: no
+// Cilium ConfigMap, no ClusterResourceSet, and no Cluster label for one to
+// select. Anything else differing would mean the option changes more than
+// who installs the CNI.
+func TestExternalCNIRendersNoCNI(t *testing.T) {
+	for _, name := range examples {
+		c := load(t, "../../examples/"+name+".yaml")
+		withCNI, err := Render(c, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.Spec.Network.CNI, c.Spec.Network.MTU = config.CNIExternal, 0
+		if HydraCNI(c) {
+			t.Fatal("HydraCNI is true for cni: external")
+		}
+		external, err := Render(c, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		cut := strings.Index(string(withCNI), "---\n# Cilium ")
+		if cut < 0 {
+			t.Fatalf("%s: default render has no Cilium section", name)
+		}
+		labelLines := "\n    # Selects the ClusterResourceSet that installs Cilium.\n    " + CNILabelKey + ": " + strconv.Quote(c.Metadata.Name)
+		want := strings.Replace(string(withCNI[:cut]), labelLines, "", 1)
+		if want == string(withCNI[:cut]) {
+			t.Fatalf("%s: default render has no CNI label on the Cluster", name)
+		}
+		if string(external) != want {
+			t.Errorf("%s: cni: external changes more than the CNI objects and label", name)
+		}
+		for _, o := range documents(t, external) {
+			if o.Kind == kindClusterResourceSet || o.Metadata.Labels[CNILabelKey] != "" {
+				t.Errorf("%s: %s %s is hydra's CNI", name, o.Kind, o.Metadata.Name)
 			}
 		}
 	}

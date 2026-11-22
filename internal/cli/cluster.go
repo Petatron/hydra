@@ -118,6 +118,10 @@ func newCreateCommand() *cobra.Command {
 cluster (field manager "hydra"), waits until Cluster API reports the cluster
 Available with its CNI applied, and writes the cluster's kubeconfig.
 
+With spec.network.cni: external, hydra installs no CNI and the nodes stay
+NotReady until something else does, so the wait ends only once it has. Install
+it while create waits, or pass --wait=false and follow with status.
+
 Progress is what the controllers report. --timeout ends the wait, not the
 creation: the controllers keep going, and running create again picks up where
 things are. Rerunning create is always safe; applying the same objects changes
@@ -210,6 +214,9 @@ func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.C
 	if err := m.CheckOwnership(ctx, objs, name, adopt); err != nil {
 		return "", err
 	}
+	if msg := st.CNIConflict(render.HydraCNI(cfg)); msg != "" {
+		return "", errors.New(msg)
+	}
 	if drift, err := upgrade.Drift(ctx, m.C, cfg); err != nil {
 		return "", err
 	} else if len(drift) > 0 {
@@ -222,6 +229,14 @@ func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.C
 	}
 	if err := m.Apply(ctx, objs, name, forceConflicts); err != nil {
 		return "", err
+	}
+	if !render.HydraCNI(cfg) {
+		switch after, err := m.State(ctx, ns, name); {
+		case err != nil:
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not re-read the Cluster to check its CNI label: %v\n", err)
+		case after.CNILabelLeft(false) != "":
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s\n", after.CNILabelLeft(false))
+		}
 	}
 	switch orphans, err := m.Orphans(ctx, objs, ns, name); {
 	case err != nil:
@@ -292,6 +307,16 @@ anything stored locally.`,
 				return err
 			} else if unprotected {
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "! note: %s\n", cluster.UnprotectedRollNote)
+			}
+			st, err := t.m.State(contextOf(cmd), cfg.Metadata.Namespace, cfg.Metadata.Name)
+			if err != nil {
+				return err
+			}
+			if msg := st.CNIConflict(render.HydraCNI(cfg)); msg != "" {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "! cni: create refuses this: %s\n", msg)
+			}
+			if msg := st.CNILabelLeft(render.HydraCNI(cfg)); msg != "" {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "! cni: %s\n", msg)
 			}
 			drift, err := upgrade.Drift(contextOf(cmd), t.m.C, cfg)
 			if err != nil {

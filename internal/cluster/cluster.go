@@ -326,6 +326,10 @@ type Summary struct {
 	Machines          map[string]int
 	CNIApplied        bool
 	CNIBindingPresent bool
+	// CNIExternal is true when the Cluster carries no CNI label, so no
+	// hydra ClusterResourceSet installs its CNI (cni: external): something
+	// else does, and CNIApplied and CNIBindingPresent say nothing.
+	CNIExternal bool
 	// RolledOut is true when the control plane and every MachineDeployment
 	// have observed their latest spec and have all replicas up to date, so a
 	// rerun after a change does not report success before the rollout.
@@ -335,6 +339,12 @@ type Summary struct {
 	Terminating     bool
 	DeletingMessage string
 }
+
+// CNIReady reports whether the CNI no longer holds the cluster up as far as
+// hydra can tell: hydra's ClusterResourceSet applied it, or hydra does not
+// install it. An external CNI that is missing shows as Machines that never
+// become Ready, which RolledOut already waits for.
+func (s Summary) CNIReady() bool { return s.CNIExternal || s.CNIApplied }
 
 // Line is the summary as one line, printed whenever it changes.
 func (s Summary) Line() string {
@@ -365,6 +375,8 @@ func (s Summary) Line() string {
 	}
 	parts = append(parts, "machines: "+strings.Join(phases, ", "))
 	switch {
+	case s.CNIExternal:
+		parts = append(parts, "CNI external (not installed by hydra)")
 	case s.CNIApplied:
 		parts = append(parts, "CNI applied")
 	case s.CNIBindingPresent:
@@ -395,6 +407,7 @@ func (m *Manager) Status(ctx context.Context, namespace, name string) (Summary, 
 		return s, err
 	}
 	s.Exists = true
+	s.CNIExternal = cl.GetLabels()[render.CNILabelKey] == ""
 	if cl.GetDeletionTimestamp() != nil {
 		s.Terminating = true
 		if c := condition(cl, "Deleting"); c != nil {
@@ -441,6 +454,9 @@ func (m *Manager) Status(ctx context.Context, namespace, name string) (Summary, 
 		s.Machines[orDash(phase)]++
 	}
 
+	if s.CNIExternal {
+		return s, nil
+	}
 	binding := &unstructured.Unstructured{}
 	binding.SetGroupVersionKind(bindingGVK)
 	switch err := m.C.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, binding); {
@@ -521,11 +537,11 @@ var ErrTimeout = errors.New("timed out waiting; the controllers keep working, so
 // it ends only the wait: the management cluster carries on.
 var ErrInterrupted = errors.New("interrupted; the operation continues in the management cluster, so run `hydra cluster status` or the same command again")
 
-// WaitAvailable polls until the Cluster is Available and the CNI is applied,
-// printing the summary whenever it changes.
+// WaitAvailable polls until the Cluster is Available, rolled out and its CNI
+// applied (or not hydra's to apply), printing the summary whenever it changes.
 func (m *Manager) WaitAvailable(ctx context.Context, namespace, name string, timeout time.Duration) error {
 	return m.wait(ctx, namespace, name, timeout, func(s Summary) bool {
-		return s.Exists && !s.Terminating && s.Available == ConditionTrue && s.CNIApplied && s.RolledOut
+		return s.Exists && !s.Terminating && s.Available == ConditionTrue && s.CNIReady() && s.RolledOut
 	})
 }
 

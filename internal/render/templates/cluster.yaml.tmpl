@@ -58,8 +58,10 @@ metadata:
   namespace: {{ q .Namespace }}
   labels:
     {{ .ClusterLabelKey }}: {{ q .Name }}
+{{- if .CNILabelKey }}
     # Selects the ClusterResourceSet that installs Cilium.
     {{ .CNILabelKey }}: {{ q .Name }}
+{{- end }}
 spec:
   clusterNetwork:
     # Propagated by KCP into kubeadm's config, and the same value is Cilium's

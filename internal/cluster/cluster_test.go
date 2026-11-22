@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"io"
 	"maps"
 	"os"
 	"strings"
@@ -100,6 +101,7 @@ func TestStatusReadsControllers(t *testing.T) {
 	cl := obj(clusterGVK, "ns", "c", map[string]any{"status": map[string]any{"conditions": []any{
 		map[string]any{"type": "Available", "status": "True", "reason": "Available"},
 	}}})
+	cl.SetLabels(map[string]string{render.CNILabelKey: "c"})
 	kcp := obj(kcpGVK, "ns", "c-cp", map[string]any{"spec": map[string]any{"replicas": int64(3)}, "status": map[string]any{"replicas": int64(3), "readyReplicas": int64(3), "upToDateReplicas": int64(3)}})
 	m1 := obj(machineGVK, "ns", "c-cp-1", map[string]any{"status": map[string]any{"phase": "Running"}})
 	m1.SetLabels(map[string]string{"cluster.x-k8s.io/cluster-name": "c"})
@@ -553,5 +555,111 @@ func TestUnprotectedRoll(t *testing.T) {
 				t.Fatalf("got %v, %v; want %v", got, err, tc.want)
 			}
 		})
+	}
+}
+
+// A Cluster without the CNI label has no hydra ClusterResourceSet selecting
+// it (cni: external): status says so, never reads a binding, and the wait
+// ends on Available and rolled out alone.
+func TestStatusAndWaitWithExternalCNI(t *testing.T) {
+	ctx := context.Background()
+	cl := obj(clusterGVK, "ns", "c", map[string]any{"status": map[string]any{"conditions": []any{
+		map[string]any{"type": "Available", "status": "True", "reason": "Available"},
+	}}})
+	kcp := obj(kcpGVK, "ns", "c-cp", map[string]any{"spec": map[string]any{"replicas": int64(1)}, "status": map[string]any{"replicas": int64(1), "readyReplicas": int64(1), "upToDateReplicas": int64(1)}})
+	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cl, kcp).WithInterceptorFuncs(interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, o client.Object, opts ...client.GetOption) error {
+			if o.GetObjectKind().GroupVersionKind().Kind == bindingGVK.Kind {
+				return errors.New("binding read with an external CNI")
+			}
+			return c.Get(ctx, key, o, opts...)
+		},
+	}).Build()
+	m := &Manager{C: c, Out: io.Discard, Poll: time.Millisecond}
+	s, err := m.Status(ctx, "ns", "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.CNIExternal || !s.CNIReady() || s.CNIApplied {
+		t.Errorf("summary: %+v", s)
+	}
+	if want := "Available=True (Available) · control plane 1/1 ready · machines: none · CNI external (not installed by hydra)"; s.Line() != want {
+		t.Errorf("got  %q\nwant %q", s.Line(), want)
+	}
+	if err := m.WaitAvailable(ctx, "ns", "c", 5*time.Second); err != nil {
+		t.Errorf("wait: %v", err)
+	}
+}
+
+func TestCNIConflict(t *testing.T) {
+	ctx := context.Background()
+	labelled := obj(clusterGVK, "ns", "c", nil)
+	labelled.SetLabels(map[string]string{render.CNILabelKey: "c"})
+	handBuilt := obj(clusterGVK, "ns", "h", nil)
+	m := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(labelled, handBuilt).Build()}
+	for _, tc := range []struct {
+		name     string
+		hydraCNI bool
+		conflict bool
+	}{
+		{"c", true, false},      // hydra installed its CNI: rerunning create is fine
+		{"h", true, true},       // CNI from elsewhere: hydra's would land on top
+		{"h", false, false},     // cni: external says so
+		{"absent", true, false}, // a new cluster
+	} {
+		st, err := m.State(ctx, "ns", tc.name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		msg := st.CNIConflict(tc.hydraCNI)
+		if (msg != "") != tc.conflict {
+			t.Errorf("%s hydraCNI=%v: got %q", tc.name, tc.hydraCNI, msg)
+		}
+		if tc.conflict && !strings.Contains(msg, "spec.network.cni: external") {
+			t.Errorf("message does not name the fix: %q", msg)
+		}
+	}
+}
+
+func TestCNILabelLeft(t *testing.T) {
+	ctx := context.Background()
+	labelled := obj(clusterGVK, "ns", "c", nil)
+	labelled.SetLabels(map[string]string{render.CNILabelKey: "c"})
+	bare := obj(clusterGVK, "ns", "h", nil)
+	m := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(labelled, bare).Build()}
+	for _, tc := range []struct {
+		name     string
+		hydraCNI bool
+		left     bool
+	}{
+		{"c", false, true},  // external, label still there
+		{"c", true, false},  // cni: hydra wants it
+		{"h", false, false}, // external, already gone
+		{"absent", false, false},
+	} {
+		st, err := m.State(ctx, "ns", tc.name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		msg := st.CNILabelLeft(tc.hydraCNI)
+		if (msg != "") != tc.left {
+			t.Errorf("%s hydraCNI=%v: got %q", tc.name, tc.hydraCNI, msg)
+		}
+		if tc.left && !strings.Contains(msg, "kubectl label cluster -n ns c cni.hydra.io/cilium-") {
+			t.Errorf("message does not give the command: %q", msg)
+		}
+	}
+}
+
+// With an external CNI the wait still holds while the control plane's
+// Machines are not Ready (their Nodes wait for the CNI).
+func TestExternalCNIWaitHoldsUntilMachinesReady(t *testing.T) {
+	cl := obj(clusterGVK, "ns", "c", map[string]any{"status": map[string]any{"conditions": []any{
+		map[string]any{"type": "Available", "status": "True"},
+	}}})
+	kcp := obj(kcpGVK, "ns", "c-cp", map[string]any{"spec": map[string]any{"replicas": int64(1)}, "status": map[string]any{"replicas": int64(1), "readyReplicas": int64(0), "upToDateReplicas": int64(1)}})
+	m := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cl, kcp).Build(), Out: io.Discard, Poll: time.Millisecond}
+	if err := m.WaitAvailable(context.Background(), "ns", "c", 50*time.Millisecond); !errors.Is(err, ErrTimeout) {
+		t.Fatalf("want a timeout while machines are not Ready, got %v", err)
 	}
 }
