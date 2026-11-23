@@ -1,0 +1,38 @@
+# The canonical Cilium values for every Hydra cluster (PET-94).
+#
+# hack/gen-cilium.sh renders the embedded manifest from these, and the same
+# values are what any other installer of Cilium on a Hydra cluster must use:
+# Argo CD (hydra-gitops), a Helm release, and later the addon controller
+# (PET-95). Change them here, in a reviewed PR, and nowhere else.
+#
+# Values that differ per cluster are sentinels the CLI substitutes when it
+# renders a cluster; another installer sets them from the cluster's hydra.yaml:
+#
+#   cluster.name                                hydra-sentinel-cluster  -> metadata.name
+#   ipam.operator.clusterPoolIPv4PodCIDRList[0] 10.255.254.0/24         -> spec.network.podCIDR
+#   MTU                                         65000                   -> spec.network.mtu
+#   operator.replicas                           1                       -> 2 when the cluster always has
+#                                                                          at least 2 nodes, otherwise 1
+#
+# Hubble's TLS certificates are issued in the cluster by Cilium's certgen
+# CronJob. Helm-generated certs would put a private key into every rendered
+# manifest and change on every render, so render would stop being
+# deterministic and every sync would show a diff.
+cluster:
+  name: hydra-sentinel-cluster
+  id: 0
+ipam:
+  mode: cluster-pool
+  operator:
+    clusterPoolIPv4PodCIDRList:
+      - 10.255.254.0/24
+MTU: 65000
+kubeProxyReplacement: false
+routingMode: tunnel
+tunnelProtocol: vxlan
+operator:
+  replicas: 1
+hubble:
+  tls:
+    auto:
+      method: cronJob

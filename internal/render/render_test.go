@@ -414,3 +414,42 @@ func TestExternalCNIRendersNoCNI(t *testing.T) {
 		}
 	}
 }
+
+// The Cilium operator runs 2 replicas when the cluster always has at least
+// two nodes, and 1 when it can shrink to one; the two lines the chart derives
+// from the count follow it.
+func TestOperatorReplicasFollowMinimumNodes(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		edit  func(c *config.ClusterConfig)
+		want  int
+		lines []string
+	}{
+		{"3 control-plane nodes", func(*config.ClusterConfig) {}, 2, []string{`\n  replicas: 2\n`, `\n      maxUnavailable: 50%\n`}},
+		{"1 control-plane node, no pools", func(c *config.ClusterConfig) { c.Spec.ControlPlane.Replicas = 1 }, 1, []string{`\n  replicas: 1\n`, `\n      maxUnavailable: 100%\n`}},
+		{"1 control-plane node, a pool that scales to 0", func(c *config.ClusterConfig) {
+			c.Spec.ControlPlane.Replicas = 1
+			c.Spec.NodePools = []config.NodePoolSpec{{Name: "p", Autoscaling: &config.AutoscalingSpec{Min: 0, Max: 3}}}
+		}, 1, []string{`\n  replicas: 1\n`}},
+		{"1 control-plane node, a fixed pool", func(c *config.ClusterConfig) {
+			c.Spec.ControlPlane.Replicas = 1
+			c.Spec.NodePools = []config.NodePoolSpec{{Name: "p", Replicas: 1}}
+		}, 2, []string{`\n  replicas: 2\n`}},
+	} {
+		c := load(t, "../../examples/hydra-mgmt.yaml")
+		tc.edit(c)
+		if got := OperatorReplicas(c); got != tc.want {
+			t.Errorf("%s: OperatorReplicas = %d, want %d", tc.name, got, tc.want)
+		}
+		m, err := ciliumFor(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, l := range tc.lines {
+			l = strings.ReplaceAll(l, `\n`, "\n")
+			if !strings.Contains(m, l) {
+				t.Errorf("%s: manifest lacks %q", tc.name, l)
+			}
+		}
+	}
+}

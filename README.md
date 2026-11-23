@@ -127,6 +127,13 @@ The output contains the HydraCluster, Cluster, KubeadmControlPlane (with kube-vi
 endpoint), a MachineHealthCheck, a MachineDeployment for each node pool, and a
 **ClusterResourceSet that installs Cilium** once the cluster's API is up.
 
+Cilium is configured from [`hack/cilium-values.yaml`](hack/cilium-values.yaml), the one set of values
+every Hydra cluster uses: cluster-pool IPAM on `podCIDR`, a VXLAN tunnel, kube-proxy kept, the
+cluster's name and MTU, and Hubble certificates issued in the cluster by a CronJob. The operator runs
+2 replicas when the cluster always has at least two nodes (control plane plus each pool's fixed size
+or autoscaling minimum), and 1 otherwise. Install Cilium any other way, with `cni: external`, and use
+the same values so a later hand-over changes nothing.
+
 ### A CNI managed elsewhere: `cni: external`
 
 With `spec.network.cni: external`, the output has no Cilium ConfigMap, no ClusterResourceSet, and

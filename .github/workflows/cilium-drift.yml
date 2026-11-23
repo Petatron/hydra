@@ -12,6 +12,7 @@ on:
   pull_request:
     paths:
       - 'hack/gen-cilium.sh'
+      - 'hack/cilium-values.yaml'
       - 'internal/render/**'
       - '.github/workflows/cilium-drift.yml'
 

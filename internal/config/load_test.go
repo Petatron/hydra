@@ -20,6 +20,13 @@ spec:
     bridges: [br0]
 `
 
+func TestMinNodes(t *testing.T) {
+	c := &ClusterConfig{Spec: ClusterSpec{ControlPlane: ControlPlaneSpec{Replicas: 1}, NodePools: []NodePoolSpec{{Replicas: 2}, {Autoscaling: &AutoscalingSpec{Min: 1, Max: 9}}, {Autoscaling: &AutoscalingSpec{Min: 0, Max: 3}}}}}
+	if got := c.MinNodes(); got != 4 {
+		t.Errorf("MinNodes = %d, want 4", got)
+	}
+}
+
 func TestDefaults(t *testing.T) {
 	c, err := Parse([]byte(valid))
 	if err != nil {
