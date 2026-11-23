@@ -42,6 +42,7 @@ Commands, in delivery order (Linear project *Hydra — Reliability & Productizat
 | `internal/validate/` | read-only host and hypervisor checks behind small interfaces (libvirt over TLS, TCP probes from this host or the kind node), faked in tests |
 | `internal/pivot/` | moving a cluster's management onto itself and back for teardown: locate, preflight, `clusterctl move`, verify, split evidence; a teardown record in kind (never moves back or unpauses on its own after a pivot) |
 | `internal/render/assets/cilium.yaml` | **generated** by `hack/gen-cilium.sh`; never edit by hand |
+| `hack/cilium-values.yaml` | the **canonical Cilium values** for every Hydra cluster (PET-94); `gen-cilium.sh` renders from it, and Argo CD, Helm releases and later the addon controller must use the same set. Per-cluster values are sentinels listed in its header |
 | `internal/render/testdata/*.golden.yaml` | expected output for each file in `examples/` |
 | `examples/` | user-facing `hydra.yaml` examples; every one is golden-tested |
 

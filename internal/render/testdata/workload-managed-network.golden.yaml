@@ -1160,14 +1160,14 @@ data:
     apps/v1\nkind: Deployment\nmetadata:\n  name: cilium-operator\n  namespace: kube-system\n
     \ labels:\n    io.cilium/app: operator\n    name: cilium-operator\n    app.kubernetes.io/part-of:
     cilium\n    app.kubernetes.io/name: cilium-operator\nspec:\n  # See docs on ServerCapabilities.LeasesResourceLock
-    in file pkg/k8s/version/version.go\n  # for more details.\n  replicas: 1\n  selector:\n
+    in file pkg/k8s/version/version.go\n  # for more details.\n  replicas: 2\n  selector:\n
     \   matchLabels:\n      io.cilium/app: operator\n      name: cilium-operator\n
     \ # ensure operator update on single node k8s clusters, by using rolling update
     with maxUnavailable=100% in case\n  # of one replica and no user configured Recreate
     strategy.\n  # otherwise an update might get stuck due to the default maxUnavailable=50%
     in combination with the\n  # podAntiAffinity which prevents deployments of multiple
     operator replicas on the same node.\n  strategy:\n    rollingUpdate:\n      maxSurge:
-    25%\n      maxUnavailable: 100%\n    type: RollingUpdate\n  template:\n    metadata:\n
+    25%\n      maxUnavailable: 50%\n    type: RollingUpdate\n  template:\n    metadata:\n
     \     annotations:\n        prometheus.io/port: \"9963\"\n        prometheus.io/scrape:
     \"true\"\n      labels:\n        io.cilium/app: operator\n        name: cilium-operator\n
     \       app.kubernetes.io/part-of: cilium\n        app.kubernetes.io/name: cilium-operator\n

@@ -512,6 +512,20 @@ func (s *ClusterSpec) KubernetesPackageVersion() string {
 	return strings.TrimPrefix(s.KubernetesVersion, "v")
 }
 
+// MinNodes is the fewest nodes the cluster can have: the control plane plus
+// every pool at its fixed size or autoscaling minimum.
+func (c *ClusterConfig) MinNodes() int {
+	n := int(c.Spec.ControlPlane.Replicas)
+	for _, p := range c.Spec.NodePools {
+		if p.Autoscaling != nil {
+			n += int(p.Autoscaling.Min)
+		} else {
+			n += int(p.Replicas)
+		}
+	}
+	return n
+}
+
 // maxNodes is the most nodes the cluster can reach: the control plane plus
 // every pool at its fixed size or autoscaling maximum.
 func (c *ClusterConfig) maxNodes() int {

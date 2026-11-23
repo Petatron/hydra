@@ -53,6 +53,25 @@ const (
 	sentinelMTU         = `mtu: "65000"`
 )
 
+// operatorHA is what the chart renders differently for operator.replicas 2
+// than for the 1 the embedded manifest is rendered with (hack/gen-cilium.sh
+// checks that this is the whole difference).
+var operatorHA = []struct{ from, to string }{
+	{"\n  replicas: 1\n", "\n  replicas: 2\n"},
+	{"\n      maxUnavailable: 100%\n", "\n      maxUnavailable: 50%\n"},
+}
+
+// OperatorReplicas is the Cilium operator's replica count for the cluster: 2
+// when it always has at least two nodes, so losing one node does not stop
+// IPAM and identity garbage collection, and 1 otherwise, since the replicas
+// keep apart and a second could never be scheduled.
+func OperatorReplicas(c *config.ClusterConfig) int {
+	if c.MinNodes() >= 2 {
+		return 2
+	}
+	return 1
+}
+
 var (
 	//go:embed templates/cluster.yaml.tmpl
 	clusterTemplate string
@@ -324,6 +343,14 @@ func ciliumFor(c *config.ClusterConfig) (string, error) {
 			return "", fmt.Errorf("embedded Cilium manifest has no %q: regenerate it with hack/gen-cilium.sh", s.from)
 		}
 		m = strings.ReplaceAll(m, s.from, s.to)
+	}
+	if OperatorReplicas(c) == 2 {
+		for _, s := range operatorHA {
+			if strings.Count(m, s.from) != 1 {
+				return "", fmt.Errorf("embedded Cilium manifest has %d of %q, want 1: regenerate it with hack/gen-cilium.sh", strings.Count(m, s.from), s.from)
+			}
+			m = strings.Replace(m, s.from, s.to, 1)
+		}
 	}
 	return m, nil
 }
