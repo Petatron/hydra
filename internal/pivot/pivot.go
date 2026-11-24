@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"time"
 
@@ -111,8 +112,13 @@ type Pivot struct {
 	allowUnsettled bool
 	// credentialsSecret is read from the live HydraCluster by preflight.
 	credentialsSecret string
-	Out               io.Writer
-	Poll              time.Duration
+	// expectedAddons are the cluster's HelmChartProxies on the source, read
+	// just before the move, held only for this run: verify requires each on
+	// the target. A rerun that finds the objects already moved has no
+	// source to read, and verifies what the target holds.
+	expectedAddons []string
+	Out            io.Writer
+	Poll           time.Duration
 }
 
 func (p *Pivot) logf(format string, args ...any) {
@@ -317,6 +323,25 @@ var movableKinds = []schema.GroupVersionKind{
 	// CAAPH's objects move too (PET-97); without the CRDs they hold nothing.
 	{Group: crsGVK.Group, Version: caaphAPIVersion, Kind: render.KindHelmChartProxy},
 	{Group: crsGVK.Group, Version: caaphAPIVersion, Kind: "HelmReleaseProxy"},
+}
+
+// addonNames lists the cluster's HelmChartProxies by name; none when CAAPH
+// is not installed.
+func (p *Pivot) addonNames(ctx context.Context, c client.Client) ([]string, error) {
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(schema.GroupVersionKind{Group: crsGVK.Group, Version: caaphAPIVersion, Kind: render.KindHelmChartProxy + "List"})
+	if err := c.List(ctx, list, client.InNamespace(p.Namespace), client.MatchingLabels{render.ClusterLabelKey: p.Name}); err != nil {
+		if meta.IsNoMatchError(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	names := make([]string, 0, len(list.Items))
+	for i := range list.Items {
+		names = append(names, list.Items[i].GetName())
+	}
+	slices.Sort(names)
+	return names, nil
 }
 
 // caaphAPIVersion is the API version of CAAPH's objects.
@@ -548,6 +573,11 @@ func crdsLabelled(ctx context.Context, c client.Client) error {
 }
 
 func (p *Pivot) move(ctx context.Context) error {
+	addons, err := p.addonNames(ctx, p.Source.C)
+	if err != nil {
+		return fmt.Errorf("listing the cluster's addons on the %s: %w", p.Source.Name, err)
+	}
+	p.expectedAddons = addons
 	p.logf("moving namespace %s from the %s to %s", p.Namespace, p.Source.Name, p.Target.Name)
 	if err := p.Hooks.Move(ctx, p.Source.Kubeconfig, p.Target.Kubeconfig, p.Namespace, false); err != nil {
 		return fmt.Errorf("clusterctl move: %w (rerun %s: it finds where the objects are and continues)", err, p.rerun())
@@ -619,6 +649,17 @@ func (p *Pivot) verifyOnce(ctx context.Context) error {
 	// Addons must be reconciled again on the target. A move makes CAAPH
 	// there replace each HelmReleaseProxy (harmlessly, PET-97); Ready says
 	// the replacement found its release.
+	if len(p.expectedAddons) > 0 {
+		onTarget, err := p.addonNames(ctx, p.Target.C)
+		if err != nil {
+			return fmt.Errorf("listing addons on %s: %w", p.Target.Name, err)
+		}
+		for _, name := range p.expectedAddons {
+			if !slices.Contains(onTarget, name) {
+				return fmt.Errorf("addon HelmChartProxy %s did not arrive on %s", name, p.Target.Name)
+			}
+		}
+	}
 	if !st.AddonsReady() {
 		return fmt.Errorf("addons on %s are not all Ready: %s", p.Target.Name, st.Line())
 	}

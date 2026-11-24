@@ -216,6 +216,17 @@ func TestPivotAcceptsReconciledAddon(t *testing.T) {
 	}
 }
 
+// The addons the source held before the move must all be on the target:
+// a target with none (where AddonsReady alone would pass) does not verify.
+func TestPivotRequiresTheSourceAddonsOnTheTarget(t *testing.T) {
+	src := newClient(t, append(append(clusterObjects("src", true), addonProxy("True")), labelledCRDs()...)...)
+	tgt := newClient(t, labelledCRDs()...)
+	err := pivotFor(t, src, tgt, &recorder{takeOver: true}).Run(context.Background(), 200*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "addon HelmChartProxy c-metrics-server did not arrive") {
+		t.Fatalf("got %v", err)
+	}
+}
+
 // verifyOnce passes only for a live, resumed, taken-over target whose
 // source no longer holds the Cluster.
 func TestVerifyOnce(t *testing.T) {
@@ -245,7 +256,9 @@ func TestVerifyOnce(t *testing.T) {
 		srcF    []*fault
 		mutate  func([]client.Object) []client.Object
 		tgtF    []*fault
-		want    string
+		// expect is the addons the source held before the move.
+		expect []string
+		want   string
 	}{
 		{name: "verified", want: ""},
 		{name: "source unreadable", srcF: []*fault{{verb: "get", kind: lcCluster, err: errBoom}}, want: "reading the bootstrap cluster"},
@@ -265,6 +278,14 @@ func TestVerifyOnce(t *testing.T) {
 		{name: "addon Ready on the target", mutate: func(o []client.Object) []client.Object {
 			return append(o, addonProxy("True"))
 		}, want: ""},
+		{name: "expected addon arrived and Ready", mutate: func(o []client.Object) []client.Object {
+			return append(o, addonProxy("True"))
+		}, expect: []string{"c-metrics-server"}, want: ""},
+		// No proxies on the target at all: AddonsReady alone would pass.
+		{name: "expected addon missing", expect: []string{"c-metrics-server"}, want: "addon HelmChartProxy c-metrics-server did not arrive"},
+		{name: "only another addon on the target", mutate: func(o []client.Object) []client.Object {
+			return append(o, addonProxy("True"))
+		}, expect: []string{"c-cert-manager"}, want: "addon HelmChartProxy c-cert-manager did not arrive"},
 		{name: "CNI set missing", tgtF: []*fault{{verb: "get", kind: "ClusterResourceSet", err: errBoom}}, want: "the CNI ClusterResourceSet did not arrive"},
 		// cni: external: no CNI label, no set and no binding to carry.
 		{name: "external CNI", mutate: func(o []client.Object) []client.Object {
@@ -285,7 +306,9 @@ func TestVerifyOnce(t *testing.T) {
 			if tc.tgtF != nil {
 				tgt = faulty(t, tgt, tc.tgtF...)
 			}
-			err := pivotFor(t, src, tgt, &recorder{}).verifyOnce(ctx)
+			pv := pivotFor(t, src, tgt, &recorder{})
+			pv.expectedAddons = tc.expect
+			err := pv.verifyOnce(ctx)
 			if tc.want == "" {
 				if err != nil {
 					t.Fatal(err)
