@@ -123,6 +123,26 @@ says() {
   fi
 }
 
+# lacks NAME TEXT: $work/NAME.out does not contain TEXT.
+lacks() {
+  if grep -qF -- "$2" "$work/$1.out"; then
+    echo "FAIL: $1 output contains: $2" >&2
+    exit 1
+  fi
+}
+
+# kept NAME KIND: the KIND apply kept as still referenced for the removed
+# pool, by the name it printed (templates are named after their content).
+kept() {
+  sed -n "s|^kept: still referenced $2 $ns/\($name-extra-[0-9a-f]*\) .*|\1|p" "$work/$1.out" >"$work/kept.out"
+  k=$(cat "$work/kept.out")
+  if [ -z "$k" ]; then
+    echo "FAIL: $1 did not keep the pool's $2 as still referenced" >&2
+    exit 1
+  fi
+  echo "$k"
+}
+
 # state KIND NAME: "live", or "gone" when it is deleted or being deleted (a
 # finalizer may hold it while its controller cleans up).
 ns=e2e
@@ -201,6 +221,8 @@ echo "--- apply refuses before writing anything"
 refused apply-refused "$hydra" cluster apply -f "$full" --wait=false
 says apply-refused "not applying"
 says apply-refused "--allow-remove=cert-manager"
+# Manager.Apply logs this only after writing: the refusal must come first.
+lacks apply-refused "applied "
 expect hydramachinetemplate "$name-cp-stale" live
 expect helmchartproxy "$name-cert-manager" live
 
@@ -215,15 +237,33 @@ echo "--- plan shows what dropping the pool and the addon does"
 run plan-dropped "$hydra" cluster plan -f "$cfg"
 says plan-dropped "- prune HelmChartProxy $ns/$name-metrics-server"
 says plan-dropped "needs --prune-pools=extra"
+# Dropping the pool and the addon changes nothing else.
+says plan-dropped "No changes to apply;"
 
 echo "--- apply prunes the dropped addon and keeps the pool"
 run apply-dropped "$hydra" cluster apply -f "$cfg" --wait=false
 says apply-dropped "needs --prune-pools=extra"
 expect helmchartproxy "$name-metrics-server" gone
 expect machinedeployment "$name-extra" live
+# The pool's templates are in use while its MachineSet is: kept, not pruned.
+hmt=$(kept apply-dropped HydraMachineTemplate)
+kct=$(kept apply-dropped KubeadmConfigTemplate)
+expect hydramachinetemplate "$hmt" live
+expect kubeadmconfigtemplate "$kct" live
 
 echo "--- apply --prune-pools=extra deletes the pool"
 run apply-pool "$hydra" cluster apply -f "$cfg" --wait=false --prune-pools=extra
 expect machinedeployment "$name-extra" gone
+# Decided while the MachineDeployment still existed, so its templates are
+# still in use: kept. (A later apply removes them once the MachineSet is gone;
+# when that happens is up to the controllers, so it is not checked here.)
+hmt2=$(kept apply-pool HydraMachineTemplate)
+kct2=$(kept apply-pool KubeadmConfigTemplate)
+if [ "$hmt2" != "$hmt" ] || [ "$kct2" != "$kct" ]; then
+  echo "FAIL: apply-pool kept $hmt2 and $kct2, want $hmt and $kct" >&2
+  exit 1
+fi
+expect hydramachinetemplate "$hmt" live
+expect kubeadmconfigtemplate "$kct" live
 
 echo "--- e2e passed"
