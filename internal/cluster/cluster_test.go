@@ -695,6 +695,83 @@ func TestCNIConflict(t *testing.T) {
 	}
 }
 
+// State finds hydra's CNI proxy and the pre-PET-100 ClusterResourceSet by
+// name and hydra's label; CNIConflict then refuses switching a CAAPH-managed
+// Cilium to cni: external, and taking over a cluster still on the old set.
+func TestCNIConflictWithCAAPH(t *testing.T) {
+	ctx := context.Background()
+	labelledFor := func(gvk schema.GroupVersionKind, name, cluster string) *unstructured.Unstructured {
+		o := obj(gvk, "ns", name, nil)
+		o.SetLabels(map[string]string{render.ClusterLabelKey: cluster})
+		return o
+	}
+	cl := func(name string) *unstructured.Unstructured {
+		o := obj(clusterGVK, "ns", name, nil)
+		o.SetLabels(map[string]string{render.CNILabelKey: name})
+		return o
+	}
+	objs := []client.Object{
+		cl("caaph"), labelledFor(hcpGVK, "caaph-cilium", "caaph"),
+		cl("legacy"), labelledFor(crsGVK, "legacy-cilium", "legacy"),
+		cl("foreign"), labelledFor(hcpGVK, "foreign-cilium", "someone-else"),
+	}
+	m := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(objs...).Build()}
+	for _, tc := range []struct {
+		name     string
+		hydraCNI bool
+		proxy    bool
+		legacy   bool
+		want     string
+	}{
+		{"caaph", true, true, false, ""},
+		{"caaph", false, true, false, "would uninstall Cilium from the running cluster"},
+		{"legacy", true, false, true, "Clusters on the old ClusterResourceSet"},
+		{"legacy", false, false, true, ""},
+		{"foreign", false, false, false, ""}, // not labelled for this cluster
+	} {
+		st, err := m.State(ctx, "ns", tc.name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.CNIProxy != tc.proxy || st.LegacyCNI != tc.legacy {
+			t.Errorf("%s: proxy=%v legacy=%v", tc.name, st.CNIProxy, st.LegacyCNI)
+		}
+		msg := st.CNIConflict(tc.hydraCNI, "kubectl")
+		if (tc.want == "") != (msg == "") || !strings.Contains(msg, tc.want) {
+			t.Errorf("%s hydraCNI=%v: got %q, want %q", tc.name, tc.hydraCNI, msg, tc.want)
+		}
+	}
+
+	// A read that fails is an error, not "no proxy".
+	failing := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cl("caaph")).WithInterceptorFuncs(interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, o client.Object, opts ...client.GetOption) error {
+			if o.GetObjectKind().GroupVersionKind().Kind == hcpGVK.Kind {
+				return errors.New("forbidden")
+			}
+			return c.Get(ctx, key, o, opts...)
+		},
+	}).Build()}
+	if _, err := failing.State(ctx, "ns", "caaph"); err == nil || !strings.Contains(err.Error(), "reading the CNI HelmChartProxy") {
+		t.Errorf("got %v", err)
+	}
+}
+
+// A HelmReleaseProxy list that fails is an error, never "not installed".
+func TestCNIStatusListError(t *testing.T) {
+	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cniProxy("1.19.1")).WithInterceptorFuncs(interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, l client.ObjectList, opts ...client.ListOption) error {
+			if u, ok := l.(*unstructured.UnstructuredList); ok && u.GroupVersionKind().Kind == "HelmReleaseProxyList" {
+				return errors.New("forbidden")
+			}
+			return c.List(ctx, l, opts...)
+		},
+	}).Build()
+	var s Summary
+	if err := (&Manager{C: c}).cniStatus(context.Background(), "ns", "c", &s); err == nil || !strings.Contains(err.Error(), "listing the CNI HelmReleaseProxy") {
+		t.Errorf("got %v", err)
+	}
+}
+
 func TestCNILabelLeft(t *testing.T) {
 	ctx := context.Background()
 	labelled := obj(clusterGVK, "ns", "c", nil)

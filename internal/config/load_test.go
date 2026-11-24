@@ -122,6 +122,7 @@ func TestRejects(t *testing.T) {
 		{"bad label", "    bridges: [br0]", "    bridges: [br0]\n  nodePools:\n    - {name: w, replicas: 1, vcpus: 1, memory: 2Gi, diskSize: 20Gi, labels: {'a b': x}}", "labels"},
 		{"unknown addon", "  storagePool: pool", "  storagePool: pool\n  addons:\n    - name: nope", "unknown addon \"nope\""},
 		{"duplicate addon", "  storagePool: pool", "  storagePool: pool\n  addons:\n    - name: metrics-server\n    - name: metrics-server", "more than once"},
+		{"the CNI as an addon", "  storagePool: pool", "  storagePool: pool\n  addons:\n    - {name: cilium}", "spec.addons[0].name: cilium is the CNI"},
 		{"addon version", "  storagePool: pool", "  storagePool: pool\n  addons:\n    - {name: metrics-server, version: 9.9.9}", "spec.addons[0].version"},
 		{"addon param", "  storagePool: pool", "  storagePool: pool\n  addons:\n    - {name: metrics-server, params: {kubeletInsecureTLS: maybe}}", "params.kubeletInsecureTLS"},
 		{"addon unknown param", "  storagePool: pool", "  storagePool: pool\n  addons:\n    - {name: metrics-server, params: {values: {a: b}}}", "params.values: unknown"},
@@ -248,20 +249,26 @@ func TestCNIModes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Spec.Network.CNI != CNIHydra || c.Spec.Network.MTU != DefaultMTU {
-		t.Errorf("default: cni %q mtu %d", c.Spec.Network.CNI, c.Spec.Network.MTU)
+	if c.Spec.Network.CNI != CNIHydra || c.Spec.Network.MTU != DefaultMTU || c.Spec.Network.CiliumVersion != "1.19.1" {
+		t.Errorf("default: cni %q mtu %d ciliumVersion %q", c.Spec.Network.CNI, c.Spec.Network.MTU, c.Spec.Network.CiliumVersion)
+	}
+	c, err = Parse([]byte(valid + "    ciliumVersion: 1.19.11\n"))
+	if err != nil || c.Spec.Network.CiliumVersion != "1.19.11" {
+		t.Errorf("ciliumVersion 1.19.11: %v %q", err, c.Spec.Network.CiliumVersion)
 	}
 	c, err = Parse([]byte(valid + "    cni: external\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Spec.Network.CNI != CNIExternal || c.Spec.Network.MTU != 0 {
-		t.Errorf("external: cni %q mtu %d (no MTU default: it is Cilium's)", c.Spec.Network.CNI, c.Spec.Network.MTU)
+	if c.Spec.Network.CNI != CNIExternal || c.Spec.Network.MTU != 0 || c.Spec.Network.CiliumVersion != "" {
+		t.Errorf("external: cni %q mtu %d ciliumVersion %q (no defaults: they are hydra's Cilium's)", c.Spec.Network.CNI, c.Spec.Network.MTU, c.Spec.Network.CiliumVersion)
 	}
 	for in, want := range map[string]string{
-		"    cni: external\n    mtu: 1450\n": "spec.network.mtu: sets the MTU of hydra's Cilium",
-		"    cni: calico\n":                  `spec.network.cni: must be "hydra" or "external", got "calico"`,
-		"    cni: hydra\n    mtu: 100\n":     "spec.network.mtu: must be between 1280 and 9000",
+		"    cni: external\n    mtu: 1450\n":             "spec.network.mtu: sets the MTU of hydra's Cilium",
+		"    cni: calico\n":                              `spec.network.cni: must be "hydra" or "external", got "calico"`,
+		"    cni: hydra\n    mtu: 100\n":                 "spec.network.mtu: must be between 1280 and 9000",
+		"    ciliumVersion: 1.18.0\n":                    `spec.network.ciliumVersion: hydra allows 1.19.1, 1.19.11, got "1.18.0"`,
+		"    cni: external\n    ciliumVersion: 1.19.1\n": "spec.network.ciliumVersion: picks the version of hydra's Cilium",
 	} {
 		if _, err := Parse([]byte(valid + in)); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("%q: want %q, got %v", in, want, err)

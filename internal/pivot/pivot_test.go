@@ -37,11 +37,11 @@ func u(gvk schema.GroupVersionKind, namespace, n string, fields map[string]any) 
 }
 
 var (
-	kcpGVK  = schema.GroupVersionKind{Group: "controlplane.cluster.x-k8s.io", Version: "v1beta2", Kind: "KubeadmControlPlane"}
-	crdGVK  = schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}
-	secGVK  = schema.GroupVersionKind{Version: "v1", Kind: "Secret"}
-	hcpGVK  = schema.GroupVersionKind{Group: "addons.cluster.x-k8s.io", Version: caaphAPIVersion, Kind: "HelmChartProxy"}
-	hrpGVK  = schema.GroupVersionKind{Group: "addons.cluster.x-k8s.io", Version: caaphAPIVersion, Kind: "HelmReleaseProxy"}
+	kcpGVK = schema.GroupVersionKind{Group: "controlplane.cluster.x-k8s.io", Version: "v1beta2", Kind: "KubeadmControlPlane"}
+	crdGVK = schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}
+	secGVK = schema.GroupVersionKind{Version: "v1", Kind: "Secret"}
+	hcpGVK = schema.GroupVersionKind{Group: "addons.cluster.x-k8s.io", Version: caaphAPIVersion, Kind: "HelmChartProxy"}
+	hrpGVK = schema.GroupVersionKind{Group: "addons.cluster.x-k8s.io", Version: caaphAPIVersion, Kind: "HelmReleaseProxy"}
 )
 
 // cniObjects are cluster name's CNI HelmChartProxy and the HelmReleaseProxy

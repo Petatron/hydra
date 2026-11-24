@@ -320,12 +320,12 @@ func comparable(o *unstructured.Unstructured) string {
 
 // Summary is a cluster's progress as its controllers report it.
 type Summary struct {
-	Exists            bool
-	Available         string // condition status, "" if not yet reported
-	AvailableReason   string
-	AvailableMessage  string
-	ControlPlane      string // "ready/desired"
-	Machines          map[string]int
+	Exists           bool
+	Available        string // condition status, "" if not yet reported
+	AvailableReason  string
+	AvailableMessage string
+	ControlPlane     string // "ready/desired"
+	Machines         map[string]int
 	// CNIApplied: CAAPH reports hydra's Cilium installed at the version the
 	// proxy asks for. CNIProxyPresent: CAAPH has a HelmReleaseProxy for it,
 	// installed or not; CNIWhy is why it is not Ready yet.

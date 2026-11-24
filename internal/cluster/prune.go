@@ -193,6 +193,10 @@ func classifyProxy(o *unstructured.Unstructured, pc pruneContext) (PruneAction, 
 	hydras := name != "" && o.GetName() == render.AddonName(pc.cluster, name)
 	entry, known := lookupAddon(name)
 	switch {
+	case known && entry.CNI:
+		// No flag removes the CNI (ADR-002 decision 4). Any proxy labelled
+		// for it may share its release, so none is removed on its own.
+		return PruneRefused, fmt.Sprintf("this is the CNI (%s): removing its proxy uninstalls %s from the running cluster, and nodes still read Ready, so apply never removes it, not even with --allow-remove. Put spec.network.cni: hydra back; handing it to another tool is a break-glass procedure (README, \"Leaving hydra's Cilium\")", name, name)
 	case allowedProxy && !hydras:
 		// proxy/<name> is for proxies hydra did not make. hydra's own proxy
 		// for a protected or uncatalogued addon still needs the addon named.
