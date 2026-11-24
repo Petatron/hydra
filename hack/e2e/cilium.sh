@@ -17,7 +17,9 @@
 # CAPD (CAPD needs the Docker socket inside the kind node), so this stage
 # builds its own.
 #
-# Needs Docker, kubectl and Go. clusterctl is downloaded at the pinned
+# Needs Docker, kubectl and Go. On Linux, CAPD needs inotify limits above
+# most distributions' defaults (fs.inotify.max_user_watches=1048576,
+# max_user_instances=8192); CI raises them. clusterctl is downloaded at the pinned
 # version unless CLUSTERCTL names one. Run from the repo root:
 # ./hack/e2e/cilium.sh
 set -eu
@@ -57,7 +59,25 @@ trap 'exit 143' TERM
 
 fail() {
   echo "FAIL: $*" >&2
+  diagnose >&2 || true
   exit 1
+}
+
+# diagnose prints what a failed run needs: the workload cluster's nodes and
+# pods, Cilium's events and the agents' logs, and CAAPH's view.
+diagnose() {
+  [ -s "$work/wl.kubeconfig" ] || return 0
+  echo "--- diagnostics"
+  wlk get nodes -o wide || true
+  wlk get pods -A -o wide || true
+  wlk -n kube-system describe daemonset cilium || true
+  wlk -n kube-system get events --sort-by=.lastTimestamp || true
+  for pod in $(wlk -n kube-system get pods -l k8s-app=cilium -o name 2>/dev/null); do
+    echo "--- $pod"
+    wlk -n kube-system logs "$pod" --all-containers --tail=80 || true
+    wlk -n kube-system logs "$pod" --all-containers --previous --tail=40 2>/dev/null || true
+  done
+  kubectl get helmreleaseproxy -A -o yaml || true
 }
 
 echo "--- building hydra"
@@ -177,8 +197,8 @@ wait_cilium() {
     sleep 10
   done
   [ "$(kubectl get helmreleaseproxy -l "$sel" --no-headers | wc -l | tr -d ' ')" = 1 ] || fail "not exactly one HelmReleaseProxy for $wl-cilium"
-  kubectl --kubeconfig "$work/wl.kubeconfig" wait nodes --all --for=condition=Ready --timeout=5m
-  kubectl --kubeconfig "$work/wl.kubeconfig" -n kube-system rollout status daemonset/cilium --timeout=5m
+  kubectl --kubeconfig "$work/wl.kubeconfig" wait nodes --all --for=condition=Ready --timeout=5m || fail "the nodes did not go Ready on Cilium $1"
+  kubectl --kubeconfig "$work/wl.kubeconfig" -n kube-system rollout status daemonset/cilium --timeout=5m || fail "the cilium DaemonSet did not roll out at $1"
   image=$(wlk -n kube-system get daemonset cilium -o 'jsonpath={.spec.template.spec.containers[0].image}')
   case $image in *":v$1@"* | *":v$1") ;; *) fail "the cilium DaemonSet runs $image, want v$1" ;; esac
   echo "    Cilium $1, revision $2, every node Ready ($image)"

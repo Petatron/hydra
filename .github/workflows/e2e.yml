@@ -66,6 +66,13 @@ jobs:
           go-version-file: go.mod
       # clusterctl reads provider release metadata from GitHub; the job token
       # keeps it clear of the anonymous API rate limit.
+      # CAPD runs kubelets inside kind node containers; the runner's default
+      # inotify limits are too low for them and the Cilium agents (Cluster API
+      # book, "Quick Start", Linux hosts).
+      - name: Raise inotify limits for CAPD
+        run: |
+          sudo sysctl -w fs.inotify.max_user_watches=1048576
+          sudo sysctl -w fs.inotify.max_user_instances=8192
       - name: Run the Cilium e2e test
         env:
           GITHUB_TOKEN: ${{ github.token }}
