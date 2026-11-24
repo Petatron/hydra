@@ -40,8 +40,22 @@ var (
 	kcpGVK  = schema.GroupVersionKind{Group: "controlplane.cluster.x-k8s.io", Version: "v1beta2", Kind: "KubeadmControlPlane"}
 	crdGVK  = schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}
 	secGVK  = schema.GroupVersionKind{Version: "v1", Kind: "Secret"}
-	bindGVK = schema.GroupVersionKind{Group: "addons.cluster.x-k8s.io", Version: "v1beta2", Kind: "ClusterResourceSetBinding"}
+	hcpGVK  = schema.GroupVersionKind{Group: "addons.cluster.x-k8s.io", Version: caaphAPIVersion, Kind: "HelmChartProxy"}
+	hrpGVK  = schema.GroupVersionKind{Group: "addons.cluster.x-k8s.io", Version: caaphAPIVersion, Kind: "HelmReleaseProxy"}
 )
+
+// cniObjects are cluster name's CNI HelmChartProxy and the HelmReleaseProxy
+// CAAPH made from it, Ready.
+func cniObjects() (*unstructured.Unstructured, *unstructured.Unstructured) {
+	hcp := u(hcpGVK, ns, name+"-cilium", map[string]any{"spec": map[string]any{"version": "1.19.1"}})
+	hcp.SetLabels(map[string]string{"hydra.io/cluster": name, "hydra.io/addon": "cilium"})
+	hrp := u(hrpGVK, ns, name+"-cilium-abc", map[string]any{
+		"spec":   map[string]any{"version": "1.19.1"},
+		"status": map[string]any{"conditions": []any{map[string]any{"type": "Ready", "status": "True"}}},
+	})
+	hrp.SetLabels(map[string]string{clusterNameLabel: name, "helmreleaseproxy.addons.cluster.x-k8s.io/helmchartproxy-name": name + "-cilium"})
+	return hcp, hrp
+}
 
 func readyStatus() map[string]any {
 	return map[string]any{"conditions": []any{map[string]any{"type": "Available", "status": "True"}}}
@@ -69,17 +83,14 @@ func clusterObjects(uidSuffix string, identityRecorded bool) []client.Object {
 		"cacert.pem": "Y2E=", "clientcert.pem": "Y2VydA==", "clientkey.pem": "a2V5",
 	}})
 	sec.SetLabels(map[string]string{moveLabel: ""})
-	crs := u(crsGVK, ns, name+"-cilium", nil)
-	bind := u(bindGVK, ns, name, map[string]any{"spec": map[string]any{"bindings": []any{
-		map[string]any{"clusterResourceSetName": name + "-cilium", "resources": []any{map[string]any{"applied": true}}},
-	}}})
+	hcp, hrp := cniObjects()
 	hc := u(hydraClusterGVK, ns, name, map[string]any{"spec": map[string]any{"hypervisor": map[string]any{
 		"credentialsSecretRef": map[string]any{"name": "c-pki"},
 	}}})
-	for _, o := range []*unstructured.Unstructured{kcp, crs, hc} {
+	for _, o := range []*unstructured.Unstructured{kcp, hc} {
 		o.SetLabels(map[string]string{"hydra.io/cluster": name}) // as rendered
 	}
-	return []client.Object{cl, kcp, hm, sec, crs, bind, hc}
+	return []client.Object{cl, kcp, hm, sec, hcp, hrp, hc}
 }
 
 func labelledCRDs() []client.Object {
@@ -112,9 +123,11 @@ type recorder struct {
 	failAfterDeleting int
 	// takeOver controls whether moved HydraMachines claim their VM on arrival.
 	takeOver bool
+	// lose names objects the move never creates on the target.
+	lose []string
 }
 
-var movedKinds = []schema.GroupVersionKind{clusterGVK, kcpGVK, hydraMachineGVK, secGVK, crsGVK, bindGVK, hydraClusterGVK}
+var movedKinds = []schema.GroupVersionKind{clusterGVK, kcpGVK, hydraMachineGVK, secGVK, hcpGVK, hrpGVK, hydraClusterGVK}
 
 func setPaused(ctx context.Context, c client.Client, v bool) error {
 	cl := &unstructured.Unstructured{}
@@ -152,6 +165,9 @@ func fakeMove(ctx context.Context, from, to client.Client, rec *recorder) error 
 		all = append(all, list.Items...)
 	}
 	for i := range all {
+		if slices.Contains(rec.lose, all[i].GetName()) {
+			continue
+		}
 		o := all[i].DeepCopy()
 		o.SetResourceVersion("")
 		newUID := types.UID(string(o.GetUID()) + "-moved")
@@ -649,17 +665,17 @@ func TestPivotVerifyNeedsALiveTargetWithCNI(t *testing.T) {
 		mutate func(ctx context.Context, tgt client.Client) error
 		want   string
 	}{
-		{"CNI binding not applied", func(ctx context.Context, tgt client.Client) error {
-			b := &unstructured.Unstructured{}
-			b.SetGroupVersionKind(bindGVK)
-			if err := tgt.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, b); err != nil {
+		{"CNI not installed on the target", func(ctx context.Context, tgt client.Client) error {
+			// CAAPH on the target replaced the moved HelmReleaseProxy and has
+			// not installed it yet.
+			h := &unstructured.Unstructured{}
+			h.SetGroupVersionKind(hrpGVK)
+			if err := tgt.Get(ctx, client.ObjectKey{Namespace: ns, Name: name + "-cilium-abc"}, h); err != nil {
 				return err
 			}
-			_ = unstructured.SetNestedSlice(b.Object, []any{map[string]any{
-				"clusterResourceSetName": name + "-cilium", "resources": []any{map[string]any{"applied": false}},
-			}}, "spec", "bindings")
-			return tgt.Update(ctx, b)
-		}, "CNI"},
+			_ = unstructured.SetNestedSlice(h.Object, []any{map[string]any{"type": "Ready", "status": "False", "reason": "HelmReleasePending"}}, "status", "conditions")
+			return tgt.Update(ctx, h)
+		}, "CNI installing"},
 		{"target Cluster being deleted", func(ctx context.Context, tgt client.Client) error {
 			cl := &unstructured.Unstructured{}
 			cl.SetGroupVersionKind(clusterGVK)

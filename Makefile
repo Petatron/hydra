@@ -28,13 +28,9 @@ test: ## Run unit and golden-file tests
 golden: ## Rewrite render golden files after an intended output change (review the diff!)
 	go test ./internal/render -update
 
-.PHONY: cilium
-cilium: ## Regenerate the embedded Cilium manifest (needs helm)
-	./hack/gen-cilium.sh
-
-.PHONY: cilium-drift
-cilium-drift: cilium ## Fail if the embedded Cilium manifest differs from the pinned chart
-	git diff --exit-code internal/render/assets/cilium.yaml
+.PHONY: cilium-check
+cilium-check: ## Render the Cilium chart with hydra's values at every allowed version (needs helm)
+	./hack/check-cilium.sh
 
 .PHONY: dist
 dist: ## Build release binaries for every DIST_PLATFORMS entry, with SHA256 checksums, into dist/

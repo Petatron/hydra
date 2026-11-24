@@ -28,12 +28,11 @@ import (
 const (
 	// KubeVIPImage holds the control-plane endpoint.
 	KubeVIPImage = "ghcr.io/kube-vip/kube-vip:v0.8.9"
-	// CiliumVersion is the chart hack/gen-cilium.sh rendered assets/cilium.yaml from.
-	CiliumVersion = "1.19.1"
-
-	// CNILabelKey on a Cluster selects the ClusterResourceSet that installs
-	// its CNI. The value is the cluster's name, so each cluster's set (which
-	// carries that cluster's pod CIDR and MTU) matches only that cluster.
+	// CNILabelKey on a Cluster selects the HelmChartProxy that installs its
+	// CNI. The value is the cluster's name, so each cluster's proxy (which
+	// carries that cluster's pod CIDR and MTU) matches only that cluster. A
+	// Cluster without it is never given hydra's Cilium, and removing it from
+	// a running Cluster uninstalls Cilium (PET-97): hydra never does.
 	CNILabelKey = "cni.hydra.io/cilium"
 
 	// ClusterLabelKey is on every rendered object, valued with the cluster's
@@ -44,27 +43,17 @@ const (
 	AddonLabelKey = "hydra.io/addon"
 )
 
-const (
-	kindConfigMap          = "ConfigMap"
-	kindClusterResourceSet = "ClusterResourceSet"
-	// KindHelmChartProxy is CAAPH's per-addon object.
-	KindHelmChartProxy = "HelmChartProxy"
-)
+// KindHelmChartProxy is CAAPH's per-addon object.
+const KindHelmChartProxy = "HelmChartProxy"
 
-// Sentinels hack/gen-cilium.sh renders in place of the per-cluster values.
+// The per-cluster values in the canonical Cilium values are these sentinels
+// (see the header of internal/addons/cilium-values.yaml).
 const (
 	sentinelClusterName = "hydra-sentinel-cluster"
 	sentinelPodCIDR     = "10.255.254.0/24"
-	sentinelMTU         = `mtu: "65000"`
+	sentinelMTU         = 65000
+	sentinelOperator    = 1
 )
-
-// operatorHA is what the chart renders differently for operator.replicas 2
-// than for the 1 the embedded manifest is rendered with (hack/gen-cilium.sh
-// checks that this is the whole difference).
-var operatorHA = []struct{ from, to string }{
-	{"\n  replicas: 1\n", "\n  replicas: 2\n"},
-	{"\n      maxUnavailable: 100%\n", "\n      maxUnavailable: 50%\n"},
-}
 
 // OperatorReplicas is the Cilium operator's replica count for the cluster: 2
 // when it always has at least two nodes, so losing one node does not stop
@@ -80,8 +69,6 @@ func OperatorReplicas(c *config.ClusterConfig) int {
 var (
 	//go:embed templates/cluster.yaml.tmpl
 	clusterTemplate string
-	//go:embed assets/cilium.yaml
-	ciliumManifest string
 
 	tmpl = template.Must(template.New("cluster").
 		Funcs(template.FuncMap{"q": strconv.Quote, "nodeSetupArgs": newNodeSetupArgs}).
@@ -216,7 +203,7 @@ func Render(c *config.ClusterConfig, opts Options) ([]byte, error) {
 		return nil, fmt.Errorf("rendering cluster manifests: %w", err)
 	}
 	if HydraCNI(c) {
-		cni, err := renderCNI(c)
+		cni, err := renderCilium(c)
 		if err != nil {
 			return nil, err
 		}
@@ -257,6 +244,12 @@ type helmChartProxySpec struct {
 	Namespace         string        `json:"namespace"`
 	ReconcileStrategy string        `json:"reconcileStrategy"`
 	ValuesTemplate    string        `json:"valuesTemplate"`
+	Options           *helmOptions  `json:"options,omitempty"`
+}
+
+// helmOptions is the part of CAAPH's HelmOptions render sets.
+type helmOptions struct {
+	TakeOwnership bool `json:"takeOwnership,omitempty"`
 }
 
 // AddonName is the HelmChartProxy's name for one of a cluster's addons.
@@ -323,8 +316,9 @@ func HydraCNI(c *config.ClusterConfig) bool { return c.Spec.Network.CNI == confi
 // ControlPlaneName is the KubeadmControlPlane's name for a cluster.
 func ControlPlaneName(cluster string) string { return cluster + "-cp" }
 
-// CNIName is the CNI ConfigMap's and ClusterResourceSet's name for a cluster.
-func CNIName(cluster string) string { return cluster + "-cilium" }
+// CNIName is the name of a cluster's CNI HelmChartProxy, and of the
+// ConfigMap and ClusterResourceSet hydra rendered for it before PET-100.
+func CNIName(cluster string) string { return AddonName(cluster, addons.Cilium) }
 
 // The control plane's pre-drain hook (PET-88). The script finishes within
 // preDrainScriptBudget, plus at most one kubectl request it had started
@@ -364,89 +358,89 @@ func joinLabels(labels map[string]string) string {
 	return strings.Join(parts, ",")
 }
 
-// renderCNI returns the ConfigMap carrying this cluster's Cilium manifest and
-// the ClusterResourceSet that applies it once the cluster's API is up
-// (ADR-001 decision 6).
+// renderCilium returns the HelmChartProxy that installs and upgrades this
+// cluster's Cilium (ADR-002 decision 5): the canonical values with the
+// cluster's own filled in, at spec.network.ciliumVersion.
 //
-// The set uses ApplyOnce. Reconcile would re-apply the manifest whenever the
-// ConfigMap changes, but the manifest contains a Job (Hubble certificate
-// generation), whose pod template is immutable, so a Cilium version change
-// would fail to apply part-way. Upgrading Cilium is left to the upgrade work,
-// not to an implicit re-apply.
-func renderCNI(c *config.ClusterConfig) ([]byte, error) {
-	manifest, err := ciliumFor(c)
+// It selects the Cluster by the CNI label, not the cluster label, so a Cluster
+// that hydra did not label for its CNI never gets hydra's Cilium on top of
+// another one. takeOwnership is set from the first render: CAAPH copies
+// options onto a HelmReleaseProxy only when it creates it (PET-97), and it
+// lets an existing Cilium with no Helm release record be taken over (PET-101)
+// rather than fail. On a fresh cluster there is nothing to take over.
+func renderCilium(c *config.ClusterConfig) ([]byte, error) {
+	entry, ok := addons.Lookup(addons.Cilium)
+	if !ok {
+		return nil, fmt.Errorf("the catalogue has no %s", addons.Cilium)
+	}
+	values, err := CiliumValues(c)
 	if err != nil {
 		return nil, err
 	}
-	name := CNIName(c.Metadata.Name)
-	cm := map[string]any{
-		"apiVersion": "v1",
-		"kind":       kindConfigMap,
-		"metadata": map[string]any{
-			"name":      name,
-			"namespace": c.Metadata.Namespace,
-			"labels":    map[string]string{CNILabelKey: c.Metadata.Name, ClusterLabelKey: c.Metadata.Name},
+	hcp := helmChartProxy{
+		APIVersion: "addons.cluster.x-k8s.io/v1alpha1",
+		Kind:       KindHelmChartProxy,
+		Metadata: objectMeta{
+			Name:      CNIName(c.Metadata.Name),
+			Namespace: c.Metadata.Namespace,
+			Labels:    map[string]string{ClusterLabelKey: c.Metadata.Name, AddonLabelKey: addons.Cilium},
 		},
-		"data": map[string]string{"cilium.yaml": manifest},
+		Spec: helmChartProxySpec{
+			ClusterSelector:   labelSelector{MatchLabels: map[string]string{CNILabelKey: c.Metadata.Name}},
+			RepoURL:           entry.RepoURL,
+			ChartName:         entry.Chart,
+			Version:           c.Spec.Network.CiliumVersion,
+			ReleaseName:       entry.ReleaseName,
+			Namespace:         entry.Namespace,
+			ReconcileStrategy: "Continuous",
+			ValuesTemplate:    values,
+			Options:           &helmOptions{TakeOwnership: true},
+		},
 	}
-	crs := map[string]any{
-		"apiVersion": "addons.cluster.x-k8s.io/v1beta2",
-		"kind":       kindClusterResourceSet,
-		"metadata": map[string]any{
-			"name":      name,
-			"namespace": c.Metadata.Namespace,
-			"labels":    map[string]string{ClusterLabelKey: c.Metadata.Name},
-		},
-		"spec": map[string]any{
-			"strategy": "ApplyOnce",
-			"clusterSelector": map[string]any{
-				"matchLabels": map[string]string{CNILabelKey: c.Metadata.Name},
-			},
-			"resources": []map[string]string{{"kind": kindConfigMap, "name": name}},
-		},
+	b, err := yaml.Marshal(hcp)
+	if err != nil {
+		return nil, err
 	}
 	var out bytes.Buffer
-	for _, header := range []struct {
-		comment string
-		obj     any
-	}{
-		{"# Cilium " + CiliumVersion + " for this cluster, applied by the ClusterResourceSet below.", cm},
-		{"# Installs the CNI once the cluster's API is reachable. ApplyOnce: see the hydra source.", crs},
-	} {
-		b, err := yaml.Marshal(header.obj)
-		if err != nil {
-			return nil, err
-		}
-		out.WriteString("---\n" + header.comment + "\n")
-		out.Write(b)
-	}
+	fmt.Fprintf(&out, "---\n# The CNI: Cilium %s, installed and kept in step by Cluster API Add-on Provider Helm.\n# Never removable: removing it uninstalls Cilium from the running cluster.\n", c.Spec.Network.CiliumVersion)
+	out.Write(b)
 	return out.Bytes(), nil
 }
 
-// ciliumFor substitutes this cluster's values into the embedded manifest.
-func ciliumFor(c *config.ClusterConfig) (string, error) {
-	m := ciliumManifest
-	// Drop the generator's header line; the ConfigMap comment says where it came from.
-	if i := strings.IndexByte(m, '\n'); i >= 0 && strings.HasPrefix(m, "# Code generated") {
-		m = m[i+1:]
+// CiliumValues is the canonical values with this cluster's filled in for the
+// sentinels, as YAML. Each sentinel must be where the canonical file puts it,
+// so a reshaped file fails here rather than installing a sentinel.
+func CiliumValues(c *config.ClusterConfig) (string, error) {
+	var v map[string]any
+	if err := yaml.Unmarshal(addons.CiliumValues, &v); err != nil {
+		return "", fmt.Errorf("canonical Cilium values: %w", err)
 	}
-	for _, s := range []struct{ from, to string }{
-		{sentinelClusterName, c.Metadata.Name},
-		{sentinelPodCIDR, c.Spec.Network.PodCIDR},
-		{sentinelMTU, fmt.Sprintf("mtu: %q", strconv.Itoa(c.Spec.Network.MTU))},
+	for _, s := range []struct {
+		path []string
+		want any
+		to   any
+	}{
+		{[]string{"cluster", "name"}, sentinelClusterName, c.Metadata.Name},
+		{[]string{"ipam", "operator", "clusterPoolIPv4PodCIDRList"}, []any{sentinelPodCIDR}, []any{c.Spec.Network.PodCIDR}},
+		{[]string{"MTU"}, sentinelMTU, c.Spec.Network.MTU},
+		{[]string{"operator", "replicas"}, sentinelOperator, OperatorReplicas(c)},
 	} {
-		if !strings.Contains(m, s.from) {
-			return "", fmt.Errorf("embedded Cilium manifest has no %q: regenerate it with hack/gen-cilium.sh", s.from)
-		}
-		m = strings.ReplaceAll(m, s.from, s.to)
-	}
-	if OperatorReplicas(c) == 2 {
-		for _, s := range operatorHA {
-			if strings.Count(m, s.from) != 1 {
-				return "", fmt.Errorf("embedded Cilium manifest has %d of %q, want 1: regenerate it with hack/gen-cilium.sh", strings.Count(m, s.from), s.from)
+		parent, key := v, s.path[len(s.path)-1]
+		for _, p := range s.path[:len(s.path)-1] {
+			next, ok := parent[p].(map[string]any)
+			if !ok {
+				return "", fmt.Errorf("canonical Cilium values have no %s", strings.Join(s.path, "."))
 			}
-			m = strings.Replace(m, s.from, s.to, 1)
+			parent = next
 		}
+		if got := parent[key]; fmt.Sprint(got) != fmt.Sprint(s.want) {
+			return "", fmt.Errorf("canonical Cilium values: %s is %v, want the sentinel %v", strings.Join(s.path, "."), got, s.want)
+		}
+		parent[key] = s.to
 	}
-	return m, nil
+	b, err := yaml.Marshal(v)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
 }

@@ -1,9 +1,11 @@
 # The canonical Cilium values for every Hydra cluster (PET-94).
 #
-# hack/gen-cilium.sh renders the embedded manifest from these, and the same
-# values are what any other installer of Cilium on a Hydra cluster must use:
-# Argo CD (hydra-gitops), a Helm release, and later the addon controller
-# (PET-95). Change them here, in a reviewed PR, and nowhere else.
+# hydra embeds these and renders them, with the sentinels below filled in, as
+# the values of each cni: hydra cluster's Cilium HelmChartProxy, which Cluster
+# API Add-on Provider Helm installs and upgrades (PET-100). Any other installer
+# of Cilium on a Hydra cluster must use the same values: Argo CD (hydra-gitops)
+# or a Helm release. Change them here, in a reviewed PR, and nowhere else;
+# hack/check-cilium.sh renders them against every chart version hydra allows.
 #
 # This file is a TEMPLATE, not values to install as they are. The values that
 # differ per cluster are sentinels the CLI substitutes when it renders a
@@ -34,8 +36,8 @@ kubeProxyReplacement: false
 routingMode: tunnel
 tunnelProtocol: vxlan
 operator:
-  # sentinel: the manifest is rendered with 1 and the CLI raises it to 2 when
-  # the cluster always has at least 2 nodes (render.OperatorReplicas). Set the
+  # sentinel: hydra sets 2 when the cluster always has at least 2 nodes, and
+  # 1 otherwise (render.OperatorReplicas). Set the
   # integer directly elsewhere: 2 for hydra-mgmt and hydra-wl0 (3 control-plane
   # nodes each), never this 1 copied as it is.
   replicas: 1

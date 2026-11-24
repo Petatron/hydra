@@ -221,7 +221,7 @@ func TestPivotAcceptsReconciledAddon(t *testing.T) {
 func TestPivotRequiresTheSourceAddonsOnTheTarget(t *testing.T) {
 	src := newClient(t, append(append(clusterObjects("src", true), addonProxy("True")), labelledCRDs()...)...)
 	tgt := newClient(t, labelledCRDs()...)
-	err := pivotFor(t, src, tgt, &recorder{takeOver: true}).Run(context.Background(), 200*time.Millisecond)
+	err := pivotFor(t, src, tgt, &recorder{takeOver: true, lose: []string{"c-metrics-server"}}).Run(context.Background(), 200*time.Millisecond)
 	if err == nil || !strings.Contains(err.Error(), "addon HelmChartProxy c-metrics-server did not arrive") {
 		t.Fatalf("got %v", err)
 	}
@@ -286,12 +286,12 @@ func TestVerifyOnce(t *testing.T) {
 		{name: "only another addon on the target", mutate: func(o []client.Object) []client.Object {
 			return append(o, addonProxy("True"))
 		}, expect: []string{"c-cert-manager"}, want: "addon HelmChartProxy c-cert-manager did not arrive"},
-		{name: "CNI set missing", tgtF: []*fault{{verb: "get", kind: "ClusterResourceSet", err: errBoom}}, want: "the CNI ClusterResourceSet did not arrive"},
-		// cni: external: no CNI label, no set and no binding to carry.
+		{name: "CNI proxy unreadable", tgtF: []*fault{{verb: "get", kind: "HelmChartProxy", err: errBoom}}, want: "reading the CNI HelmChartProxy"},
+		// cni: external: no CNI label, and no CNI proxy to read.
 		{name: "external CNI", mutate: func(o []client.Object) []client.Object {
 			o[0].SetLabels(nil)
-			return drop(crsGVK)(drop(bindGVK)(o))
-		}, tgtF: []*fault{{verb: "get", kind: crsGVK.Kind, err: errBoom}}, want: ""},
+			return drop(hcpGVK)(drop(hrpGVK)(o))
+		}, tgtF: []*fault{{verb: "get", kind: hcpGVK.Kind, err: errBoom}}, want: ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			src := newClient(t, tc.srcObjs...)

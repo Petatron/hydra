@@ -26,7 +26,6 @@ var (
 	hmtGVK = schema.GroupVersionKind{Group: infraGroup, Version: infraVersion, Kind: kindHydraMachineTemplate}
 	kctGVK = schema.GroupVersionKind{Group: bootstrapGroup, Version: capiVersion, Kind: kindKubeadmConfigTemplate}
 	mhcGVK = schema.GroupVersionKind{Group: capiGroup, Version: capiVersion, Kind: "MachineHealthCheck"}
-	crsGVK = schema.GroupVersionKind{Group: addonsGroup, Version: capiVersion, Kind: "ClusterResourceSet"}
 )
 
 // withCatalogue makes "guarded" a protected addon and "plain" an

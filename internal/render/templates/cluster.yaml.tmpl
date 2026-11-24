@@ -59,7 +59,8 @@ metadata:
   labels:
     {{ .ClusterLabelKey }}: {{ q .Name }}
 {{- if .CNILabelKey }}
-    # Selects the ClusterResourceSet that installs Cilium.
+    # Selects the HelmChartProxy that installs Cilium. Never remove it from a
+    # running cluster: CAAPH would uninstall Cilium.
     {{ .CNILabelKey }}: {{ q .Name }}
 {{- end }}
 spec:

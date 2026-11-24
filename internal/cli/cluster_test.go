@@ -244,6 +244,7 @@ func TestCreateRefusesAVersionChange(t *testing.T) {
 	// A management cluster: the Cluster API kinds resolve.
 	mapper := meta.NewDefaultRESTMapper(nil)
 	mapper.Add(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta2", Kind: "Cluster"}, meta.RESTScopeNamespace)
+	mapper.Add(schema.GroupVersionKind{Group: "addons.cluster.x-k8s.io", Version: "v1alpha1", Kind: "HelmChartProxy"}, meta.RESTScopeNamespace)
 	withCAPI := fake.NewClientBuilder().WithScheme(c.Scheme()).WithRESTMapper(mapper).
 		WithObjects(capiCluster("default", "hydra-mgmt", "192.168.15.11", 6443), kcp).Build()
 	connectManagement = func([]byte) (client.Client, error) { return withCAPI, nil }
@@ -353,17 +354,29 @@ func cluAvailable(version string, kc []byte) []client.Object {
 	kcp.SetLabels(map[string]string{"hydra.io/cluster": name})
 	_ = unstructured.SetNestedField(kcp.Object, version, "spec", "version")
 	_ = unstructured.SetNestedField(kcp.Object, int64(0), "spec", "replicas")
-	b := &unstructured.Unstructured{Object: map[string]any{}}
-	b.SetAPIVersion("addons.cluster.x-k8s.io/v1beta2")
-	b.SetKind("ClusterResourceSetBinding")
-	b.SetNamespace(ns)
-	b.SetName(name)
-	_ = unstructured.SetNestedSlice(b.Object, []any{map[string]any{
-		"clusterResourceSetName": name + "-cilium",
-		"resources":              []any{map[string]any{"applied": true}},
-	}}, "spec", "bindings")
 	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name + "-kubeconfig"}, Data: map[string][]byte{"value": kc}}
-	return []client.Object{cl, kcp, b, sec}
+	return append([]client.Object{cl, kcp, sec}, cniInstalled(ns, name)...)
+}
+
+// cniInstalled is cluster ns/name's CNI HelmChartProxy at the default Cilium
+// version, and the HelmReleaseProxy CAAPH made from it, Ready.
+func cniInstalled(ns, name string) []client.Object {
+	hcp := &unstructured.Unstructured{Object: map[string]any{}}
+	hcp.SetAPIVersion("addons.cluster.x-k8s.io/v1alpha1")
+	hcp.SetKind("HelmChartProxy")
+	hcp.SetNamespace(ns)
+	hcp.SetName(name + "-cilium")
+	hcp.SetLabels(map[string]string{"hydra.io/cluster": name, "hydra.io/addon": "cilium"})
+	_ = unstructured.SetNestedField(hcp.Object, "1.19.1", "spec", "version")
+	hrp := &unstructured.Unstructured{Object: map[string]any{}}
+	hrp.SetAPIVersion("addons.cluster.x-k8s.io/v1alpha1")
+	hrp.SetKind("HelmReleaseProxy")
+	hrp.SetNamespace(ns)
+	hrp.SetName(name + "-cilium-abc")
+	hrp.SetLabels(map[string]string{"cluster.x-k8s.io/cluster-name": name, "helmreleaseproxy.addons.cluster.x-k8s.io/helmchartproxy-name": name + "-cilium"})
+	_ = unstructured.SetNestedField(hrp.Object, "1.19.1", "spec", "version")
+	_ = unstructured.SetNestedSlice(hrp.Object, []any{map[string]any{"type": "Ready", lcStatus: "True"}}, lcStatus, "conditions")
+	return []client.Object{hcp, hrp}
 }
 
 func TestCluRunCreateRefusesBeforeApplying(t *testing.T) {
@@ -547,7 +560,7 @@ func TestCluRunCreateWaitsAndWritesKubeconfig(t *testing.T) {
 	})
 	t.Run("no kubeconfig Secret", func(t *testing.T) {
 		live := cluAvailable(cfg.Spec.KubernetesVersion, nil)
-		tg, _ := cluTarget(t, true, &cluApplies{}, interceptor.Funcs{}, live[:3]...)
+		tg, _ := cluTarget(t, true, &cluApplies{}, interceptor.Funcs{}, append(live[:2:2], live[3:]...)...)
 		cmd, _ := cluCmd()
 		if _, err := runCreate(t.Context(), cmd, tg, cfg, objs, createOptions{wait: true, timeout: 5 * time.Second}); err == nil || !strings.Contains(err.Error(), "hydra-mgmt-kubeconfig") {
 			t.Fatalf("got %v", err)

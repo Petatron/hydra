@@ -171,8 +171,15 @@ func (c *ClusterConfig) applyDefaults() {
 	if n.CNI == "" {
 		n.CNI = CNIHydra
 	}
-	if n.MTU == 0 && n.CNI == CNIHydra {
-		n.MTU = DefaultMTU
+	if n.CNI == CNIHydra {
+		if n.MTU == 0 {
+			n.MTU = DefaultMTU
+		}
+		if n.CiliumVersion == "" {
+			if cilium, ok := addons.Lookup(addons.Cilium); ok {
+				n.CiliumVersion = cilium.DefaultVersion
+			}
+		}
 	}
 	if n.NodeInterface == "" {
 		n.NodeInterface = DefaultNodeInterface
@@ -275,6 +282,10 @@ func (c *ClusterConfig) validateAddons(errs *fieldErrors) {
 			errs.add(field+".name", "unknown addon %q; the catalogue has %s", a.Name, strings.Join(addons.Names(), ", "))
 			continue
 		}
+		if entry.CNI {
+			errs.add(field+".name", "%s is the CNI, installed by spec.network.cni: %s (its version is spec.network.ciliumVersion), not listed in spec.addons", a.Name, CNIHydra)
+			continue
+		}
 		if seen[a.Name] {
 			errs.add(field+".name", "%s is listed more than once", a.Name)
 		}
@@ -318,9 +329,15 @@ func (c *ClusterConfig) validateNetwork(errs *fieldErrors) {
 		if n.MTU < 1280 || n.MTU > 9000 {
 			errs.add("spec.network.mtu", "must be between 1280 and 9000, got %d", n.MTU)
 		}
+		if cilium, ok := addons.Lookup(addons.Cilium); ok && !slices.Contains(cilium.Versions, n.CiliumVersion) {
+			errs.add("spec.network.ciliumVersion", "hydra allows %s, got %q", strings.Join(cilium.Versions, ", "), n.CiliumVersion)
+		}
 	case CNIExternal:
 		if n.MTU != 0 {
 			errs.add("spec.network.mtu", "sets the MTU of hydra's Cilium, which cni %q does not install; set it in the external CNI's own configuration", CNIExternal)
+		}
+		if n.CiliumVersion != "" {
+			errs.add("spec.network.ciliumVersion", "picks the version of hydra's Cilium, which cni %q does not install", CNIExternal)
 		}
 	default:
 		errs.add("spec.network.cni", "must be %q or %q, got %q", CNIHydra, CNIExternal, n.CNI)

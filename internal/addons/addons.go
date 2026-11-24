@@ -9,6 +9,7 @@
 package addons
 
 import (
+	_ "embed"
 	"fmt"
 	"math"
 	"slices"
@@ -52,6 +53,12 @@ type Addon struct {
 	// from hydra.yaml, unless --allow-remove names it; an unprotected addon
 	// dropped from hydra.yaml is uninstalled with no flag.
 	Protected bool
+	// CNI marks the cluster's network plugin. It is never removable, not even
+	// with --allow-remove: removing it uninstalls the CNI from a running
+	// cluster, and nodes still read Ready afterwards (PET-97). It is not
+	// listed in spec.addons; spec.network.cni installs it, and
+	// spec.network.ciliumVersion picks its version.
+	CNI bool
 	// Values turns resolved params (every declared param present, typed) into
 	// the chart's Helm values.
 	Values func(params map[string]any) map[string]any
@@ -60,7 +67,31 @@ type Addon struct {
 // MetricsServer is the metrics-server addon's name, chart and release.
 const MetricsServer = "metrics-server"
 
+// Cilium is the CNI's name, chart and release (cni: hydra).
+const Cilium = "cilium"
+
+// CiliumValues is the canonical Cilium values for every Hydra cluster
+// (PET-94): a template whose per-cluster values are sentinels, listed in its
+// header, that render fills in.
+//
+//go:embed cilium-values.yaml
+var CiliumValues []byte
+
 var catalogue = []Addon{
+	{
+		Name:        Cilium,
+		RepoURL:     "https://helm.cilium.io",
+		Chart:       Cilium,
+		ReleaseName: Cilium,
+		Namespace:   "kube-system",
+		// 1.19.1 is what hydra-mgmt and hydra-wl0 run (PET-94); 1.19.11 is
+		// the latest 1.19 patch, the kind e2e's upgrade target. Each is
+		// checked against the canonical values by hack/check-cilium.sh.
+		Versions:       []string{"1.19.1", "1.19.11"},
+		DefaultVersion: "1.19.1",
+		Protected:      true,
+		CNI:            true,
+	},
 	{
 		Name:        MetricsServer,
 		RepoURL:     "https://kubernetes-sigs.github.io/metrics-server/",
@@ -96,11 +127,14 @@ func Lookup(name string) (Addon, bool) {
 	return catalogue[i], true
 }
 
-// Names lists the catalogue, sorted.
+// Names lists the addons spec.addons may name, sorted: the catalogue
+// without the CNI.
 func Names() []string {
 	names := make([]string, 0, len(catalogue))
 	for _, a := range catalogue {
-		names = append(names, a.Name)
+		if !a.CNI {
+			names = append(names, a.Name)
+		}
 	}
 	slices.Sort(names)
 	return names

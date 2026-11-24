@@ -1,0 +1,39 @@
+name: Cilium chart
+
+# Renders the Cilium chart with the values hydra puts in each cni: hydra
+# cluster's HelmChartProxy, at every chart version hydra allows
+# (hack/check-cilium.sh). A values change the chart rejects, or a chart
+# re-published under an allowed version that no longer accepts them, would
+# otherwise surface only when CAAPH installs it. Needs helm and network access,
+# so it runs weekly, on demand, and on PRs that touch the values, the catalogue
+# or the renderer.
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'hack/check-cilium.sh'
+      - 'hack/cilium-values/**'
+      - 'internal/addons/**'
+      - 'internal/render/**'
+      - '.github/workflows/cilium-chart.yml'
+
+permissions: {}
+
+jobs:
+  chart:
+    permissions:
+      contents: read
+    name: Cilium chart renders with hydra's values
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+      - name: Render every allowed version
+        run: make cilium-check

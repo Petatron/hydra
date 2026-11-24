@@ -473,6 +473,16 @@ func (p *Pivot) preflight(ctx context.Context) error {
 	}
 
 	var problems []string
+	// A cluster whose Cilium came from the ClusterResourceSet hydra v0.5 and
+	// earlier rendered would never verify on the target: this hydra waits for
+	// CAAPH to report Cilium installed, and nothing has installed it that way.
+	if !st.CNIExternal {
+		if cs, err := src.State(ctx, p.Namespace, p.Name); err != nil {
+			return err
+		} else if cs.LegacyCNI {
+			problems = append(problems, fmt.Sprintf("its Cilium comes from the ClusterResourceSet %s that hydra v0.5 and earlier rendered; migrate it to the CNI HelmChartProxy first (README, \"Clusters on the old ClusterResourceSet\"), so the target can verify it", render.CNIName(p.Name)))
+		}
+	}
 	// clusterctl moves the whole namespace.
 	others, err := otherClusters(ctx, p.Source.C, p.Namespace, p.Name)
 	if err != nil {
@@ -640,9 +650,10 @@ func (p *Pivot) verifyOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// Being deleted, or a CNI only present as the moved ClusterResourceSet
-	// without its binding applied, is no management path to leave the
-	// cluster on: the bootstrap cluster is deleted once this passes.
+	// Being deleted, or a CNI that CAAPH on the target does not report
+	// installed (its HelmReleaseProxy is replaced after a move, PET-97), is no
+	// management path to leave the cluster on: the bootstrap cluster is
+	// deleted once this passes.
 	if !st.Exists || st.Terminating || st.Available != cluster.ConditionTrue || !st.RolledOut || !st.CNIReady() {
 		return fmt.Errorf("the Cluster on %s: %s", p.Target.Name, st.Line())
 	}
@@ -682,14 +693,6 @@ func (p *Pivot) verifyOnce(ctx context.Context) error {
 		if !conditionTrue(&m, "Ready") {
 			return fmt.Errorf("HydraMachine %s is not Ready", m.GetName())
 		}
-	}
-	if st.CNIExternal {
-		return nil // no hydra ClusterResourceSet to carry
-	}
-	crs := &unstructured.Unstructured{}
-	crs.SetGroupVersionKind(crsGVK)
-	if err := p.Target.C.Get(ctx, client.ObjectKey{Namespace: p.Namespace, Name: render.CNIName(p.Name)}, crs); err != nil {
-		return fmt.Errorf("the CNI ClusterResourceSet did not arrive on %s: %w", p.Target.Name, err)
 	}
 	return nil
 }

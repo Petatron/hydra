@@ -420,11 +420,7 @@ func pivSettled() []client.Object {
 	hm.SetLabels(map[string]string{"cluster.x-k8s.io/cluster-name": "c"})
 	hm.SetUID("hm-1")
 	hm.SetAnnotations(map[string]string{pivot.OwnerUIDAnnotation: "hm-1"})
-	crs := pivObj("addons.cluster.x-k8s.io/v1beta2", "ClusterResourceSet", "c-cilium", nil)
-	bind := pivObj("addons.cluster.x-k8s.io/v1beta2", "ClusterResourceSetBinding", "c", map[string]any{"spec": map[string]any{"bindings": []any{
-		map[string]any{"clusterResourceSetName": "c-cilium", "resources": []any{map[string]any{"applied": true}}},
-	}}})
-	return []client.Object{cl, kcp, hm, crs, bind, kubeconfigSecret(pivOwnKC)}
+	return append([]client.Object{cl, kcp, hm, kubeconfigSecret(pivOwnKC)}, cniInstalled("ns", "c")...)
 }
 
 func pivCmd() (*cobra.Command, *bytes.Buffer) {

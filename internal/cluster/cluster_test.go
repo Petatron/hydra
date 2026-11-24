@@ -60,8 +60,8 @@ func TestObjectsFromRender(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(objs) != 14 {
-		t.Fatalf("want 14 objects (header comment skipped), got %d", len(objs))
+	if len(objs) != 13 {
+		t.Fatalf("want 13 objects (header comment skipped), got %d", len(objs))
 	}
 	if objs[0].GetKind() != kindHydraCluster || objs[len(objs)-1].GetKind() != "HelmChartProxy" {
 		t.Errorf("order not kept: first %s, last %s", objs[0].GetKind(), objs[len(objs)-1].GetKind())
@@ -73,28 +73,59 @@ func TestSummaryLine(t *testing.T) {
 		t.Errorf("got %q", got)
 	}
 	s := Summary{Exists: true, Available: "False", AvailableReason: "NotAvailable", ControlPlane: "1/3 ready",
-		Machines: map[string]int{"Running": 1, "Provisioning": 2}, CNIBindingPresent: true}
-	want := "Available=False (NotAvailable) · control plane 1/3 ready · machines: 2 Provisioning, 1 Running · CNI pending"
+		Machines: map[string]int{"Running": 1, "Provisioning": 2}, CNIProxyPresent: true}
+	want := "Available=False (NotAvailable) · control plane 1/3 ready · machines: 2 Provisioning, 1 Running · CNI installing"
 	if got := s.Line(); got != want {
 		t.Errorf("got  %q\nwant %q", got, want)
 	}
 }
 
-func TestBindingApplied(t *testing.T) {
-	b := obj(bindingGVK, "ns", "c", map[string]any{"spec": map[string]any{"bindings": []any{
-		map[string]any{"clusterResourceSetName": "c-cilium", "resources": []any{map[string]any{"applied": true}}},
-	}}})
-	if !bindingApplied(b, "c-cilium") {
-		t.Error("applied binding not recognised")
-	}
-	if bindingApplied(b, "other") {
-		t.Error("another set's binding counted")
-	}
-	b2 := obj(bindingGVK, "ns", "c", map[string]any{"spec": map[string]any{"bindings": []any{
-		map[string]any{"clusterResourceSetName": "c-cilium", "resources": []any{map[string]any{"applied": false}}},
-	}}})
-	if bindingApplied(b2, "c-cilium") {
-		t.Error("unapplied resource counted as applied")
+// cniProxy and cniRelease are the CNI HelmChartProxy for cluster c at
+// version want, and a HelmReleaseProxy CAAPH made from it.
+func cniProxy(want string) *unstructured.Unstructured {
+	return obj(hcpGVK, "ns", "c-cilium", map[string]any{"spec": map[string]any{"version": want}})
+}
+
+func cniRelease(name, cluster, version, ready string, observed int64) *unstructured.Unstructured {
+	h := obj(hrpGVK, "ns", name, map[string]any{
+		"spec": map[string]any{"version": version},
+		"status": map[string]any{"conditions": []any{map[string]any{
+			"type": "Ready", "status": ready, "reason": "InstallFailed", "message": "chart\n  not found", "observedGeneration": observed,
+		}}},
+	})
+	h.SetLabels(map[string]string{clusterNameLabel: cluster, hcpNameLabel: cluster + "-cilium"})
+	h.SetGeneration(1)
+	return h
+}
+
+// The CNI counts as applied only when CAAPH reports the release Ready for
+// the proxy's current version and its latest generation.
+func TestCNIStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		objs    []client.Object
+		applied bool
+		present bool
+		why     string
+	}{
+		{"no proxy yet", nil, false, false, ""},
+		{"proxy, no release yet", []client.Object{cniProxy("1.19.1")}, false, false, ""},
+		{"installed", []client.Object{cniProxy("1.19.1"), cniRelease("r", "c", "1.19.1", "True", 1)}, true, true, ""},
+		{"installed at the old version", []client.Object{cniProxy("1.19.11"), cniRelease("r", "c", "1.19.1", "True", 1)}, false, true, "moving to 1.19.11"},
+		{"Ready from an older generation", []client.Object{cniProxy("1.19.1"), cniRelease("r", "c", "1.19.1", "True", 0)}, false, true, ""},
+		{"failing", []client.Object{cniProxy("1.19.1"), cniRelease("r", "c", "1.19.1", "False", 1)}, false, true, "InstallFailed: chart not found"},
+		{"another cluster's release", []client.Object{cniProxy("1.19.1"), cniRelease("r", "other", "1.19.1", "True", 1)}, false, false, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(tc.objs...).Build()
+			var s Summary
+			if err := (&Manager{C: c}).cniStatus(context.Background(), "ns", "c", &s); err != nil {
+				t.Fatal(err)
+			}
+			if s.CNIApplied != tc.applied || s.CNIProxyPresent != tc.present || s.CNIWhy != tc.why {
+				t.Errorf("applied=%v present=%v why=%q", s.CNIApplied, s.CNIProxyPresent, s.CNIWhy)
+			}
+		})
 	}
 }
 
@@ -109,15 +140,12 @@ func TestStatusReadsControllers(t *testing.T) {
 	m1.SetLabels(map[string]string{"cluster.x-k8s.io/cluster-name": "c"})
 	other := obj(machineGVK, "ns", "other-1", map[string]any{"status": map[string]any{"phase": "Running"}})
 	other.SetLabels(map[string]string{"cluster.x-k8s.io/cluster-name": "other"})
-	binding := obj(bindingGVK, "ns", "c", map[string]any{"spec": map[string]any{"bindings": []any{
-		map[string]any{"clusterResourceSetName": "c-cilium", "resources": []any{map[string]any{"applied": true}}},
-	}}})
-	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cl, kcp, m1, other, binding).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cl, kcp, m1, other, cniProxy("1.19.1"), cniRelease("r", "c", "1.19.1", "True", 1)).Build()
 	s, err := (&Manager{C: c}).Status(ctx, "ns", "c")
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "Available=True (Available) · control plane 3/3 ready · machines: 1 Running · CNI applied"
+	want := "Available=True (Available) · control plane 3/3 ready · machines: 1 Running · CNI ready"
 	if got := s.Line(); got != want {
 		t.Errorf("got  %q\nwant %q", got, want)
 	}
@@ -181,8 +209,8 @@ func TestPlanCreateUpdateAndNoChange(t *testing.T) {
 	if up.Action != "update" || !strings.Contains(up.Diff, `-  mtu: "1500"`) || !strings.Contains(up.Diff, `+  mtu: "1450"`) {
 		t.Errorf("update diff should show the changed line:\n%s", up.Diff)
 	}
-	if up.Note == "" {
-		t.Error("a CNI ConfigMap change must carry the ApplyOnce note")
+	if up.Note != "" {
+		t.Errorf("a ConfigMap change carries no note since the CNI is a HelmChartProxy: %q", up.Note)
 	}
 	if changes[1].Action != "create" || changes[1].Object != "Cluster ns/c" {
 		t.Errorf("create: %+v", changes[1])
@@ -589,8 +617,8 @@ func TestUnprotectedRoll(t *testing.T) {
 	}
 }
 
-// A Cluster without the CNI label has no hydra ClusterResourceSet selecting
-// it (cni: external): status says so, never reads a binding, and the wait
+// A Cluster without the CNI label has no hydra CNI proxy selecting it
+// (cni: external): status says so, never reads the proxy, and the wait
 // ends on Available and rolled out alone.
 func TestStatusAndWaitWithExternalCNI(t *testing.T) {
 	ctx := context.Background()
@@ -600,8 +628,8 @@ func TestStatusAndWaitWithExternalCNI(t *testing.T) {
 	kcp := obj(kcpGVK, "ns", "c-cp", map[string]any{"spec": map[string]any{"replicas": int64(1)}, "status": map[string]any{"replicas": int64(1), "readyReplicas": int64(1), "upToDateReplicas": int64(1)}})
 	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cl, kcp).WithInterceptorFuncs(interceptor.Funcs{
 		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, o client.Object, opts ...client.GetOption) error {
-			if o.GetObjectKind().GroupVersionKind().Kind == bindingGVK.Kind {
-				return errors.New("binding read with an external CNI")
+			if o.GetObjectKind().GroupVersionKind().Kind == hcpGVK.Kind {
+				return errors.New("CNI proxy read with an external CNI")
 			}
 			return c.Get(ctx, key, o, opts...)
 		},
