@@ -49,7 +49,7 @@ var (
 	clusterGVK      = schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: capiVersion, Kind: "Cluster"}
 	hydraMachineGVK = schema.GroupVersionKind{Group: infraGroup, Version: infraVersion, Kind: "HydraMachine"}
 	hydraClusterGVK = schema.GroupVersionKind{Group: infraGroup, Version: infraVersion, Kind: "HydraCluster"}
-	crsGVK          = schema.GroupVersionKind{Group: "addons.cluster.x-k8s.io", Version: capiVersion, Kind: "ClusterResourceSet"}
+	crsGVK          = schema.GroupVersionKind{Group: addonsGroup, Version: capiVersion, Kind: "ClusterResourceSet"}
 	crsBindingGVK   = schema.GroupVersionKind{Group: crsGVK.Group, Version: capiVersion, Kind: crsGVK.Kind + "Binding"}
 	hydraCRDs       = []string{
 		"hydraclusters.infrastructure.cluster.x-k8s.io",
@@ -322,7 +322,7 @@ var movableKinds = []schema.GroupVersionKind{
 	crsBindingGVK,
 	// CAAPH's objects move too (PET-97); without the CRDs they hold nothing.
 	{Group: crsGVK.Group, Version: caaphAPIVersion, Kind: render.KindHelmChartProxy},
-	{Group: crsGVK.Group, Version: caaphAPIVersion, Kind: "HelmReleaseProxy"},
+	{Group: crsGVK.Group, Version: caaphAPIVersion, Kind: kindHelmReleaseProxy},
 }
 
 // addonNames lists the cluster's HelmChartProxies by name; none when CAAPH
@@ -346,6 +346,13 @@ func (p *Pivot) addonNames(ctx context.Context, c client.Client) ([]string, erro
 
 // caaphAPIVersion is the API version of CAAPH's objects.
 const caaphAPIVersion = "v1alpha1"
+
+// addonsGroup is the API group of ClusterResourceSets and CAAPH's objects;
+// kindHelmReleaseProxy is CAAPH's per-cluster release object.
+const (
+	addonsGroup          = "addons.cluster.x-k8s.io"
+	kindHelmReleaseProxy = "HelmReleaseProxy"
+)
 
 // strangers lists the objects in the namespace a move could carry that are
 // not this cluster's. A kind whose CRD is not installed holds nothing.
@@ -473,15 +480,10 @@ func (p *Pivot) preflight(ctx context.Context) error {
 	}
 
 	var problems []string
-	// A cluster whose Cilium came from the ClusterResourceSet hydra v0.5 and
-	// earlier rendered would never verify on the target: this hydra waits for
-	// CAAPH to report Cilium installed, and nothing has installed it that way.
-	if !st.CNIExternal {
-		if cs, err := src.State(ctx, p.Namespace, p.Name); err != nil {
-			return err
-		} else if cs.LegacyCNI {
-			problems = append(problems, fmt.Sprintf("its Cilium comes from the ClusterResourceSet %s that hydra v0.5 and earlier rendered; migrate it to the CNI HelmChartProxy first (README, \"Clusters on the old ClusterResourceSet\"), so the target can verify it", render.CNIName(p.Name)))
-		}
+	if msg, err := p.legacyCNI(ctx, src, st); err != nil {
+		return err
+	} else if msg != "" {
+		problems = append(problems, msg)
 	}
 	// clusterctl moves the whole namespace.
 	others, err := otherClusters(ctx, p.Source.C, p.Namespace, p.Name)
@@ -564,6 +566,21 @@ func (p *Pivot) preflight(ctx context.Context) error {
 		return fmt.Errorf("clusterctl move dry run: %w", err)
 	}
 	return nil
+}
+
+// legacyCNI explains why a cluster whose Cilium came from the
+// ClusterResourceSet hydra v0.5 and earlier rendered cannot be pivoted, or
+// returns "": it would never verify on the target, where this hydra waits for
+// CAAPH to report Cilium installed, and nothing installed it that way.
+func (p *Pivot) legacyCNI(ctx context.Context, src *cluster.Manager, st cluster.Summary) (string, error) {
+	if st.CNIExternal {
+		return "", nil
+	}
+	cs, err := src.State(ctx, p.Namespace, p.Name)
+	if err != nil || !cs.LegacyCNI {
+		return "", err
+	}
+	return fmt.Sprintf("its Cilium comes from the ClusterResourceSet %s that hydra v0.5 and earlier rendered; migrate it to the CNI HelmChartProxy first (README, \"Clusters on the old ClusterResourceSet\"), so the target can verify it", render.CNIName(p.Name)), nil
 }
 
 // crdsLabelled checks the Hydra CRDs carry the label clusterctl move looks

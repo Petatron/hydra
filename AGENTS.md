@@ -30,6 +30,7 @@ Commands, in delivery order (Linear project *Hydra — Reliability & Productizat
 | `hydra cluster upgrade` | PET-24 | implemented (hardware proof pending) |
 | `spec.addons` (CAAPH, catalogue in `internal/addons`) | PET-98 | implemented |
 | `hydra cluster apply` (create + scoped pruning) | PET-99 | implemented, kind e2e (hardware proof pending) |
+| `cni: hydra` through CAAPH (`spec.network.ciliumVersion`) | PET-100 | implemented, kind and CAPD e2e (hardware proof pending) |
 
 ## Layout
 
@@ -44,8 +45,7 @@ Commands, in delivery order (Linear project *Hydra — Reliability & Productizat
 | `internal/bootstrap/` | the temporary kind management cluster: kind and clusterctl as Go libraries behind small interfaces, faked in tests |
 | `internal/validate/` | read-only host and hypervisor checks behind small interfaces (libvirt over TLS, TCP probes from this host or the kind node), faked in tests |
 | `internal/pivot/` | moving a cluster's management onto itself and back for teardown: locate, preflight, `clusterctl move`, verify, split evidence; a teardown record in kind (never moves back or unpauses on its own after a pivot) |
-| `internal/render/assets/cilium.yaml` | **generated** by `hack/gen-cilium.sh`; never edit by hand |
-| `hack/cilium-values.yaml` | the **canonical Cilium values** for every Hydra cluster (PET-94); `gen-cilium.sh` renders from it, and Argo CD, Helm releases and later the addon controller must use the same set. Per-cluster values are sentinels listed in its header |
+| `internal/addons/cilium-values.yaml` | the **canonical Cilium values** for every Hydra cluster (PET-94), embedded and rendered into each `cni: hydra` cluster's Cilium HelmChartProxy (PET-100); Argo CD or a Helm release must use the same set. Per-cluster values are sentinels listed in its header. `hack/check-cilium.sh` renders the chart with them at every allowed version |
 | `internal/render/testdata/*.golden.yaml` | expected output for each file in `examples/` |
 | `examples/` | user-facing `hydra.yaml` examples; every one is golden-tested |
 
@@ -63,8 +63,8 @@ Commands, in delivery order (Linear project *Hydra — Reliability & Productizat
 4. **The templates descend from proven manifests.** `cluster.yaml.tmpl` is derived from the
    provider's `docs/examples/`, which were verified on hardware. When you change a setting there,
    find the provider ticket that proved it, and keep the two in step.
-5. **Pinned versions are code.** Kubernetes default, Cilium (`CILIUM_VERSION` in
-   `hack/gen-cilium.sh` and `render.CiliumVersion`), kube-vip, bootstrap's kind node image,
+5. **Pinned versions are code.** Kubernetes default, Cilium (the catalogue's allowed and default
+   versions in `internal/addons`), kube-vip, bootstrap's kind node image,
    cert-manager, Cluster API, Hydra provider and CAAPH (`internal/bootstrap`; CAAPH's pin is also
    `cluster.AddonProviderVersion`, kept equal by a test), and addon chart versions
    (`internal/addons`) change only in a reviewed PR.
@@ -79,8 +79,9 @@ make test          # unit + golden tests
 make golden        # regenerate golden files after an intended output change
 make lint          # golangci-lint, built with the pinned toolchain (see below)
 make verify        # go.mod tidy + gofmt
-make cilium        # regenerate the embedded Cilium manifest (needs helm)
+make cilium-check  # render the Cilium chart with hydra's values at every allowed version (needs helm)
 make e2e           # kind management cluster via `hydra bootstrap`, dry-run every example, apply + prune (needs Docker)
+make e2e-cilium    # CAPD cluster on kind: hydra's Cilium proxy installs Cilium (nodes Ready), then upgrades it (needs Docker)
 make vuln          # govulncheck
 make actionlint    # lint .github/workflows
 make dist          # release binaries + checksums into dist/
@@ -88,8 +89,8 @@ make dist          # release binaries + checksums into dist/
 
 CI (`.github/workflows/`): `ci.yml` (verify, test, build, lint, govulncheck, actionlint, and
 `VERSION is releasable`) on every PR;
-`e2e.yml` (the kind e2e) on PRs touching code or examples and on main; `cilium-drift.yml` weekly
-and on renderer changes; `release.yml` publishes binaries when `VERSION` is untagged on `main` (or
+`e2e.yml` (the kind e2e, and the Cilium e2e on a CAPD cluster) on PRs touching code or examples and
+on main; `cilium-chart.yml` weekly and on values, catalogue or renderer changes; `release.yml` publishes binaries when `VERSION` is untagged on `main` (or
 on a hand-pushed `v*` tag; manual runs build an artifact only). Every job runs on GitHub-hosted
 runners. Actions are pinned by commit SHA; Dependabot keeps them and the Go modules current.
 

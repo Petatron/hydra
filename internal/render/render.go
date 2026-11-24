@@ -46,6 +46,10 @@ const (
 // KindHelmChartProxy is CAAPH's per-addon object.
 const KindHelmChartProxy = "HelmChartProxy"
 
+// reconcileContinuous keeps a release matching its proxy (CAAPH's
+// InstallOnce has an open cleanup bug, #617, and never upgrades).
+const reconcileContinuous = "Continuous"
+
 // The per-cluster values in the canonical Cilium values are these sentinels
 // (see the header of internal/addons/cilium-values.yaml).
 const (
@@ -295,7 +299,7 @@ func renderAddons(c *config.ClusterConfig) ([]byte, error) {
 				Version:           a.Version,
 				ReleaseName:       entry.ReleaseName,
 				Namespace:         entry.Namespace,
-				ReconcileStrategy: "Continuous",
+				ReconcileStrategy: reconcileContinuous,
 				ValuesTemplate:    string(values),
 			},
 		}
@@ -392,7 +396,7 @@ func renderCilium(c *config.ClusterConfig) ([]byte, error) {
 			Version:           c.Spec.Network.CiliumVersion,
 			ReleaseName:       entry.ReleaseName,
 			Namespace:         entry.Namespace,
-			ReconcileStrategy: "Continuous",
+			ReconcileStrategy: reconcileContinuous,
 			ValuesTemplate:    values,
 			Options:           &helmOptions{TakeOwnership: true},
 		},

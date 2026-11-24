@@ -6,6 +6,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,7 +26,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) < 2 {
-		return fmt.Errorf("usage: cilium-values <out-dir> <hydra.yaml>...")
+		return errors.New("usage: cilium-values <out-dir> <hydra.yaml> [<hydra.yaml>]")
 	}
 	out := args[0]
 	cilium, ok := addons.Lookup(addons.Cilium)

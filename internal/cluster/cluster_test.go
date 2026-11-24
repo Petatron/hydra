@@ -86,8 +86,10 @@ func cniProxy(want string) *unstructured.Unstructured {
 	return obj(hcpGVK, "ns", "c-cilium", map[string]any{"spec": map[string]any{"version": want}})
 }
 
-func cniRelease(name, cluster, version, ready string, observed int64) *unstructured.Unstructured {
-	h := obj(hrpGVK, "ns", name, map[string]any{
+// cniRelease is always at 1.19.1; tests vary the proxy's version instead.
+func cniRelease(cluster, ready string, observed int64) *unstructured.Unstructured {
+	const version = "1.19.1"
+	h := obj(hrpGVK, "ns", "r", map[string]any{
 		"spec": map[string]any{"version": version},
 		"status": map[string]any{"conditions": []any{map[string]any{
 			"type": "Ready", "status": ready, "reason": "InstallFailed", "message": "chart\n  not found", "observedGeneration": observed,
@@ -110,11 +112,11 @@ func TestCNIStatus(t *testing.T) {
 	}{
 		{"no proxy yet", nil, false, false, ""},
 		{"proxy, no release yet", []client.Object{cniProxy("1.19.1")}, false, false, ""},
-		{"installed", []client.Object{cniProxy("1.19.1"), cniRelease("r", "c", "1.19.1", "True", 1)}, true, true, ""},
-		{"installed at the old version", []client.Object{cniProxy("1.19.11"), cniRelease("r", "c", "1.19.1", "True", 1)}, false, true, "moving to 1.19.11"},
-		{"Ready from an older generation", []client.Object{cniProxy("1.19.1"), cniRelease("r", "c", "1.19.1", "True", 0)}, false, true, ""},
-		{"failing", []client.Object{cniProxy("1.19.1"), cniRelease("r", "c", "1.19.1", "False", 1)}, false, true, "InstallFailed: chart not found"},
-		{"another cluster's release", []client.Object{cniProxy("1.19.1"), cniRelease("r", "other", "1.19.1", "True", 1)}, false, false, ""},
+		{"installed", []client.Object{cniProxy("1.19.1"), cniRelease("c", "True", 1)}, true, true, ""},
+		{"installed at the old version", []client.Object{cniProxy("1.19.11"), cniRelease("c", "True", 1)}, false, true, "moving to 1.19.11"},
+		{"Ready from an older generation", []client.Object{cniProxy("1.19.1"), cniRelease("c", "True", 0)}, false, true, ""},
+		{"failing", []client.Object{cniProxy("1.19.1"), cniRelease("c", "False", 1)}, false, true, "InstallFailed: chart not found"},
+		{"another cluster's release", []client.Object{cniProxy("1.19.1"), cniRelease("other", "True", 1)}, false, false, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(tc.objs...).Build()
@@ -140,7 +142,7 @@ func TestStatusReadsControllers(t *testing.T) {
 	m1.SetLabels(map[string]string{"cluster.x-k8s.io/cluster-name": "c"})
 	other := obj(machineGVK, "ns", "other-1", map[string]any{"status": map[string]any{"phase": "Running"}})
 	other.SetLabels(map[string]string{"cluster.x-k8s.io/cluster-name": "other"})
-	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cl, kcp, m1, other, cniProxy("1.19.1"), cniRelease("r", "c", "1.19.1", "True", 1)).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cl, kcp, m1, other, cniProxy("1.19.1"), cniRelease("c", "True", 1)).Build()
 	s, err := (&Manager{C: c}).Status(ctx, "ns", "c")
 	if err != nil {
 		t.Fatal(err)
