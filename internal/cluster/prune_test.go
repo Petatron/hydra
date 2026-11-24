@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"maps"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -164,6 +166,74 @@ func TestPlanPrune(t *testing.T) {
 		if got[k] != v {
 			t.Errorf("%s: got %q, want %q", k, got[k], v)
 		}
+	}
+}
+
+// One --prune-pools value never deletes two pools. In cluster edge,
+// MachineDeployment edge-gpu is pool gpu and edge-edge-gpu is pool edge-gpu,
+// so "edge-gpu" names both: both are refused, and each is offered a value
+// that names it alone.
+func TestPlanPruneAmbiguousPool(t *testing.T) {
+	ctx := context.Background()
+	gpu := labelled(mdGVK, "edge-gpu", "edge")
+	edgeGPU := labelled(mdGVK, "edge-edge-gpu", "edge")
+	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(gpu, edgeGPU).Build()
+	m := &Manager{C: c, Out: &bytes.Buffer{}}
+	plan := func(pools ...string) map[string]Orphan {
+		t.Helper()
+		orphans, err := m.PlanPrune(ctx, nil, "ns", "edge", PruneOptions{Pools: pools})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := map[string]Orphan{}
+		for _, o := range orphans {
+			got[o.Object.GetName()] = o
+		}
+		if len(got) != 2 {
+			t.Fatalf("orphans: %v", orphans)
+		}
+		return got
+	}
+
+	got := plan()
+	for name, flag := range map[string]string{"edge-gpu": "--prune-pools=gpu", "edge-edge-gpu": "--prune-pools=edge-edge-gpu"} {
+		if o := got[name]; o.Action != PruneNeedsFlag || !strings.HasSuffix(o.Why, flag) {
+			t.Errorf("%s: got %s, want it to need %s", name, o, flag)
+		}
+	}
+
+	got = plan("edge-gpu")
+	for _, name := range []string{"edge-gpu", "edge-edge-gpu"} {
+		if o := got[name]; o.Action != PruneRefused || !strings.Contains(o.Why, "--prune-pools=edge-gpu names more than one removed pool") {
+			t.Errorf("%s: got %s, want refused", name, o)
+		}
+	}
+	if Refusals(slices.Collect(maps.Values(got))) == nil {
+		t.Error("an ambiguous --prune-pools must stop apply")
+	}
+
+	got = plan("gpu")
+	if got["edge-gpu"].Action != PruneDelete || got["edge-edge-gpu"].Action != PruneNeedsFlag {
+		t.Errorf("--prune-pools=gpu: got %v", got)
+	}
+	got = plan("edge-edge-gpu")
+	if got["edge-gpu"].Action != PruneNeedsFlag || got["edge-edge-gpu"].Action != PruneDelete {
+		t.Errorf("--prune-pools=edge-edge-gpu: got %v", got)
+	}
+}
+
+// No value names a MachineDeployment alone when both its forms collide: it
+// is kept, and the fix is by hand.
+func TestPoolFlagsWithNoUniqueValue(t *testing.T) {
+	// edge-gpu's pool "gpu" is also MachineDeployment gpu's name and pool;
+	// its name "edge-gpu" is also edge-edge-gpu's pool.
+	got := poolFlags([]string{"edge-gpu", "edge-edge-gpu", "gpu"}, "edge")
+	if got["edge-gpu"] != "" || got["edge-edge-gpu"] != "edge-edge-gpu" {
+		t.Errorf("got %v", got)
+	}
+	o := classify(labelled(mdGVK, "edge-gpu", "edge"), pruneContext{cluster: "edge", poolFlag: got})
+	if o.Action != PruneNeedsFlag || !strings.Contains(o.Why, "by hand") {
+		t.Errorf("got %s", o)
 	}
 }
 

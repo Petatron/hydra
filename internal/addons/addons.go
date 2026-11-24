@@ -48,7 +48,9 @@ type Addon struct {
 	Params         []Param
 	// Protected marks an addon whose removal must be explicit: deleting its
 	// HelmChartProxy uninstalls the release, and CAAPH has no way to keep it.
-	// Read by the pruning planned in PET-99; nothing prunes addons yet.
+	// `hydra cluster apply` refuses to run while a protected addon is gone
+	// from hydra.yaml, unless --allow-remove names it; an unprotected addon
+	// dropped from hydra.yaml is uninstalled with no flag.
 	Protected bool
 	// Values turns resolved params (every declared param present, typed) into
 	// the chart's Helm values.

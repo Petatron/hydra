@@ -284,7 +284,7 @@ current kubectl context is never used.
   | hydra's `HelmChartProxy` for a removed addon (`<cluster>-<addon>`; deleting it uninstalls the addon) | deletes it; a protected or uncatalogued addon only with `--allow-remove=<addon>`, otherwise apply refuses before writing anything |
   | Any other proxy labelled for the cluster (a duplicate, one made by hand) | refuses unless named as `--allow-remove=proxy/<name>`: a duplicate shares the release of the addon hydra.yaml still lists |
   | A superseded machine or bootstrap template | deletes it once no machine, MachineSet or control plane uses it (a later apply removes one still in use) |
-  | A node pool (`MachineDeployment`) | keeps it unless named with `--prune-pools=<pool>`, because deleting it deletes its machines and VMs |
+  | A node pool (`MachineDeployment`) | keeps it unless named with `--prune-pools=<pool>`, because deleting it deletes its machines and VMs; a value that names more than one removed pool (a pool name can equal another pool's MachineDeployment name) refuses, and `plan` prints a value that names each alone |
   | The control plane, `HydraCluster`, health check, CNI objects | never |
 
   `plan` takes `--prune-pools` and `--allow-remove` too, to show exactly what `apply` with them would

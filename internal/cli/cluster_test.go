@@ -196,6 +196,18 @@ func TestPlanWordingWithOrphans(t *testing.T) {
 	if strings.Contains(b.String(), "matches hydra.yaml") || !strings.Contains(b.String(), "1 object(s) no longer rendered, 0 of which apply would prune") {
 		t.Errorf("orphans must not read as a clean plan:\n%s", b.String())
 	}
+	if strings.Contains(b.String(), "refused") {
+		t.Errorf("no refusal, so the plan must not say apply will not run:\n%s", b.String())
+	}
+	// Only a refusal, and nothing else changed: the last line must say apply
+	// will not run.
+	b.Reset()
+	if err := printPlan(&b, nil, []cluster.Orphan{orphanOf("HelmChartProxy", "c-guarded", cluster.PruneRefused, "addon guarded is protected")}); err != nil {
+		t.Fatal(err)
+	}
+	if want := "No changes to apply; 1 object(s) no longer rendered, 0 of which apply would prune; 1 refused, so apply will not run"; !strings.Contains(b.String(), want) {
+		t.Errorf("lacks %q:\n%s", want, b.String())
+	}
 }
 
 func TestDeleteRefusesAnotherClustersCluster(t *testing.T) {
@@ -664,7 +676,7 @@ func TestCluPrintPlan(t *testing.T) {
 			"? kept MachineDeployment default/c-old (no longer rendered; needs --prune-pools)",
 			"- prune HydraMachineTemplate default/c-cp-1 (no longer rendered; apply deletes it, create leaves it: superseded and unused)",
 			"! refused HelmChartProxy default/c-x (no longer rendered; apply refuses to run: pass --allow-remove=x)",
-			"1 change(s); 3 object(s) no longer rendered, 1 of which apply would prune.\n",
+			"1 change(s); 3 object(s) no longer rendered, 1 of which apply would prune; 1 refused, so apply will not run until each is resolved (see the ! refused lines).\n",
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

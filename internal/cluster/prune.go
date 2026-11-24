@@ -71,6 +71,10 @@ type pruneContext struct {
 	inUse map[string]bool
 	// renderedAddons are the addons hydra.yaml still lists.
 	renderedAddons map[string]bool
+	// poolFlag is the --prune-pools value that names each removed
+	// MachineDeployment and no other, by MachineDeployment name; "" when no
+	// value does. Missing means the pool name.
+	poolFlag map[string]string
 }
 
 // ProxyPrefix marks a HelmChartProxy named in --allow-remove by its object
@@ -90,11 +94,17 @@ func classify(o *unstructured.Unstructured, pc pruneContext) Orphan {
 			out.Action, out.Why = PruneDelete, "superseded and unused"
 		}
 	case mdGVK.Kind:
-		pool := strings.TrimPrefix(o.GetName(), pc.cluster+"-")
-		if slices.Contains(pc.opts.Pools, pool) || slices.Contains(pc.opts.Pools, o.GetName()) {
-			out.Action, out.Why = PruneDelete, "pool removed from hydra.yaml; --prune-pools="+pool+" deletes its machines and VMs"
-		} else {
-			out.Action, out.Why = PruneNeedsFlag, "pool removed from hydra.yaml; deleting it deletes its machines and VMs, so it needs --prune-pools="+pool
+		flag, ok := pc.poolFlag[o.GetName()]
+		if !ok {
+			flag = poolOf(o.GetName(), pc.cluster)
+		}
+		switch {
+		case slices.ContainsFunc(pc.opts.Pools, func(t string) bool { return namesPool(t, o.GetName(), pc.cluster) }):
+			out.Action, out.Why = PruneDelete, "pool removed from hydra.yaml; --prune-pools deletes its machines and VMs"
+		case flag == "":
+			out.Action, out.Why = PruneNeedsFlag, "pool removed from hydra.yaml; no --prune-pools value names it alone, so delete the MachineDeployment by hand"
+		default:
+			out.Action, out.Why = PruneNeedsFlag, "pool removed from hydra.yaml; deleting it deletes its machines and VMs, so it needs --prune-pools="+flag
 		}
 	default:
 		// The Cluster's own objects and the CNI's are never pruned: they are
@@ -102,6 +112,73 @@ func classify(o *unstructured.Unstructured, pc pruneContext) Orphan {
 		out.Action, out.Why = PruneNever, "apply never deletes a "+o.GetKind()
 	}
 	return out
+}
+
+// poolOf is the pool a MachineDeployment belongs to: its name without the
+// cluster prefix.
+func poolOf(md, cluster string) string { return strings.TrimPrefix(md, cluster+"-") }
+
+// namesPool reports whether a --prune-pools value names a MachineDeployment,
+// by pool name or by its own name.
+func namesPool(token, md, cluster string) bool { return token == md || token == poolOf(md, cluster) }
+
+// poolFlags picks, for each removed MachineDeployment, the --prune-pools value
+// that names it and no other removed one. Pool names and MachineDeployment
+// names overlap: in cluster edge, MachineDeployment edge-gpu is pool gpu, and
+// edge-edge-gpu is pool edge-gpu.
+func poolFlags(mds []string, cluster string) map[string]string {
+	out := map[string]string{}
+	for _, md := range mds {
+		out[md] = ""
+		for _, t := range []string{poolOf(md, cluster), md} {
+			if countNamed(t, mds, cluster) == 1 {
+				out[md] = t
+				break
+			}
+		}
+	}
+	return out
+}
+
+// countNamed is how many of mds a --prune-pools value names.
+func countNamed(token string, mds []string, cluster string) int {
+	n := 0
+	for _, md := range mds {
+		if namesPool(token, md, cluster) {
+			n++
+		}
+	}
+	return n
+}
+
+// refuseAmbiguousPools refuses every removed MachineDeployment a
+// --prune-pools value names when it names more than one, so one value never
+// deletes two pools' machines and VMs.
+func refuseAmbiguousPools(out []Orphan, mds []string, pc pruneContext) {
+	for _, t := range pc.opts.Pools {
+		if countNamed(t, mds, pc.cluster) < 2 {
+			continue
+		}
+		var named []string
+		for _, md := range mds {
+			if namesPool(t, md, pc.cluster) {
+				named = append(named, md)
+			}
+		}
+		for i := range out {
+			o := out[i].Object
+			if o.GetKind() != mdGVK.Kind || !namesPool(t, o.GetName(), pc.cluster) {
+				continue
+			}
+			fix := "delete the MachineDeployment by hand"
+			if f := pc.poolFlag[o.GetName()]; f != "" {
+				fix = "name this pool as --prune-pools=" + f
+			}
+			out[i].Action = PruneRefused
+			out[i].Why = fmt.Sprintf("--prune-pools=%s names more than one removed pool (MachineDeployments %s), so it deletes none; %s",
+				t, strings.Join(named, ", "), fix)
+		}
+	}
 }
 
 // classifyProxy decides a HelmChartProxy. Without a flag apply deletes only
@@ -164,7 +241,8 @@ func (m *Manager) PlanPrune(ctx context.Context, objs []*unstructured.Unstructur
 			pc.renderedAddons[o.GetLabels()[render.AddonLabelKey]] = true
 		}
 	}
-	var out []Orphan
+	var candidates []*unstructured.Unstructured
+	var mds []string
 	for _, gvk := range ownedKinds {
 		items, err := m.listLabelled(ctx, namespace, cluster, gvk)
 		if err != nil {
@@ -175,9 +253,18 @@ func (m *Manager) PlanPrune(ctx context.Context, objs []*unstructured.Unstructur
 			if rendered[o.GetKind()+"/"+o.GetName()] || o.GetDeletionTimestamp() != nil {
 				continue
 			}
-			out = append(out, classify(o, pc))
+			candidates = append(candidates, o)
+			if o.GetKind() == mdGVK.Kind {
+				mds = append(mds, o.GetName())
+			}
 		}
 	}
+	pc.poolFlag = poolFlags(mds, cluster)
+	out := make([]Orphan, 0, len(candidates))
+	for _, o := range candidates {
+		out = append(out, classify(o, pc))
+	}
+	refuseAmbiguousPools(out, mds, pc)
 	slices.SortFunc(out, func(a, b Orphan) int { return strings.Compare(describe(a.Object), describe(b.Object)) })
 	return out, nil
 }

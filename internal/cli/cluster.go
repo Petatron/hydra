@@ -218,6 +218,7 @@ renders are deleted where that is safe (ADR-002).
     use).
   - A node pool removed from hydra.yaml: kept unless named with
     --prune-pools=<pool>, because deleting it deletes its machines and VMs.
+    A value that names more than one removed pool refuses instead.
   - The Cluster, its control plane, health check and CNI objects: never.
 
 Refusals are checked before anything is written. Run plan first: it shows
@@ -518,13 +519,30 @@ them would do. Templates still in use are re-checked by apply after it applies.`
 	return c
 }
 
-func printPlan(w io.Writer, changes []cluster.Change, orphans []cluster.Orphan) error {
-	var b strings.Builder
-	prunes := 0
+// orphanSummary closes a plan that has orphans. It says when apply will not
+// run at all, so a plan with refusals never ends reading as a no-op.
+func orphanSummary(orphans []cluster.Orphan) string {
+	prunes, refused := 0, 0
 	for _, o := range orphans {
 		switch o.Action {
 		case cluster.PruneDelete:
 			prunes++
+		case cluster.PruneRefused:
+			refused++
+		}
+	}
+	s := fmt.Sprintf("%d object(s) no longer rendered, %d of which apply would prune", len(orphans), prunes)
+	if refused > 0 {
+		s += fmt.Sprintf("; %d refused, so apply will not run until each is resolved (see the ! refused lines)", refused)
+	}
+	return s + "."
+}
+
+func printPlan(w io.Writer, changes []cluster.Change, orphans []cluster.Orphan) error {
+	var b strings.Builder
+	for _, o := range orphans {
+		switch o.Action {
+		case cluster.PruneDelete:
 			fmt.Fprintf(&b, "- prune %s (no longer rendered; apply deletes it, create leaves it: %s)\n", orphanName(o), o.Why)
 		case cluster.PruneRefused:
 			fmt.Fprintf(&b, "! refused %s (no longer rendered; apply refuses to run: %s)\n", orphanName(o), o.Why)
@@ -536,7 +554,7 @@ func printPlan(w io.Writer, changes []cluster.Change, orphans []cluster.Orphan) 
 		if len(orphans) == 0 {
 			b.WriteString("No changes: the live cluster matches hydra.yaml.\n")
 		} else {
-			fmt.Fprintf(&b, "No changes to apply; %d object(s) no longer rendered, %d of which apply would prune.\n", len(orphans), prunes)
+			fmt.Fprintf(&b, "No changes to apply; %s\n", orphanSummary(orphans))
 		}
 		_, err := io.WriteString(w, b.String())
 		return err
@@ -556,7 +574,7 @@ func printPlan(w io.Writer, changes []cluster.Change, orphans []cluster.Orphan) 
 		}
 	}
 	if len(orphans) > 0 {
-		fmt.Fprintf(&b, "%d change(s); %d object(s) no longer rendered, %d of which apply would prune.\n", len(changes), len(orphans), prunes)
+		fmt.Fprintf(&b, "%d change(s); %s\n", len(changes), orphanSummary(orphans))
 	} else {
 		fmt.Fprintf(&b, "%d change(s).\n", len(changes))
 	}
