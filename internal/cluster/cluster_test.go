@@ -63,7 +63,7 @@ func TestObjectsFromRender(t *testing.T) {
 	if len(objs) != 14 {
 		t.Fatalf("want 14 objects (header comment skipped), got %d", len(objs))
 	}
-	if objs[0].GetKind() != "HydraCluster" || objs[len(objs)-1].GetKind() != "HelmChartProxy" {
+	if objs[0].GetKind() != kindHydraCluster || objs[len(objs)-1].GetKind() != "HelmChartProxy" {
 		t.Errorf("order not kept: first %s, last %s", objs[0].GetKind(), objs[len(objs)-1].GetKind())
 	}
 }

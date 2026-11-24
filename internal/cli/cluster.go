@@ -196,7 +196,79 @@ used.`,
 	return c
 }
 
+func newApplyCommand() *cobra.Command {
+	var file, mgmt, kubeconfigOut string
+	var timeout time.Duration
+	var wait, adopt, forceConflicts bool
+	var prune cluster.PruneOptions
+	c := &cobra.Command{
+		Use:   "apply",
+		Short: "Create or update the cluster to match hydra.yaml, and prune what it no longer lists",
+		Long: `apply does what create does -- server-side apply, wait, write the kubeconfig
+-- and then prunes: objects labelled for the cluster that hydra.yaml no longer
+renders are deleted where that is safe (ADR-002).
+
+  - An addon removed from spec.addons: hydra's own HelmChartProxy for it
+    (<cluster>-<addon>) is deleted, which uninstalls the addon. A protected
+    or uncatalogued addon is refused unless named with --allow-remove; any
+    other proxy labelled for the cluster (a duplicate, one made by hand) is
+    refused unless named as --allow-remove=proxy/<name>.
+  - A superseded machine or bootstrap template: deleted once no machine,
+    MachineSet or control plane uses it (a later apply removes one still in
+    use).
+  - A node pool removed from hydra.yaml: kept unless named with
+    --prune-pools=<pool>, because deleting it deletes its machines and VMs.
+    A value that names more than one removed pool refuses instead.
+  - The Cluster, its control plane, health check and CNI objects: never.
+
+Pruning is the last step: an apply that times out waiting, or cannot write the
+kubeconfig, deletes nothing (with --wait=false it prunes right after the
+apply). Refusals are checked before anything is written. Run plan first: it shows
+each object and what apply would do with it. Like create, apply refuses a
+Kubernetes version change (use upgrade) and keeps nothing locally; an
+interrupted apply is finished by running it again.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, err := config.Load(file)
+			if err != nil {
+				return err
+			}
+			objs, err := renderObjects(cfg)
+			if err != nil {
+				return err
+			}
+			ctx, stop := interruptible(cmd)
+			defer stop()
+			t, err := manager(cmd, mgmt, cfg.Metadata.Name)
+			if err != nil {
+				return err
+			}
+			p := prune
+			_, err = runCreate(ctx, cmd, t, cfg, objs, createOptions{prune: &p, kubeconfigOut: kubeconfigOut, configFile: file, timeout: timeout, wait: wait, adopt: adopt, forceConflicts: forceConflicts})
+			return err
+		},
+	}
+	c.Flags().StringVarP(&file, "file", "f", "hydra.yaml", "path to hydra.yaml")
+	c.Flags().StringVar(&mgmt, "management-kubeconfig", "", "kubeconfig of the management cluster (default: the cluster's bootstrap kind cluster)")
+	c.Flags().StringVar(&kubeconfigOut, "kubeconfig-out", "", "where to write the cluster's kubeconfig (default ./<name>.kubeconfig)")
+	c.Flags().DurationVar(&timeout, "timeout", 30*time.Minute, "how long to wait for the cluster to be Available")
+	c.Flags().BoolVar(&wait, "wait", true, "wait for the cluster to be Available")
+	c.Flags().BoolVar(&adopt, "adopt", false, "take over existing objects of the same names that hydra did not make (never ones labelled for another cluster)")
+	c.Flags().BoolVar(&forceConflicts, "force-conflicts", false, "take over fields another field manager owns (e.g. a hand edit) instead of failing")
+	addPruneFlags(c, &prune)
+	return c
+}
+
+// addPruneFlags adds apply's pruning flags, which plan takes too.
+func addPruneFlags(c *cobra.Command, p *cluster.PruneOptions) {
+	c.Flags().StringSliceVar(&p.Pools, "prune-pools", nil, "node pools removed from hydra.yaml to delete, with their machines and VMs, by name; repeat or comma-separate")
+	c.Flags().StringSliceVar(&p.AllowRemove, "allow-remove", nil, "protected or uncatalogued addons to uninstall although apply would refuse, by addon name, or any other proxy as proxy/<name>; repeat or comma-separate")
+}
+
 type createOptions struct {
+	// prune, when set, makes this apply: objects no longer rendered are
+	// pruned per cluster.PruneOptions, after a pre-write refusal check.
+	prune         *cluster.PruneOptions
 	kubeconfigOut string
 	// configFile is hydra.yaml's path, for commands printed in messages.
 	configFile                  string
@@ -249,6 +321,9 @@ func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.C
 	} else if unprotected {
 		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "note: %s\n", cluster.UnprotectedRollNote)
 	}
+	if err := checkPruneRefusals(ctx, m, objs, ns, name, o.prune); err != nil {
+		return "", err
+	}
 	if err := m.Apply(ctx, objs, name, forceConflicts); err != nil {
 		return "", err
 	}
@@ -265,15 +340,11 @@ func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.C
 			return "", fmt.Errorf("applied, but %s", msg)
 		}
 	}
-	switch orphans, err := m.Orphans(ctx, objs, ns, name); {
-	case err != nil:
-		// The apply succeeded; only the check for leftovers failed.
-		// Say so rather than imply there are none.
-		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not check for objects hydra.yaml no longer renders: %v\n", err)
-	case len(orphans) > 0:
-		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "not in hydra.yaml any more (left in place; delete them yourself if unused):\n  %s\n", strings.Join(orphans, "\n  "))
-	}
 	if !wait {
+		// Asked not to wait: prune now, as the last step.
+		if err := pruneOrReport(ctx, cmd, m, objs, ns, name, o.prune); err != nil {
+			return "", err
+		}
 		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "not waiting (--wait=false); follow with `hydra cluster status`")
 		return "", nil
 	}
@@ -304,7 +375,62 @@ func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.C
 		return "", err
 	}
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "kubeconfig written to %s\n", path)
+	// Prune last: a cluster that never became Available, or a kubeconfig that
+	// could not be written, deletes nothing.
+	if err := pruneOrReport(ctx, cmd, m, objs, ns, name, o.prune); err != nil {
+		return path, err
+	}
 	return path, nil
+}
+
+// checkPruneRefusals refuses an apply, before anything is written, when it
+// would have to remove something it may not. Refusals depend only on what is
+// labelled and what is rendered, so they hold before and after the apply.
+// With prune nil (create) there is nothing to check.
+func checkPruneRefusals(ctx context.Context, m *cluster.Manager, objs []*unstructured.Unstructured, ns, name string, prune *cluster.PruneOptions) error {
+	if prune == nil {
+		return nil
+	}
+	orphans, err := m.PlanPrune(ctx, objs, ns, name, *prune)
+	if err != nil {
+		return err
+	}
+	return cluster.Refusals(orphans)
+}
+
+// pruneOrReport handles what hydra.yaml no longer renders, after the apply:
+// apply prunes it (decided again now, as the apply may just have made a
+// template unused) and says what it kept; create only lists it.
+func pruneOrReport(ctx context.Context, cmd *cobra.Command, m *cluster.Manager, objs []*unstructured.Unstructured, ns, name string, prune *cluster.PruneOptions) error {
+	if prune != nil {
+		orphans, err := m.PlanPrune(ctx, objs, ns, name, *prune)
+		if err != nil {
+			return fmt.Errorf("applied, but could not work out what to prune (run apply again): %w", err)
+		}
+		_, skipped, err := m.Prune(ctx, orphans)
+		if err != nil {
+			return fmt.Errorf("applied, but %w (run apply again)", err)
+		}
+		for _, or := range orphans {
+			if or.Action != cluster.PruneDelete {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "%s\n", or)
+			}
+		}
+		if skipped > 0 {
+			// Not done: a script must not read this as a finished apply.
+			return fmt.Errorf("applied, but %d object(s) to prune changed while apply ran and were left; run apply again", skipped)
+		}
+		return nil
+	}
+	switch orphans, err := m.Orphans(ctx, objs, ns, name); {
+	case err != nil:
+		// The apply succeeded; only the check for leftovers failed.
+		// Say so rather than imply there are none.
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not check for objects hydra.yaml no longer renders: %v\n", err)
+	case len(orphans) > 0:
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "not in hydra.yaml any more (left in place; `hydra cluster apply` prunes what is safe):\n  %s\n", strings.Join(orphans, "\n  "))
+	}
+	return nil
 }
 
 // addonNotes says, for each addon that is not Ready, whether it is still
@@ -329,13 +455,19 @@ func addonNotes(s cluster.Summary) []string {
 func newPlanCommand() *cobra.Command {
 	var file, mgmt string
 	var forceConflicts bool
+	var prune cluster.PruneOptions
 	c := &cobra.Command{
 		Use:   "plan",
-		Short: "Show what create would change, against the live management cluster",
+		Short: "Show what create or apply would change, against the live management cluster",
 		Long: `plan renders hydra.yaml and server-side dry-runs every object against the
 management cluster, then prints what would be created and a diff of what would
 change. It writes nothing and compares only with the live cluster, never with
-anything stored locally.`,
+anything stored locally.
+
+Objects labelled for the cluster that hydra.yaml no longer renders are listed
+with what apply would do with them: prune (-), keep (?), or refuse to run (!).
+Pass apply's --prune-pools and --allow-remove to see exactly what apply with
+them would do. Templates still in use are re-checked by apply after it applies.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, err := config.Load(file)
@@ -354,7 +486,7 @@ anything stored locally.`,
 			if err != nil {
 				return err
 			}
-			orphans, err := t.m.Orphans(contextOf(cmd), objs, cfg.Metadata.Namespace, cfg.Metadata.Name)
+			orphans, err := t.m.PlanPrune(contextOf(cmd), objs, cfg.Metadata.Namespace, cfg.Metadata.Name, prune)
 			if err != nil {
 				return err
 			}
@@ -391,19 +523,46 @@ anything stored locally.`,
 	c.Flags().StringVarP(&file, "file", "f", "hydra.yaml", "path to hydra.yaml")
 	c.Flags().StringVar(&mgmt, "management-kubeconfig", "", "kubeconfig of the management cluster (default: the cluster's bootstrap kind cluster)")
 	c.Flags().BoolVar(&forceConflicts, "force-conflicts", false, "plan as create --force-conflicts would apply")
+	addPruneFlags(c, &prune)
 	return c
 }
 
-func printPlan(w io.Writer, changes []cluster.Change, orphans []string) error {
+// orphanSummary closes a plan that has orphans. It says when apply will not
+// run at all, so a plan with refusals never ends reading as a no-op.
+func orphanSummary(orphans []cluster.Orphan) string {
+	prunes, refused := 0, 0
+	for _, o := range orphans {
+		switch o.Action {
+		case cluster.PruneDelete:
+			prunes++
+		case cluster.PruneRefused:
+			refused++
+		}
+	}
+	s := fmt.Sprintf("%d object(s) no longer rendered, %d of which apply would prune", len(orphans), prunes)
+	if refused > 0 {
+		s += fmt.Sprintf("; %d refused, so apply will not run until each is resolved (see the ! refused lines)", refused)
+	}
+	return s + "."
+}
+
+func printPlan(w io.Writer, changes []cluster.Change, orphans []cluster.Orphan) error {
 	var b strings.Builder
 	for _, o := range orphans {
-		fmt.Fprintf(&b, "? orphaned %s (labelled for this cluster, no longer rendered; create leaves it in place)\n", o)
+		switch o.Action {
+		case cluster.PruneDelete:
+			fmt.Fprintf(&b, "- prune %s (no longer rendered; apply deletes it, create leaves it: %s)\n", orphanName(o), o.Why)
+		case cluster.PruneRefused:
+			fmt.Fprintf(&b, "! refused %s (no longer rendered; apply refuses to run: %s)\n", orphanName(o), o.Why)
+		default:
+			fmt.Fprintf(&b, "? kept %s (no longer rendered; %s)\n", orphanName(o), o.Why)
+		}
 	}
 	if len(changes) == 0 {
 		if len(orphans) == 0 {
 			b.WriteString("No changes: the live cluster matches hydra.yaml.\n")
 		} else {
-			fmt.Fprintf(&b, "No changes to apply; %d orphaned object(s) left behind.\n", len(orphans))
+			fmt.Fprintf(&b, "No changes to apply; %s\n", orphanSummary(orphans))
 		}
 		_, err := io.WriteString(w, b.String())
 		return err
@@ -423,12 +582,17 @@ func printPlan(w io.Writer, changes []cluster.Change, orphans []string) error {
 		}
 	}
 	if len(orphans) > 0 {
-		fmt.Fprintf(&b, "%d change(s); %d orphaned object(s) left behind.\n", len(changes), len(orphans))
+		fmt.Fprintf(&b, "%d change(s); %s\n", len(changes), orphanSummary(orphans))
 	} else {
 		fmt.Fprintf(&b, "%d change(s).\n", len(changes))
 	}
 	_, err := io.WriteString(w, b.String())
 	return err
+}
+
+// orphanName is "Kind ns/name".
+func orphanName(o cluster.Orphan) string {
+	return o.Object.GetKind() + " " + o.Object.GetNamespace() + "/" + o.Object.GetName()
 }
 
 func newStatusCommand() *cobra.Command {

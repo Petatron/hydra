@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -178,13 +179,34 @@ func TestDeleteNothingToDo(t *testing.T) {
 	}
 }
 
+// orphanOf is a classified orphan of the given kind, for plan output tests.
+func orphanOf(kind, name string, action cluster.PruneAction, why string) cluster.Orphan {
+	o := &unstructured.Unstructured{}
+	o.SetGroupVersionKind(schema.GroupVersionKind{Kind: kind})
+	o.SetNamespace("default")
+	o.SetName(name)
+	return cluster.Orphan{Object: o, Action: action, Why: why}
+}
+
 func TestPlanWordingWithOrphans(t *testing.T) {
 	var b bytes.Buffer
-	if err := printPlan(&b, nil, []string{"MachineDeployment ns/c-old"}); err != nil {
+	if err := printPlan(&b, nil, []cluster.Orphan{orphanOf("MachineDeployment", "c-old", cluster.PruneNeedsFlag, "needs --prune-pools")}); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(b.String(), "matches hydra.yaml") || !strings.Contains(b.String(), "1 orphaned object(s) left behind") {
+	if strings.Contains(b.String(), "matches hydra.yaml") || !strings.Contains(b.String(), "1 object(s) no longer rendered, 0 of which apply would prune") {
 		t.Errorf("orphans must not read as a clean plan:\n%s", b.String())
+	}
+	if strings.Contains(b.String(), "refused") {
+		t.Errorf("no refusal, so the plan must not say apply will not run:\n%s", b.String())
+	}
+	// Only a refusal, and nothing else changed: the last line must say apply
+	// will not run.
+	b.Reset()
+	if err := printPlan(&b, nil, []cluster.Orphan{orphanOf("HelmChartProxy", "c-guarded", cluster.PruneRefused, "addon guarded is protected")}); err != nil {
+		t.Fatal(err)
+	}
+	if want := "No changes to apply; 1 object(s) no longer rendered, 0 of which apply would prune; 1 refused, so apply will not run"; !strings.Contains(b.String(), want) {
+		t.Errorf("lacks %q:\n%s", want, b.String())
 	}
 }
 
@@ -318,7 +340,9 @@ func cluCmd() (*cobra.Command, *bytes.Buffer) {
 
 // cluAvailable is a cluster ns/name that its controllers report Available,
 // rolled out, with the CNI applied and a kubeconfig Secret holding kc.
-func cluAvailable(ns, name, version string, kc []byte) []client.Object {
+func cluAvailable(version string, kc []byte) []client.Object {
+	const name = "hydra-mgmt"
+	const ns = "default"
 	cl := capiCluster(ns, name, "", 0)
 	_ = unstructured.SetNestedSlice(cl.Object, []any{map[string]any{"type": "Available", lcStatus: "True"}}, lcStatus, "conditions")
 	kcp := &unstructured.Unstructured{Object: map[string]any{}}
@@ -482,7 +506,7 @@ func TestCluRunCreateWaitsAndWritesKubeconfig(t *testing.T) {
 	cfg, objs := cluLoad(t, "../../examples/hydra-mgmt.yaml")
 	t.Run("explicit path", func(t *testing.T) {
 		ap := &cluApplies{}
-		tg, log := cluTarget(t, true, ap, interceptor.Funcs{}, cluAvailable("default", "hydra-mgmt", cfg.Spec.KubernetesVersion, []byte("admin"))...)
+		tg, log := cluTarget(t, true, ap, interceptor.Funcs{}, cluAvailable(cfg.Spec.KubernetesVersion, []byte("admin"))...)
 		tg.bootstrapKind = false
 		cmd, errOut := cluCmd()
 		out := filepath.Join(t.TempDir(), "x.kubeconfig")
@@ -507,7 +531,7 @@ func TestCluRunCreateWaitsAndWritesKubeconfig(t *testing.T) {
 	})
 	t.Run("default path", func(t *testing.T) {
 		t.Chdir(t.TempDir())
-		tg, _ := cluTarget(t, true, &cluApplies{}, interceptor.Funcs{}, cluAvailable("default", "hydra-mgmt", cfg.Spec.KubernetesVersion, []byte("admin"))...)
+		tg, _ := cluTarget(t, true, &cluApplies{}, interceptor.Funcs{}, cluAvailable(cfg.Spec.KubernetesVersion, []byte("admin"))...)
 		cmd, _ := cluCmd()
 		path, err := runCreate(t.Context(), cmd, tg, cfg, objs, createOptions{wait: true, timeout: 5 * time.Second})
 		if err != nil || path != "hydra-mgmt.kubeconfig" {
@@ -522,7 +546,7 @@ func TestCluRunCreateWaitsAndWritesKubeconfig(t *testing.T) {
 		}
 	})
 	t.Run("no kubeconfig Secret", func(t *testing.T) {
-		live := cluAvailable("default", "hydra-mgmt", cfg.Spec.KubernetesVersion, nil)
+		live := cluAvailable(cfg.Spec.KubernetesVersion, nil)
 		tg, _ := cluTarget(t, true, &cluApplies{}, interceptor.Funcs{}, live[:3]...)
 		cmd, _ := cluCmd()
 		if _, err := runCreate(t.Context(), cmd, tg, cfg, objs, createOptions{wait: true, timeout: 5 * time.Second}); err == nil || !strings.Contains(err.Error(), "hydra-mgmt-kubeconfig") {
@@ -536,6 +560,39 @@ func TestCluRunCreateWaitsAndWritesKubeconfig(t *testing.T) {
 			t.Fatalf("got %v", err)
 		}
 	})
+	// apply prunes last: a timeout, or a kubeconfig it cannot fetch, leaves
+	// what it would have pruned; a finished apply prunes it.
+	for _, tc := range []struct {
+		name    string
+		live    func() []client.Object
+		timeout time.Duration
+		pruned  bool
+	}{
+		{"apply that times out prunes nothing", func() []client.Object { return nil }, 20 * time.Millisecond, false},
+		{"apply without a kubeconfig prunes nothing", func() []client.Object {
+			return cluAvailable(cfg.Spec.KubernetesVersion, nil)[:3]
+		}, 5 * time.Second, false},
+		{"finished apply prunes", func() []client.Object {
+			return cluAvailable(cfg.Spec.KubernetesVersion, []byte("admin"))
+		}, 5 * time.Second, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			stale := labelledFor("HydraMachineTemplate", "infrastructure.cluster.x-k8s.io/v1alpha1", "hydra-mgmt-cp-stale")
+			tg, _ := cluTarget(t, true, &cluApplies{}, interceptor.Funcs{}, append(tc.live(), stale)...)
+			cmd, errOut := cluCmd()
+			_, err := runCreate(t.Context(), cmd, tg, cfg, objs, createOptions{prune: &cluster.PruneOptions{}, wait: true, timeout: tc.timeout})
+			if (err == nil) != tc.pruned {
+				t.Fatalf("err %v\n%s", err, errOut.String())
+			}
+			u := &unstructured.Unstructured{}
+			u.SetGroupVersionKind(stale.GroupVersionKind())
+			gone := apierrors.IsNotFound(tg.m.C.Get(t.Context(), client.ObjectKeyFromObject(stale), u))
+			if gone != tc.pruned {
+				t.Errorf("pruned=%v, want %v\n%s", gone, tc.pruned, errOut.String())
+			}
+		})
+	}
 }
 
 func TestCluCreateCommandRefusals(t *testing.T) {
@@ -631,7 +688,7 @@ func TestCluPrintPlan(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		changes []cluster.Change
-		orphans []string
+		orphans []cluster.Orphan
 		want    []string
 	}{
 		{"clean", nil, nil, []string{"No changes: the live cluster matches hydra.yaml.\n"}},
@@ -646,8 +703,16 @@ func TestCluPrintPlan(t *testing.T) {
 			"--force-conflicts",
 			"3 change(s).\n",
 		}},
-		{"changes and orphans", []cluster.Change{{Object: "Cluster default/c", Action: lcCreate}}, []string{"MachineDeployment default/c-old"},
-			[]string{"? orphaned MachineDeployment default/c-old", "1 change(s); 1 orphaned object(s) left behind.\n"}},
+		{"changes and orphans", []cluster.Change{{Object: "Cluster default/c", Action: lcCreate}}, []cluster.Orphan{
+			orphanOf("MachineDeployment", "c-old", cluster.PruneNeedsFlag, "needs --prune-pools"),
+			orphanOf("HydraMachineTemplate", "c-cp-1", cluster.PruneDelete, "superseded and unused"),
+			orphanOf("HelmChartProxy", "c-x", cluster.PruneRefused, "pass --allow-remove=x"),
+		}, []string{
+			"? kept MachineDeployment default/c-old (no longer rendered; needs --prune-pools)",
+			"- prune HydraMachineTemplate default/c-cp-1 (no longer rendered; apply deletes it, create leaves it: superseded and unused)",
+			"! refused HelmChartProxy default/c-x (no longer rendered; apply refuses to run: pass --allow-remove=x)",
+			"1 change(s); 3 object(s) no longer rendered, 1 of which apply would prune; 1 refused, so apply will not run until each is resolved (see the ! refused lines).\n",
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var b bytes.Buffer
@@ -880,5 +945,114 @@ func TestAddonNotes(t *testing.T) {
 	}
 	if got := addonNotes(cluster.Summary{AddonsError: "forbidden"}); len(got) != 1 || got[0] != "addons could not be read: forbidden" {
 		t.Errorf("unreadable: %v", got)
+	}
+}
+
+// labelledFor is an object labelled for cluster hydra-mgmt.
+func labelledFor(kind, apiVersion, name string) *unstructured.Unstructured {
+	o := &unstructured.Unstructured{}
+	o.SetAPIVersion(apiVersion)
+	o.SetKind(kind)
+	o.SetNamespace("default")
+	o.SetName(name)
+	o.SetLabels(map[string]string{"hydra.io/cluster": "hydra-mgmt"})
+	return o
+}
+
+// apply refuses, before writing anything, when hydra.yaml no longer lists
+// a proxy it may not remove on its own.
+func TestCluApplyRefusesBeforeWriting(t *testing.T) {
+	cfg, objs := cluLoad(t, "../../examples/hydra-mgmt.yaml")
+	hand := labelledFor("HelmChartProxy", "addons.cluster.x-k8s.io/v1alpha1", "hydra-mgmt-unknown")
+	ap := &cluApplies{}
+	tg, _ := cluTarget(t, true, ap, interceptor.Funcs{}, hand)
+	cmd, _ := cluCmd()
+	_, err := runCreate(t.Context(), cmd, tg, cfg, objs, createOptions{prune: &cluster.PruneOptions{}, wait: false})
+	if err == nil || !strings.Contains(err.Error(), "not applying") || !strings.Contains(err.Error(), "--allow-remove=proxy/hydra-mgmt-unknown") {
+		t.Fatalf("got %v", err)
+	}
+	if ap.n != 0 {
+		t.Errorf("%d applies before the refusal", ap.n)
+	}
+}
+
+// After applying, apply prunes what is safe and keeps a removed pool unless
+// --prune-pools; create prunes nothing.
+func TestCluApplyPrunes(t *testing.T) {
+	cfg, objs := cluLoad(t, "../../examples/hydra-mgmt.yaml")
+	for _, tc := range []struct {
+		name     string
+		opts     *cluster.PruneOptions
+		wantGone []string
+	}{
+		{"create prunes nothing", nil, nil},
+		{"apply prunes the unused template, keeps the pool", &cluster.PruneOptions{}, []string{"hydra-mgmt-cp-stale"}},
+		{"apply --prune-pools=old", &cluster.PruneOptions{Pools: []string{"old"}}, []string{"hydra-mgmt-cp-stale", "hydra-mgmt-old"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stale := labelledFor("HydraMachineTemplate", "infrastructure.cluster.x-k8s.io/v1alpha1", "hydra-mgmt-cp-stale")
+			pool := labelledFor("MachineDeployment", "cluster.x-k8s.io/v1beta2", "hydra-mgmt-old")
+			tg, _ := cluTarget(t, true, &cluApplies{}, interceptor.Funcs{}, stale, pool)
+			cmd, errOut := cluCmd()
+			if _, err := runCreate(t.Context(), cmd, tg, cfg, objs, createOptions{prune: tc.opts, wait: false}); err != nil {
+				t.Fatalf("%v\n%s", err, errOut.String())
+			}
+			exists := func(o *unstructured.Unstructured) bool {
+				u := &unstructured.Unstructured{}
+				u.SetGroupVersionKind(o.GroupVersionKind())
+				return tg.m.C.Get(t.Context(), client.ObjectKeyFromObject(o), u) == nil
+			}
+			for _, o := range []*unstructured.Unstructured{stale, pool} {
+				gone := !exists(o)
+				if slices.Contains(tc.wantGone, o.GetName()) != gone {
+					t.Errorf("%s gone=%v\n%s", o.GetName(), gone, errOut.String())
+				}
+			}
+			if tc.opts != nil && len(tc.opts.Pools) == 0 && !strings.Contains(errOut.String(), "needs --prune-pools=old") {
+				t.Errorf("the kept pool must say how to remove it:\n%s", errOut.String())
+			}
+		})
+	}
+}
+
+// A template a live MachineSet still uses survives apply's prune.
+func TestCluApplyKeepsTemplatesInUse(t *testing.T) {
+	cfg, objs := cluLoad(t, "../../examples/hydra-mgmt.yaml")
+	used := labelledFor("HydraMachineTemplate", "infrastructure.cluster.x-k8s.io/v1alpha1", "hydra-mgmt-w-old")
+	ms := &unstructured.Unstructured{}
+	ms.SetAPIVersion("cluster.x-k8s.io/v1beta2")
+	ms.SetKind("MachineSet")
+	ms.SetNamespace("default")
+	ms.SetName("hydra-mgmt-w-abc")
+	ms.SetLabels(map[string]string{"cluster.x-k8s.io/cluster-name": "hydra-mgmt"})
+	_ = unstructured.SetNestedField(ms.Object, "hydra-mgmt-w-old", "spec", "template", "spec", "infrastructureRef", "name")
+	tg, _ := cluTarget(t, true, &cluApplies{}, interceptor.Funcs{}, used, ms)
+	cmd, errOut := cluCmd()
+	if _, err := runCreate(t.Context(), cmd, tg, cfg, objs, createOptions{prune: &cluster.PruneOptions{}, wait: false}); err != nil {
+		t.Fatalf("%v\n%s", err, errOut.String())
+	}
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(used.GroupVersionKind())
+	if err := tg.m.C.Get(t.Context(), client.ObjectKeyFromObject(used), u); err != nil {
+		t.Errorf("a template a MachineSet uses must survive: %v\n%s", err, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "still referenced") {
+		t.Errorf("apply must say why it kept it:\n%s", errOut.String())
+	}
+}
+
+// An object that changes between classification and deletion is left, and
+// apply exits non-zero so a script does not read it as finished.
+func TestCluApplyFailsWhenAPruneIsSkipped(t *testing.T) {
+	cfg, objs := cluLoad(t, "../../examples/hydra-mgmt.yaml")
+	stale := labelledFor("HydraMachineTemplate", "infrastructure.cluster.x-k8s.io/v1alpha1", "hydra-mgmt-cp-stale")
+	conflict := interceptor.Funcs{Delete: func(ctx context.Context, w client.WithWatch, o client.Object, opts ...client.DeleteOption) error {
+		return apierrors.NewConflict(schema.GroupResource{Resource: "hydramachinetemplates"}, o.GetName(), errors.New("changed"))
+	}}
+	tg, _ := cluTarget(t, true, &cluApplies{}, conflict, stale)
+	cmd, _ := cluCmd()
+	_, err := runCreate(t.Context(), cmd, tg, cfg, objs, createOptions{prune: &cluster.PruneOptions{}, wait: false})
+	if err == nil || !strings.Contains(err.Error(), "changed while apply ran") {
+		t.Fatalf("got %v", err)
 	}
 }
