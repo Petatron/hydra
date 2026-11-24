@@ -24,7 +24,7 @@ import (
 )
 
 var (
-	hydraClusterGVK = schema.GroupVersionKind{Group: infraGroup, Version: infraVersion, Kind: "HydraCluster"}
+	hydraClusterGVK = schema.GroupVersionKind{Group: infraGroup, Version: infraVersion, Kind: kindHydraCluster}
 	mdGVK           = schema.GroupVersionKind{Group: capiGroup, Version: capiVersion, Kind: "MachineDeployment"}
 	// hcpGVK is CAAPH's per-addon object (ADR-002).
 	hcpGVK = schema.GroupVersionKind{Group: addonsGroup, Version: "v1alpha1", Kind: render.KindHelmChartProxy}
@@ -45,7 +45,7 @@ var (
 	withMachines  = []schema.GroupVersionKind{hydraClusterGVK, kcpGVK, mdGVK}
 	afterMachines = []schema.GroupVersionKind{
 		{Group: capiGroup, Version: capiVersion, Kind: "MachineHealthCheck"},
-		{Group: "bootstrap.cluster.x-k8s.io", Version: capiVersion, Kind: "KubeadmConfigTemplate"},
+		{Group: bootstrapGroup, Version: capiVersion, Kind: kindKubeadmConfigTemplate},
 		{Group: infraGroup, Version: infraVersion, Kind: kindHydraMachineTemplate},
 		{Group: addonsGroup, Version: capiVersion, Kind: "ClusterResourceSet"},
 		{Group: "", Version: "v1", Kind: kindConfigMap},

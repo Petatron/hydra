@@ -60,7 +60,7 @@ func newClusterCommand() *cobra.Command {
 		Use:   "cluster",
 		Short: "Work with a cluster described by hydra.yaml",
 	}
-	c.AddCommand(newRenderCommand(), newPlanCommand(), newCreateCommand(), newStatusCommand(), newDeleteCommand(), newPivotCommand(), newUpgradeCommand())
+	c.AddCommand(newRenderCommand(), newPlanCommand(), newCreateCommand(), newApplyCommand(), newStatusCommand(), newDeleteCommand(), newPivotCommand(), newUpgradeCommand())
 	return c
 }
 

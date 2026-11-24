@@ -28,6 +28,8 @@ Commands, in delivery order (Linear project *Hydra — Reliability & Productizat
 | `hydra cluster pivot` / `create --self-hosted` | PET-83 | implemented |
 | `hydra cluster delete --self-hosted`, `--finish-split` | PET-87 | implemented, proven on hardware |
 | `hydra cluster upgrade` | PET-24 | implemented (hardware proof pending) |
+| `spec.addons` (CAAPH, catalogue in `internal/addons`) | PET-98 | implemented |
+| `hydra cluster apply` (create + scoped pruning) | PET-99 | implemented |
 
 ## Layout
 

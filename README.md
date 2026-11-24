@@ -18,8 +18,9 @@ The CLI is a **stateless orchestrator**: every cluster's desired and actual stat
 Kubernetes, never on your machine. There is no local database, cache or inventory, and an
 interrupted command can always be re-run.
 
-> **Status:** early, latest release v0.4.0. `validate`, `render`, `bootstrap`,
-> `cluster create/plan/status/delete`, the self-hosting pivot and self-hosted teardown work today.
+> **Status:** early, latest release v0.5.0. `validate`, `render`, `bootstrap`,
+> `cluster create/apply/plan/status/delete`, platform addons (`spec.addons`), the self-hosting pivot
+> and self-hosted teardown work today.
 
 ## Install
 
@@ -27,7 +28,7 @@ Release binaries for Linux and macOS (amd64 and arm64), with SHA256 sums in `che
 the [releases page](https://github.com/Petatron/hydra/releases). For example, on Linux amd64:
 
 ```bash
-v=v0.4.0; os=linux; arch=amd64
+v=v0.5.0; os=linux; arch=amd64
 curl -fsSLO https://github.com/Petatron/hydra/releases/download/$v/hydra-$os-$arch
 curl -fsSLO https://github.com/Petatron/hydra/releases/download/$v/checksums.txt
 grep " hydra-$os-$arch\$" checksums.txt | sha256sum -c -   # macOS: shasum -a 256 -c -
@@ -193,10 +194,10 @@ installs CAAPH; `create` refuses a hydra.yaml with addons on a management cluste
 - `create` does not wait for addons: they settle after the cluster is Available. `status` shows
   each one, and the reason when it is not Ready. A pivot waits for every addon to be Ready on the
   target before it deletes the bootstrap cluster.
-- **Removing an addon from hydra.yaml does not uninstall it yet**: its `HelmChartProxy` is listed as
-  no longer rendered and left in place. **Deleting that `HelmChartProxy`, or removing the Cluster's
-  `hydra.io/cluster` label, uninstalls the addon within seconds**, and CAAPH has no way to keep it.
-  Pruning with guards for protected addons arrives with `hydra cluster apply` (PET-99).
+- **Removing an addon from hydra.yaml and running `apply` uninstalls it**; `create` leaves its
+  `HelmChartProxy` in place. Protected addons need `--allow-remove=<addon>` (see below). Deleting a
+  `HelmChartProxy` by hand, or removing the Cluster's `hydra.io/cluster` label, also uninstalls the
+  addon within seconds, and CAAPH has no way to keep it.
 
 Machine and bootstrap templates are named after their content (`<cluster>-cp-1a2b3c4d`), so
 changing a machine's size or a pool's labels produces a new template and a rolling replacement
@@ -259,8 +260,9 @@ own control plane later. It takes about 75 seconds from nothing.
 ## Create, inspect and delete a cluster
 
 ```bash
-hydra cluster plan   -f hydra.yaml   # what create would change, against the live management cluster
+hydra cluster plan   -f hydra.yaml   # what create/apply would change, against the live management cluster
 hydra cluster create -f hydra.yaml   # apply, wait for Available, write ./<name>.kubeconfig
+hydra cluster apply  -f hydra.yaml   # create, then prune what hydra.yaml no longer lists
 hydra cluster status -f hydra.yaml
 hydra cluster delete -f hydra.yaml   # asks for the cluster name; --yes skips that
 ```
@@ -274,7 +276,18 @@ current kubectl context is never used.
 - It refuses to take over objects of the same name that another cluster owns, or that hydra did
   not make (`--adopt` allows the latter), and refuses while the cluster is being deleted.
 - `plan` diffs against the live cluster only, and lists objects labelled for the cluster that
-  `hydra.yaml` no longer produces (a removed pool, an old template). Neither command deletes them.
+  `hydra.yaml` no longer produces, each with what `apply` would do with it: prune (`-`), keep (`?`)
+  or refuse (`!`). `create` never deletes them; `apply` prunes what is safe:
+
+  | No longer in hydra.yaml | `apply` |
+  |---|---|
+  | An addon's `HelmChartProxy` (uninstalls it) | deletes it; a protected or uncatalogued addon only with `--allow-remove=<name>`, otherwise apply refuses before writing anything |
+  | A superseded machine or bootstrap template | deletes it once no machine, MachineSet or control plane uses it (a later apply removes one still in use) |
+  | A node pool (`MachineDeployment`) | keeps it unless `--prune-pools`, because deleting it deletes its machines and VMs |
+  | The control plane, `HydraCluster`, health check, CNI objects | never |
+
+  `plan` takes `--prune-pools` and `--allow-remove` too, to show exactly what `apply` with them would
+  do. Like `create`, `apply` refuses a Kubernetes version change (use `upgrade`).
 - **Replacing a control-plane machine keeps the API up (PET-88).** The control-plane template asks
   the provider (v0.2.0 or later) to run `/usr/local/sbin/hydra-pre-drain` in the guest before
   Cluster API drains the machine. If that node holds the control-plane VIP, the script stops
