@@ -284,9 +284,12 @@ func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.C
 	}
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "cluster %s/%s is Available after %s\n", ns, name, time.Since(start).Round(time.Second))
 	if len(cfg.Spec.Addons) > 0 {
-		// Addons settle on their own, after the cluster; create does not wait.
-		if s, err := m.Status(ctx, ns, name); err == nil && !s.AddonsReady() {
-			_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "addons are still being installed by Cluster API Add-on Provider Helm; follow them with `hydra cluster status`")
+		// Addons settle on their own, after the cluster; create does not wait,
+		// but says plainly which addons are not there yet and why.
+		if s, err := m.Status(ctx, ns, name); err == nil {
+			for _, line := range addonNotes(s) {
+				_, _ = fmt.Fprintln(cmd.ErrOrStderr(), line)
+			}
 		}
 	}
 	kc, err := m.Kubeconfig(ctx, ns, name)
@@ -302,6 +305,25 @@ func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.C
 	}
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "kubeconfig written to %s\n", path)
 	return path, nil
+}
+
+// addonNotes says, for each addon that is not Ready, whether it is still
+// being installed or has failed, and whether the addons could be read at all.
+func addonNotes(s cluster.Summary) []string {
+	if s.AddonsError != "" {
+		return []string{"addons could not be read: " + s.AddonsError}
+	}
+	var out []string
+	for _, a := range s.Addons {
+		switch a.Ready {
+		case cluster.ConditionTrue:
+		case "", "Unknown":
+			out = append(out, "addon "+a.Name+": still being installed by Cluster API Add-on Provider Helm; follow it with `hydra cluster status`")
+		default:
+			out = append(out, "addon "+a.Name+" is not Ready: "+strings.Join(strings.Fields(a.Message), " "))
+		}
+	}
+	return out
 }
 
 func newPlanCommand() *cobra.Command {

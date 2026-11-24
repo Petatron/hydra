@@ -11,6 +11,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -53,6 +54,16 @@ func TestCAAPHNotInstalledByClusterctl(t *testing.T) {
 	}
 	if got[caaphInventoryName] != notByClusterctl {
 		t.Errorf("got %v", got)
+	}
+	// The case that matters most: clusterctl never ran, so its inventory
+	// kind does not exist at all, yet CAAPH's CRD does.
+	noInventory := &meta.NoKindMatchError{GroupKind: providerListGVK.GroupKind()}
+	got, err = newKubeCluster(providerClient(t, nil, noInventory, crd)).InstalledProviders(context.Background())
+	if err != nil || got[caaphInventoryName] != notByClusterctl {
+		t.Errorf("no clusterctl inventory: %v %v", got, err)
+	}
+	if got, err := newKubeCluster(providerClient(t, nil, noInventory)).InstalledProviders(context.Background()); err != nil || len(got) != 0 {
+		t.Errorf("nothing installed at all: %v %v", got, err)
 	}
 	inv := []*unstructured.Unstructured{provider("caaph-system", "AddonProvider", "helm", CAAPHVersion)}
 	got, err = newKubeCluster(providerClient(t, inv, nil, crd)).InstalledProviders(context.Background())

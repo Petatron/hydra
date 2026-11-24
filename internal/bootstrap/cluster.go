@@ -90,10 +90,11 @@ func (k *KubeCluster) InstalledProviders(ctx context.Context) (map[string]string
 	}
 	list := &unstructured.UnstructuredList{}
 	list.SetGroupVersionKind(providerListGVK)
-	if err := k.c.List(ctx, list); err != nil {
-		if isNoKind(err) {
-			return out, nil
-		}
+	switch err := k.c.List(ctx, list); {
+	case isNoKind(err):
+		// clusterctl never ran here; CAAPH may still have been installed
+		// some other way, which is exactly the case to catch.
+	case err != nil:
 		return nil, err
 	}
 	for _, p := range list.Items {

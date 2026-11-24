@@ -201,6 +201,21 @@ func TestPivotStrangersSkipsUninstalledKinds(t *testing.T) {
 	}
 }
 
+// A reconciled addon is this cluster's, not a stranger: CAAPH labels its
+// HelmReleaseProxy only with Cluster API's cluster-name label and owns it by
+// the HelmChartProxy, never by the Cluster and never with hydra's label.
+func TestPivotAcceptsReconciledAddon(t *testing.T) {
+	hcp := addonProxy("c-metrics-server", "True")
+	hrp := u(schema.GroupVersionKind{Group: crsGVK.Group, Version: caaphAPIVersion, Kind: "HelmReleaseProxy"}, ns, "metrics-server-c-abcde", nil)
+	hrp.SetLabels(map[string]string{clusterNameLabel: "c", "helmreleaseproxy.addons.cluster.x-k8s.io/helmchartproxy-name": "c-metrics-server"})
+	hrp.SetOwnerReferences([]metav1.OwnerReference{{APIVersion: crsGVK.Group + "/" + caaphAPIVersion, Kind: "HelmChartProxy", Name: "c-metrics-server", UID: "hcp-uid"}})
+	src := newClient(t, append(append(clusterObjects("src", true), hcp, hrp), labelledCRDs()...)...)
+	tgt := newClient(t, append(labelledCRDs(), addonProxy("c-metrics-server", "True"))...)
+	if err := pivotFor(t, src, tgt, &recorder{takeOver: true}).Run(context.Background(), time.Second); err != nil {
+		t.Fatalf("a reconciled addon must not block the pivot: %v", err)
+	}
+}
+
 // verifyOnce passes only for a live, resumed, taken-over target whose
 // source no longer holds the Cluster.
 func TestVerifyOnce(t *testing.T) {

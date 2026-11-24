@@ -863,3 +863,20 @@ func TestCluCreateRefusesHydraCNIOnAForeignCNI(t *testing.T) {
 		t.Errorf("plan does not warn with a runnable fix:\n%s", out)
 	}
 }
+
+// create's addon note tells installing, failed and unreadable apart.
+func TestAddonNotes(t *testing.T) {
+	s := cluster.Summary{Addons: []cluster.AddonState{
+		{Name: "ok", Ready: cluster.ConditionTrue},
+		{Name: "new"},
+		{Name: "broken", Ready: "False", Message: "install  failed:\n chart not found"},
+	}}
+	got := strings.Join(addonNotes(s), "\n")
+	if strings.Contains(got, "addon ok") || !strings.Contains(got, "addon new: still being installed") ||
+		!strings.Contains(got, "addon broken is not Ready: install failed: chart not found") {
+		t.Errorf("got:\n%s", got)
+	}
+	if got := addonNotes(cluster.Summary{AddonsError: "forbidden"}); len(got) != 1 || got[0] != "addons could not be read: forbidden" {
+		t.Errorf("unreadable: %v", got)
+	}
+}
