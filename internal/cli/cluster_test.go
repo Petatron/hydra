@@ -870,10 +870,12 @@ func TestAddonNotes(t *testing.T) {
 		{Name: "ok", Ready: cluster.ConditionTrue},
 		{Name: "new"},
 		{Name: "broken", Ready: "False", Message: "install  failed:\n chart not found"},
+		{Name: "terse", Ready: "False", Reason: "HelmInstallOrUpgradeFailed"},
 	}}
 	got := strings.Join(addonNotes(s), "\n")
 	if strings.Contains(got, "addon ok") || !strings.Contains(got, "addon new: still being installed") ||
-		!strings.Contains(got, "addon broken is not Ready: install failed: chart not found") {
+		!strings.Contains(got, "addon broken is not Ready: install failed: chart not found") ||
+		!strings.Contains(got, "addon terse is not Ready: HelmInstallOrUpgradeFailed") {
 		t.Errorf("got:\n%s", got)
 	}
 	if got := addonNotes(cluster.Summary{AddonsError: "forbidden"}); len(got) != 1 || got[0] != "addons could not be read: forbidden" {

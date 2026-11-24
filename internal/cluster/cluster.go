@@ -412,8 +412,22 @@ func (s Summary) Line() string {
 type AddonState struct {
 	Name, Version string
 	// Ready is the proxy's Ready condition status ("" if not yet reported).
-	Ready   string
-	Message string
+	Ready string
+	// Reason and Message are the Ready condition's, kept when it is not
+	// True; CAAPH may set either alone.
+	Reason, Message string
+}
+
+// Why is the not-Ready addon's reason and message, as one line.
+func (a AddonState) Why() string {
+	msg := strings.Join(strings.Fields(a.Message), " ")
+	switch {
+	case a.Reason != "" && msg != "":
+		return a.Reason + ": " + msg
+	case a.Reason != "":
+		return a.Reason
+	}
+	return msg
 }
 
 func addonState(hcp *unstructured.Unstructured) AddonState {
@@ -425,6 +439,7 @@ func addonState(hcp *unstructured.Unstructured) AddonState {
 	if c := condition(hcp, "Ready"); c != nil {
 		a.Ready, _ = c["status"].(string)
 		if a.Ready != ConditionTrue {
+			a.Reason, _ = c["reason"].(string)
 			a.Message, _ = c["message"].(string)
 		}
 	}

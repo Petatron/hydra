@@ -320,7 +320,7 @@ func addonNotes(s cluster.Summary) []string {
 		case "", "Unknown":
 			out = append(out, "addon "+a.Name+": still being installed by Cluster API Add-on Provider Helm; follow it with `hydra cluster status`")
 		default:
-			out = append(out, "addon "+a.Name+" is not Ready: "+strings.Join(strings.Fields(a.Message), " "))
+			out = append(out, "addon "+a.Name+" is not Ready: "+a.Why())
 		}
 	}
 	return out
@@ -459,8 +459,8 @@ func newStatusCommand() *cobra.Command {
 				addonLines.WriteString("  addons: " + s.AddonsError + "\n")
 			}
 			for _, a := range s.Addons {
-				if a.Message != "" {
-					addonLines.WriteString("  addon " + a.Name + ": " + strings.Join(strings.Fields(a.Message), " ") + "\n")
+				if why := a.Why(); why != "" {
+					addonLines.WriteString("  addon " + a.Name + ": " + why + "\n")
 				}
 			}
 			out += addonLines.String()

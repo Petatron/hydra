@@ -758,7 +758,7 @@ func TestStatusReportsAddons(t *testing.T) {
 	ready.SetLabels(map[string]string{render.ClusterLabelKey: "c", render.AddonLabelKey: "metrics-server"})
 	failing := obj(hcpGVK, "ns", "c-other", map[string]any{
 		"spec":   map[string]any{"version": "1.0.0"},
-		"status": map[string]any{"conditions": []any{map[string]any{"type": "Ready", "status": "False", "message": "install failed"}}},
+		"status": map[string]any{"conditions": []any{map[string]any{"type": "Ready", "status": "False", "reason": "IssuesReported", "message": "install failed"}}},
 	})
 	failing.SetLabels(map[string]string{render.ClusterLabelKey: "c", render.AddonLabelKey: "other"})
 	m := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cl, ready, failing).Build()}
@@ -773,7 +773,7 @@ func TestStatusReportsAddons(t *testing.T) {
 		t.Errorf("line: %s", s.Line())
 	}
 	for _, a := range s.Addons {
-		if a.Name == "other" && a.Message != "install failed" {
+		if a.Name == "other" && (a.Message != "install failed" || a.Why() != "IssuesReported: install failed") {
 			t.Errorf("message: %+v", a)
 		}
 	}
