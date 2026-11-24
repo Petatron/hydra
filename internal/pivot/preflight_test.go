@@ -11,6 +11,8 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/Petatron/hydra/internal/render"
 )
 
 func TestPollDefaults(t *testing.T) {
@@ -242,6 +244,12 @@ func TestVerifyOnce(t *testing.T) {
 		{name: "machines unlistable", tgtF: []*fault{{verb: "list", kind: lcHydraMachine, err: errBoom}}, want: "listing HydraMachines on cluster c"},
 		{name: "no machines", mutate: drop(hydraMachineGVK), want: "no HydraMachines on cluster c yet"},
 		{name: "machine not Ready", mutate: machineNotReady, want: "HydraMachine c-cp-1 is not Ready"},
+		{name: "addon not Ready on the target", mutate: func(o []client.Object) []client.Object {
+			return append(o, addonProxy("c-metrics-server", "False"))
+		}, want: "addons on cluster c are not all Ready"},
+		{name: "addon Ready on the target", mutate: func(o []client.Object) []client.Object {
+			return append(o, addonProxy("c-metrics-server", "True"))
+		}, want: ""},
 		{name: "CNI set missing", tgtF: []*fault{{verb: "get", kind: "ClusterResourceSet", err: errBoom}}, want: "the CNI ClusterResourceSet did not arrive"},
 		// cni: external: no CNI label, no set and no binding to carry.
 		{name: "external CNI", mutate: func(o []client.Object) []client.Object {
@@ -274,6 +282,17 @@ func TestVerifyOnce(t *testing.T) {
 			}
 		})
 	}
+}
+
+// addonProxy is a HelmChartProxy labelled for cluster c with the given Ready
+// status.
+func addonProxy(name, ready string) client.Object {
+	h := u(schema.GroupVersionKind{Group: crsGVK.Group, Version: "v1alpha1", Kind: "HelmChartProxy"}, ns, name, map[string]any{
+		"spec":   map[string]any{"version": "3.14.0"},
+		"status": map[string]any{"conditions": []any{map[string]any{"type": "Ready", "status": ready}}},
+	})
+	h.SetLabels(map[string]string{render.ClusterLabelKey: "c", render.AddonLabelKey: "metrics-server"})
+	return h
 }
 
 func TestConditionTrue(t *testing.T) {

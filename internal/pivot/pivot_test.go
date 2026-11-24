@@ -512,6 +512,7 @@ func TestPivotRefusesStrangersInTheNamespace(t *testing.T) {
 		{"another ClusterResourceSet", u(crsGVK, ns, "other-cilium", nil), "ClusterResourceSet other-cilium"},
 		{"a ClusterClass", u(ccGVK, ns, "cc", nil), "ClusterClass cc"},
 		{"a Secret labelled for move", foreignSecret, "Secret other-pki"},
+		{"another tool's HelmChartProxy", u(schema.GroupVersionKind{Group: crsGVK.Group, Version: "v1alpha1", Kind: "HelmChartProxy"}, ns, "hand-made", nil), "HelmChartProxy hand-made"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			src := newClient(t, append(append(clusterObjects("src", true), tc.extra), labelledCRDs()...)...)

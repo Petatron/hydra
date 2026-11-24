@@ -283,6 +283,12 @@ func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.C
 		return "", err
 	}
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "cluster %s/%s is Available after %s\n", ns, name, time.Since(start).Round(time.Second))
+	if len(cfg.Spec.Addons) > 0 {
+		// Addons settle on their own, after the cluster; create does not wait.
+		if s, err := m.Status(ctx, ns, name); err == nil && !s.AddonsReady() {
+			_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "addons are still being installed by Cluster API Add-on Provider Helm; follow them with `hydra cluster status`")
+		}
+	}
 	kc, err := m.Kubeconfig(ctx, ns, name)
 	if err != nil {
 		return "", err
@@ -427,6 +433,9 @@ func newStatusCommand() *cobra.Command {
 				out += "  " + s.AvailableMessage + "\n"
 			}
 			var addonLines strings.Builder
+			if s.AddonsError != "" {
+				addonLines.WriteString("  addons: " + s.AddonsError + "\n")
+			}
 			for _, a := range s.Addons {
 				if a.Message != "" {
 					addonLines.WriteString("  addon " + a.Name + ": " + strings.Join(strings.Fields(a.Message), " ") + "\n")
@@ -456,7 +465,8 @@ func newDeleteCommand() *cobra.Command {
 		Long: `delete deletes the Cluster object and waits while Cluster API and the Hydra
 provider tear down its machines, VMs and disks; a network Hydra created for it
 is removed once nothing else uses it. It then removes the rendered objects Cluster API does not own (templates,
-the CNI ClusterResourceSet). The hypervisor credentials Secret is kept.
+the CNI ClusterResourceSet, addon HelmChartProxies: only after the machines are gone, since deleting a proxy
+uninstalls its addon). The hypervisor credentials Secret is kept.
 
 This cannot be undone. It shows which management cluster it will act on, then
 asks for the cluster's name unless --yes is given, and refuses without --yes

@@ -314,7 +314,13 @@ var movableKinds = []schema.GroupVersionKind{
 	{Group: "bootstrap.cluster.x-k8s.io", Version: capiVersion, Kind: "KubeadmConfigTemplate"},
 	crsGVK,
 	crsBindingGVK,
+	// CAAPH's objects move too (PET-97); without the CRDs they hold nothing.
+	{Group: crsGVK.Group, Version: caaphAPIVersion, Kind: render.KindHelmChartProxy},
+	{Group: crsGVK.Group, Version: caaphAPIVersion, Kind: "HelmReleaseProxy"},
 }
+
+// caaphAPIVersion is the API version of CAAPH's objects.
+const caaphAPIVersion = "v1alpha1"
 
 // strangers lists the objects in the namespace a move could carry that are
 // not this cluster's. A kind whose CRD is not installed holds nothing.
@@ -609,6 +615,12 @@ func (p *Pivot) verifyOnce(ctx context.Context) error {
 	// cluster on: the bootstrap cluster is deleted once this passes.
 	if !st.Exists || st.Terminating || st.Available != cluster.ConditionTrue || !st.RolledOut || !st.CNIReady() {
 		return fmt.Errorf("the Cluster on %s: %s", p.Target.Name, st.Line())
+	}
+	// Addons must be reconciled again on the target. A move makes CAAPH
+	// there replace each HelmReleaseProxy (harmlessly, PET-97); Ready says
+	// the replacement found its release.
+	if !st.AddonsReady() {
+		return fmt.Errorf("addons on %s are not all Ready: %s", p.Target.Name, st.Line())
 	}
 	if cl, err := p.getCluster(ctx, p.Target.C); err != nil {
 		return err

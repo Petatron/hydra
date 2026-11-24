@@ -35,20 +35,24 @@ const addonsGroup = "addons.cluster.x-k8s.io"
 
 // ownedKinds are every kind render produces that this CLI may find again by
 // the hydra.io/cluster label: to report as orphaned, or to delete.
-var ownedKinds = []schema.GroupVersionKind{
-	hydraClusterGVK,
-	kcpGVK,
-	mdGVK,
-	{Group: capiGroup, Version: capiVersion, Kind: "MachineHealthCheck"},
-	{Group: "bootstrap.cluster.x-k8s.io", Version: capiVersion, Kind: "KubeadmConfigTemplate"},
-	{Group: infraGroup, Version: infraVersion, Kind: kindHydraMachineTemplate},
-	{Group: addonsGroup, Version: capiVersion, Kind: "ClusterResourceSet"},
-	{Group: "", Version: "v1", Kind: kindConfigMap},
-	// Last, so delete removes addons only after the machines are gone: a
-	// HelmChartProxy deleted while its cluster still runs uninstalls the
-	// release there.
-	hcpGVK,
-}
+//
+// delete removes them in two phases. withMachines first, waiting until they
+// are gone (so are the machines and VMs); then afterMachines, which nothing
+// running references any more. A HelmChartProxy deleted while its cluster
+// still runs uninstalls the release there, so addons belong in the second
+// phase only (a test keeps it so).
+var (
+	withMachines  = []schema.GroupVersionKind{hydraClusterGVK, kcpGVK, mdGVK}
+	afterMachines = []schema.GroupVersionKind{
+		{Group: capiGroup, Version: capiVersion, Kind: "MachineHealthCheck"},
+		{Group: "bootstrap.cluster.x-k8s.io", Version: capiVersion, Kind: "KubeadmConfigTemplate"},
+		{Group: infraGroup, Version: infraVersion, Kind: kindHydraMachineTemplate},
+		{Group: addonsGroup, Version: capiVersion, Kind: "ClusterResourceSet"},
+		{Group: "", Version: "v1", Kind: kindConfigMap},
+		hcpGVK,
+	}
+	ownedKinds = slices.Concat(withMachines, afterMachines)
+)
 
 // CheckManagementCluster fails, before anything is written, when the target
 // has no Cluster API: create must not leave a stray namespace on a cluster
@@ -67,7 +71,11 @@ func (m *Manager) CheckAddonProvider(objs []*unstructured.Unstructured) error {
 	if !slices.ContainsFunc(objs, func(o *unstructured.Unstructured) bool { return o.GetKind() == render.KindHelmChartProxy }) {
 		return nil
 	}
-	if _, err := m.C.RESTMapper().RESTMapping(hcpGVK.GroupKind(), hcpGVK.Version); err != nil {
+	_, err := m.C.RESTMapper().RESTMapping(hcpGVK.GroupKind(), hcpGVK.Version)
+	if err != nil && !meta.IsNoMatchError(err) {
+		return fmt.Errorf("checking the management cluster for Cluster API Add-on Provider Helm: %w", err)
+	}
+	if err != nil {
 		return fmt.Errorf("hydra.yaml lists addons, but the management cluster has no Cluster API Add-on Provider Helm (no %s %s): `hydra bootstrap` installs it on a new management cluster; on an existing one install it with `clusterctl init --addon helm:%s`, or remove spec.addons (%w)",
 			hcpGVK.GroupVersion(), hcpGVK.Kind, AddonProviderVersion, err)
 	}

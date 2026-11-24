@@ -102,8 +102,31 @@ func (k *KubeCluster) InstalledProviders(ctx context.Context) (map[string]string
 		version, _, _ := unstructured.NestedString(p.Object, "version")
 		out[inventoryName(typ, name)] = version
 	}
+	// CAAPH installed some other way (its Helm chart, kubectl apply) has its
+	// CRDs but no inventory entry. clusterctl init would install over it, so
+	// report it as present at an unknown version and let the caller refuse.
+	if _, ok := out[caaphInventoryName]; !ok {
+		var crd apiextensionsv1.CustomResourceDefinition
+		switch err := k.c.Get(ctx, client.ObjectKey{Name: caaphCRD}, &crd); {
+		case err == nil:
+			out[caaphInventoryName] = notByClusterctl
+		case apierrors.IsNotFound(err), isNoKind(err):
+		default:
+			return nil, fmt.Errorf("checking for an existing Cluster API Add-on Provider Helm: %w", err)
+		}
+	}
 	return out, nil
 }
+
+// notByClusterctl is the version reported for a component present without
+// clusterctl's record of it: never equal to a pin, so it is refused.
+const notByClusterctl = "unknown (not installed by clusterctl)"
+
+// caaphInventoryName and caaphCRD identify Cluster API Add-on Provider Helm.
+const (
+	caaphInventoryName = "addon-helm"
+	caaphCRD           = "helmchartproxies.addons.cluster.x-k8s.io"
+)
 
 // certManagerVersion returns the version clusterctl recorded on the
 // cert-manager it installed, "" when there is none, or "unknown" when a
@@ -119,7 +142,7 @@ func (k *KubeCluster) certManagerVersion(ctx context.Context) (string, error) {
 		}
 	}
 	if len(deps.Items) > 0 {
-		return "unknown (not installed by clusterctl)", nil
+		return notByClusterctl, nil
 	}
 	return "", nil
 }

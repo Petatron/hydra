@@ -583,3 +583,20 @@ func TestCheckAddonProvider(t *testing.T) {
 		t.Errorf("CAAPH installed: %v", err)
 	}
 }
+
+// Only a missing kind means CAAPH is absent; any other discovery error is
+// reported as itself.
+func TestCheckAddonProviderPassesOtherErrorsThrough(t *testing.T) {
+	hcp := obj(hcpGVK, "ns", "c-metrics-server", nil)
+	m := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithRESTMapper(brokenMapper{}).Build()}
+	err := m.CheckAddonProvider([]*unstructured.Unstructured{hcp})
+	if err == nil || strings.Contains(err.Error(), "clusterctl init") || !strings.Contains(err.Error(), "discovery down") {
+		t.Errorf("got %v", err)
+	}
+}
+
+type brokenMapper struct{ meta.RESTMapper }
+
+func (brokenMapper) RESTMapping(schema.GroupKind, ...string) (*meta.RESTMapping, error) {
+	return nil, errors.New("discovery down")
+}

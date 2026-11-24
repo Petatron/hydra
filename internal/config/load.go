@@ -278,6 +278,10 @@ func (c *ClusterConfig) validateAddons(errs *fieldErrors) {
 		if seen[a.Name] {
 			errs.add(field+".name", "%s is listed more than once", a.Name)
 		}
+		// CAAPH puts the proxy's name, <cluster>-<addon>, in a label value.
+		if n := len(c.Metadata.Name) + 1 + len(a.Name); n > validation.LabelValueMaxLength {
+			errs.add(field+".name", "%s-%s is %d characters; it names the addon's HelmChartProxy and must fit a label value (%d)", c.Metadata.Name, a.Name, n, validation.LabelValueMaxLength)
+		}
 		seen[a.Name] = true
 		if !slices.Contains(entry.Versions, a.Version) {
 			errs.add(field+".version", "%s allows %s, got %q", a.Name, strings.Join(entry.Versions, ", "), a.Version)

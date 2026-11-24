@@ -10,6 +10,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -35,7 +36,29 @@ func coreScheme(t *testing.T) *runtime.Scheme {
 	if err := clientgoscheme.AddToScheme(s); err != nil {
 		t.Fatal(err)
 	}
+	if err := apiextensionsv1.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
 	return s
+}
+
+// CAAPH installed without clusterctl has its CRDs but no inventory entry: it
+// is reported at an unknown version, so bootstrap refuses rather than letting
+// clusterctl init install over it.
+func TestCAAPHNotInstalledByClusterctl(t *testing.T) {
+	crd := &apiextensionsv1.CustomResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: caaphCRD}}
+	got, err := newKubeCluster(providerClient(t, nil, nil, crd)).InstalledProviders(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[caaphInventoryName] != notByClusterctl {
+		t.Errorf("got %v", got)
+	}
+	inv := []*unstructured.Unstructured{provider("caaph-system", "AddonProvider", "helm", CAAPHVersion)}
+	got, err = newKubeCluster(providerClient(t, inv, nil, crd)).InstalledProviders(context.Background())
+	if err != nil || got[caaphInventoryName] != CAAPHVersion {
+		t.Errorf("clusterctl-installed CAAPH: %v %v", got, err)
+	}
 }
 
 func provider(ns, typ, name, version string) *unstructured.Unstructured {

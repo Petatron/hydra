@@ -10,6 +10,7 @@ package addons
 
 import (
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 )
@@ -45,9 +46,9 @@ type Addon struct {
 	Versions       []string
 	DefaultVersion string
 	Params         []Param
-	// Protected addons are never removed by `hydra cluster apply` without
-	// --allow-remove (PET-99): removing a HelmChartProxy uninstalls the
-	// release, and CAAPH has no way to keep it.
+	// Protected marks an addon whose removal must be explicit: deleting its
+	// HelmChartProxy uninstalls the release, and CAAPH has no way to keep it.
+	// Read by the pruning planned in PET-99; nothing prunes addons yet.
 	Protected bool
 	// Values turns resolved params (every declared param present, typed) into
 	// the chart's Helm values.
@@ -139,7 +140,9 @@ func (a Addon) Resolve(params map[string]any) (map[string]any, []string) {
 			}
 		case Int:
 			f, ok := v.(float64)
-			if !ok || f != float64(int64(f)) {
+			// Beyond 2^53 a float64 no longer holds every whole number, and
+			// converting past int64's range is implementation-defined.
+			if !ok || math.Abs(f) > 1<<53 || f != math.Trunc(f) {
 				problems = append(problems, fmt.Sprintf("params.%s: must be a whole number, got %v", p.Name, v))
 				continue
 			}

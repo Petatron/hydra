@@ -334,6 +334,8 @@ type Summary struct {
 	CNIExternal bool
 	// Addons are the cluster's HelmChartProxies, as CAAPH reports them.
 	Addons []AddonState
+	// AddonsError is why the proxies could not be read, if they could not.
+	AddonsError string
 	// RolledOut is true when the control plane and every MachineDeployment
 	// have observed their latest spec and have all replicas up to date, so a
 	// rerun after a change does not report success before the rollout.
@@ -388,6 +390,9 @@ func (s Summary) Line() string {
 	default:
 		parts = append(parts, "CNI waiting for the API")
 	}
+	if s.AddonsError != "" {
+		parts = append(parts, "addons: unreadable")
+	}
 	if len(s.Addons) > 0 {
 		var ad []string
 		for _, a := range s.Addons {
@@ -426,8 +431,12 @@ func addonState(hcp *unstructured.Unstructured) AddonState {
 	return a
 }
 
-// AddonsReady reports whether every addon's proxy is Ready.
+// AddonsReady reports whether every addon's proxy is Ready (false when they
+// could not be read).
 func (s Summary) AddonsReady() bool {
+	if s.AddonsError != "" {
+		return false
+	}
 	for _, a := range s.Addons {
 		if a.Ready != ConditionTrue {
 			return false
@@ -503,12 +512,14 @@ func (m *Manager) Status(ctx context.Context, namespace, name string) (Summary, 
 		s.Machines[orDash(phase)]++
 	}
 
-	hcps, err := m.listLabelled(ctx, namespace, name, hcpGVK)
-	if err != nil {
-		return s, err
-	}
-	for i := range hcps {
-		s.Addons = append(s.Addons, addonState(&hcps[i]))
+	// Addons never make status fail: the cluster's own state is what create
+	// waits on, and a kubeconfig that may not list proxies must not hang it.
+	if hcps, err := m.listLabelled(ctx, namespace, name, hcpGVK); err != nil {
+		s.AddonsError = err.Error()
+	} else {
+		for i := range hcps {
+			s.Addons = append(s.Addons, addonState(&hcps[i]))
+		}
 	}
 
 	if s.CNIExternal {
@@ -684,14 +695,14 @@ func (m *Manager) Delete(ctx context.Context, namespace, name string, timeout ti
 		}
 	}
 	// Phase 1: objects with machines or infrastructure behind them.
-	if err := m.deleteLabelled(ctx, namespace, name, ownedKinds[:3]); err != nil {
+	if err := m.deleteLabelled(ctx, namespace, name, withMachines); err != nil {
 		return err
 	}
-	if err := m.waitLabelledGone(ctx, namespace, name, ownedKinds[:3], time.Until(deadline)); err != nil {
+	if err := m.waitLabelledGone(ctx, namespace, name, withMachines, time.Until(deadline)); err != nil {
 		return err
 	}
 	// Phase 2: nothing references these any more.
-	return m.deleteLabelled(ctx, namespace, name, ownedKinds[3:])
+	return m.deleteLabelled(ctx, namespace, name, afterMachines)
 }
 
 // Labelled lists every object labelled for the cluster, as delete would find

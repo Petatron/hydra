@@ -187,6 +187,12 @@ installs CAAPH; `create` refuses a hydra.yaml with addons on a management cluste
 
 - A version change in hydra.yaml upgrades the addon on the next `create`. A change made on the
   workload cluster behind CAAPH's back is put right at CAAPH's next resync (up to 10 minutes).
+- **Pin `version` for anything you care about.** An addon without one takes the catalogue's
+  default, so a hydra release that moves the default upgrades the addon on your next `create`
+  (`plan` shows the change first).
+- `create` does not wait for addons: they settle after the cluster is Available. `status` shows
+  each one, and the reason when it is not Ready. A pivot waits for every addon to be Ready on the
+  target before it deletes the bootstrap cluster.
 - **Removing an addon from hydra.yaml does not uninstall it yet**: its `HelmChartProxy` is listed as
   no longer rendered and left in place. **Deleting that `HelmChartProxy`, or removing the Cluster's
   `hydra.io/cluster` label, uninstalls the addon within seconds**, and CAAPH has no way to keep it.

@@ -14,6 +14,20 @@ func TestCatalogueEntriesAreComplete(t *testing.T) {
 		if !slices.Contains(a.Versions, a.DefaultVersion) {
 			t.Errorf("%s: default version %s is not an allowed version %v", a.Name, a.DefaultVersion, a.Versions)
 		}
+		for _, p := range a.Params {
+			var ok bool
+			switch p.Type {
+			case Bool:
+				_, ok = p.Default.(bool)
+			case String:
+				_, ok = p.Default.(string)
+			case Int:
+				_, ok = p.Default.(int64)
+			}
+			if !ok {
+				t.Errorf("%s: param %s default %v (%T) is not a %s", a.Name, p.Name, p.Default, p.Default, p.Type)
+			}
+		}
 		params, problems := a.Resolve(nil)
 		if len(problems) > 0 {
 			t.Errorf("%s: defaults do not resolve: %v", a.Name, problems)
@@ -51,11 +65,12 @@ func TestResolve(t *testing.T) {
 		t.Errorf("defaults: %v", got)
 	}
 	for in, want := range map[string]map[string]any{
-		"params.extra: unknown; x takes on, s, n": {"extra": 1.0},
-		"params.on: must be true or false":        {"on": "yes"},
-		"params.s: must be a string":              {"s": 1.0},
-		"params.s: must not contain {{":           {"s": "{{ .Cluster }}"},
-		"params.n: must be a whole number":        {"n": 1.5},
+		"params.extra: unknown; x takes on, s, n":      {"extra": 1.0},
+		"params.on: must be true or false":             {"on": "yes"},
+		"params.s: must be a string":                   {"s": 1.0},
+		"params.s: must not contain {{":                {"s": "{{ .Cluster }}"},
+		"params.n: must be a whole number":             {"n": 1.5},
+		"params.n: must be a whole number, got 1e+300": {"n": 1e300},
 	} {
 		if _, problems := a.Resolve(want); len(problems) != 1 || !strings.HasPrefix(problems[0], in) {
 			t.Errorf("%v: got %v, want %q", want, problems, in)

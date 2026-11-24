@@ -8,11 +8,13 @@ import (
 	"io"
 	"maps"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -423,6 +425,35 @@ func TestDeleteRemovesUnownedInfrastructureFirst(t *testing.T) {
 	}
 }
 
+// An addon's HelmChartProxy is deleted only once the cluster's machines are
+// gone: deleting it while they run would uninstall the release from them.
+func TestDeleteRemovesAddonsAfterMachines(t *testing.T) {
+	ctx := context.Background()
+	md := labelled(mdGVK, "c-md-0", "c")
+	hcp := labelled(hcpGVK, "c-metrics-server", "c")
+	var order []string
+	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(hcp, md).WithInterceptorFuncs(interceptor.Funcs{
+		Delete: func(ctx context.Context, cl client.WithWatch, o client.Object, opts ...client.DeleteOption) error {
+			order = append(order, o.GetObjectKind().GroupVersionKind().Kind)
+			return cl.Delete(ctx, o, opts...)
+		},
+	}).Build()
+	var out bytes.Buffer
+	if err := (&Manager{C: c, Out: &out, Poll: time.Millisecond}).Delete(ctx, "ns", "c", time.Second, false); err != nil {
+		t.Fatalf("%v\n%s", err, out.String())
+	}
+	if got := strings.Join(order, ","); got != "MachineDeployment,HelmChartProxy" {
+		t.Errorf("delete order %s: the machines must go before the addons", got)
+	}
+}
+
+// The first delete phase (waited on until gone) never holds addons.
+func TestAddonsNotInTheFirstDeletePhase(t *testing.T) {
+	if slices.Contains(withMachines, hcpGVK) || !slices.Contains(afterMachines, hcpGVK) {
+		t.Errorf("HelmChartProxy must be deleted after the machines: withMachines=%v", withMachines)
+	}
+}
+
 func TestApplyDoesNotForceOwnershipByDefault(t *testing.T) {
 	for _, o := range applyOptions("c", false) {
 		if o == client.ForceOwnership {
@@ -761,5 +792,29 @@ func TestOrphanedAddon(t *testing.T) {
 	}
 	if len(orphans) != 1 || !strings.Contains(orphans[0], "HelmChartProxy") {
 		t.Errorf("orphans: %v", orphans)
+	}
+}
+
+// A kubeconfig that may not list HelmChartProxies leaves status working: the
+// addons are reported unreadable, not the whole cluster.
+func TestStatusSurvivesUnreadableAddons(t *testing.T) {
+	ctx := context.Background()
+	cl := obj(clusterGVK, "ns", "c", map[string]any{"status": map[string]any{"conditions": []any{
+		map[string]any{"type": "Available", "status": "True"},
+	}}})
+	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cl).WithInterceptorFuncs(interceptor.Funcs{
+		List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if u, ok := list.(*unstructured.UnstructuredList); ok && u.GroupVersionKind().Kind == hcpGVK.Kind+"List" {
+				return apierrors.NewForbidden(schema.GroupResource{Group: addonsGroup, Resource: "helmchartproxies"}, "", errors.New("denied"))
+			}
+			return w.List(ctx, list, opts...)
+		},
+	}).Build()
+	s, err := (&Manager{C: c, Out: io.Discard}).Status(ctx, "ns", "c")
+	if err != nil {
+		t.Fatalf("status must not fail on unreadable addons: %v", err)
+	}
+	if s.AddonsError == "" || s.AddonsReady() || !strings.Contains(s.Line(), "addons: unreadable") {
+		t.Errorf("summary: %+v / %s", s, s.Line())
 	}
 }
