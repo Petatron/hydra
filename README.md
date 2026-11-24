@@ -13,7 +13,9 @@ lifecycle platform built on [Cluster API](https://cluster-api.sigs.k8s.io/), wit
 infrastructure provider
 ([`cluster-api-provider-hydra`](https://github.com/Petatron/cluster-api-provider-hydra)).
 
-You describe a cluster in one file, `hydra.yaml`, and `hydra` turns it into Cluster API resources.
+You describe a cluster in one file, `hydra.yaml` (its control plane, node pools, CNI and platform
+addons), and `hydra` turns it into Cluster API resources, keeps the live cluster matching it, and
+removes what you take out of it, within safe limits.
 The CLI is a **stateless orchestrator**: every cluster's desired and actual state lives in
 Kubernetes, never on your machine. There is no local database, cache or inventory, and an
 interrupted command can always be re-run.
@@ -62,9 +64,9 @@ hydra validate -f hydra.yaml --hypervisor-credentials ./libvirt-pki
 # 2. Build it and make it manage itself (bootstrap kind, create, pivot, delete kind)
 hydra cluster create -f hydra.yaml --self-hosted --hypervisor-credentials ./libvirt-pki
 
-# 3. Day 2: change hydra.yaml (pool sizes, say), preview, apply, against the cluster itself
+# 3. Day 2: change hydra.yaml (pool sizes, an addon), preview, apply, against the cluster itself
 hydra cluster plan   -f hydra.yaml --management-kubeconfig ./<name>.kubeconfig
-hydra cluster create -f hydra.yaml --management-kubeconfig ./<name>.kubeconfig
+hydra cluster apply  -f hydra.yaml --management-kubeconfig ./<name>.kubeconfig
 hydra cluster status -f hydra.yaml --management-kubeconfig ./<name>.kubeconfig
 
 # 4. Tear it down: move it into a bootstrap cluster, delete it there, remove kind
@@ -74,6 +76,9 @@ hydra cluster delete -f hydra.yaml --self-hosted
 - `create --self-hosted` refuses to build when it cannot show the cluster does not already exist
   (this machine cannot reach the endpoint, or Hydra chooses it). Pass `--fresh` once you have
   checked.
+- `apply` also removes what you took out of `hydra.yaml`: a dropped addon is uninstalled, a removed
+  pool only with `--prune-pools=<pool>`. `plan` shows each one first; see
+  [Create, inspect and delete a cluster](#create-inspect-and-delete-a-cluster).
 - Every step can be interrupted and run again: each command finds where things are and continues.
   A move interrupted part way leaves the Cluster on both sides; the command says so, and
   `--finish-split` finishes it.
@@ -411,4 +416,7 @@ They change only in a hydra release.
 ## Contributing
 
 See [`AGENTS.md`](AGENTS.md) for layout and conventions. `make test lint verify` must pass.
+`make e2e` (needs Docker) bootstraps a kind management cluster, server-side dry-runs every example
+against it, and runs `hydra cluster apply` through creating, refusing and pruning; CI runs it on
+every PR that touches code.
 Licensed under [Apache 2.0](LICENSE).

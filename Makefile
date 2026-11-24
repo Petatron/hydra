@@ -64,7 +64,7 @@ test-version: ## Test hack/version.sh (parsing, tag ordering, bumping, metadata.
 	bash hack/version_test.sh
 
 .PHONY: e2e
-e2e: ## Bootstrap a kind management cluster and dry-run every example against it (needs Docker)
+e2e: ## Bootstrap a kind management cluster, dry-run every example, and apply and prune a cluster (needs Docker)
 	./hack/e2e/run.sh
 
 .PHONY: vuln

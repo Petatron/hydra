@@ -15,3 +15,8 @@ spec:
   network:
     controlPlaneEndpoint: 10.123.0.10
     bridges: [br0]
+  # Pinned, not defaulted: with no node pools the control plane would default
+  # to schedulable, so dropping the apply stage's only pool would also change
+  # the control plane. The stage tests pruning, not that default.
+  controlPlane:
+    schedulable: false
