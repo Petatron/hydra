@@ -340,7 +340,9 @@ func cluCmd() (*cobra.Command, *bytes.Buffer) {
 
 // cluAvailable is a cluster ns/name that its controllers report Available,
 // rolled out, with the CNI applied and a kubeconfig Secret holding kc.
-func cluAvailable(ns, name, version string, kc []byte) []client.Object {
+func cluAvailable(version string, kc []byte) []client.Object {
+	const name = "hydra-mgmt"
+	const ns = "default"
 	cl := capiCluster(ns, name, "", 0)
 	_ = unstructured.SetNestedSlice(cl.Object, []any{map[string]any{"type": "Available", lcStatus: "True"}}, lcStatus, "conditions")
 	kcp := &unstructured.Unstructured{Object: map[string]any{}}
@@ -504,7 +506,7 @@ func TestCluRunCreateWaitsAndWritesKubeconfig(t *testing.T) {
 	cfg, objs := cluLoad(t, "../../examples/hydra-mgmt.yaml")
 	t.Run("explicit path", func(t *testing.T) {
 		ap := &cluApplies{}
-		tg, log := cluTarget(t, true, ap, interceptor.Funcs{}, cluAvailable("default", "hydra-mgmt", cfg.Spec.KubernetesVersion, []byte("admin"))...)
+		tg, log := cluTarget(t, true, ap, interceptor.Funcs{}, cluAvailable(cfg.Spec.KubernetesVersion, []byte("admin"))...)
 		tg.bootstrapKind = false
 		cmd, errOut := cluCmd()
 		out := filepath.Join(t.TempDir(), "x.kubeconfig")
@@ -529,7 +531,7 @@ func TestCluRunCreateWaitsAndWritesKubeconfig(t *testing.T) {
 	})
 	t.Run("default path", func(t *testing.T) {
 		t.Chdir(t.TempDir())
-		tg, _ := cluTarget(t, true, &cluApplies{}, interceptor.Funcs{}, cluAvailable("default", "hydra-mgmt", cfg.Spec.KubernetesVersion, []byte("admin"))...)
+		tg, _ := cluTarget(t, true, &cluApplies{}, interceptor.Funcs{}, cluAvailable(cfg.Spec.KubernetesVersion, []byte("admin"))...)
 		cmd, _ := cluCmd()
 		path, err := runCreate(t.Context(), cmd, tg, cfg, objs, createOptions{wait: true, timeout: 5 * time.Second})
 		if err != nil || path != "hydra-mgmt.kubeconfig" {
@@ -544,7 +546,7 @@ func TestCluRunCreateWaitsAndWritesKubeconfig(t *testing.T) {
 		}
 	})
 	t.Run("no kubeconfig Secret", func(t *testing.T) {
-		live := cluAvailable("default", "hydra-mgmt", cfg.Spec.KubernetesVersion, nil)
+		live := cluAvailable(cfg.Spec.KubernetesVersion, nil)
 		tg, _ := cluTarget(t, true, &cluApplies{}, interceptor.Funcs{}, live[:3]...)
 		cmd, _ := cluCmd()
 		if _, err := runCreate(t.Context(), cmd, tg, cfg, objs, createOptions{wait: true, timeout: 5 * time.Second}); err == nil || !strings.Contains(err.Error(), "hydra-mgmt-kubeconfig") {
@@ -558,6 +560,39 @@ func TestCluRunCreateWaitsAndWritesKubeconfig(t *testing.T) {
 			t.Fatalf("got %v", err)
 		}
 	})
+	// apply prunes last: a timeout, or a kubeconfig it cannot fetch, leaves
+	// what it would have pruned; a finished apply prunes it.
+	for _, tc := range []struct {
+		name    string
+		live    func() []client.Object
+		timeout time.Duration
+		pruned  bool
+	}{
+		{"apply that times out prunes nothing", func() []client.Object { return nil }, 20 * time.Millisecond, false},
+		{"apply without a kubeconfig prunes nothing", func() []client.Object {
+			return cluAvailable(cfg.Spec.KubernetesVersion, nil)[:3]
+		}, 5 * time.Second, false},
+		{"finished apply prunes", func() []client.Object {
+			return cluAvailable(cfg.Spec.KubernetesVersion, []byte("admin"))
+		}, 5 * time.Second, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			stale := labelledFor("HydraMachineTemplate", "infrastructure.cluster.x-k8s.io/v1alpha1", "hydra-mgmt-cp-stale")
+			tg, _ := cluTarget(t, true, &cluApplies{}, interceptor.Funcs{}, append(tc.live(), stale)...)
+			cmd, errOut := cluCmd()
+			_, err := runCreate(t.Context(), cmd, tg, cfg, objs, createOptions{prune: &cluster.PruneOptions{}, wait: true, timeout: tc.timeout})
+			if (err == nil) != tc.pruned {
+				t.Fatalf("err %v\n%s", err, errOut.String())
+			}
+			u := &unstructured.Unstructured{}
+			u.SetGroupVersionKind(stale.GroupVersionKind())
+			gone := apierrors.IsNotFound(tg.m.C.Get(t.Context(), client.ObjectKeyFromObject(stale), u))
+			if gone != tc.pruned {
+				t.Errorf("pruned=%v, want %v\n%s", gone, tc.pruned, errOut.String())
+			}
+		})
+	}
 }
 
 func TestCluCreateCommandRefusals(t *testing.T) {

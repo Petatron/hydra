@@ -193,7 +193,9 @@ func classifyProxy(o *unstructured.Unstructured, pc pruneContext) (PruneAction, 
 	hydras := name != "" && o.GetName() == render.AddonName(pc.cluster, name)
 	entry, known := lookupAddon(name)
 	switch {
-	case allowedProxy:
+	case allowedProxy && !hydras:
+		// proxy/<name> is for proxies hydra did not make. hydra's own proxy
+		// for a protected or uncatalogued addon still needs the addon named.
 		return PruneDelete, "removal allowed by --allow-remove=" + byProxy + "; deleting the proxy uninstalls its release"
 	case name != "" && pc.renderedAddons[name]:
 		return PruneRefused, fmt.Sprintf("another proxy for addon %s, which hydra.yaml still lists; deleting it would uninstall the release the addon uses. Remove it by hand, or pass --allow-remove=%s", name, byProxy)

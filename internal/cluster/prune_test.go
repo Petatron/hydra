@@ -81,6 +81,9 @@ func TestClassify(t *testing.T) {
 		{"hydra's proxy, uncatalogued addon allowed", proxy("c-gone", "gone"), PruneOptions{AllowRemove: []string{"gone"}}, PruneDelete, ""},
 		// Deleting a duplicate would uninstall the release the listed addon uses.
 		{"duplicate proxy for an addon still listed", proxy("c-kept-copy", "kept"), PruneOptions{AllowRemove: []string{"kept"}}, PruneRefused, "still lists"},
+		{"hydra's proxy, protected addon, proxy/ is not enough", proxy("c-guarded", "guarded"), PruneOptions{AllowRemove: []string{"proxy/c-guarded"}}, PruneRefused, "--allow-remove=guarded"},
+		{"hydra's proxy, uncatalogued addon, proxy/ is not enough", proxy("c-gone", "gone"), PruneOptions{AllowRemove: []string{"proxy/c-gone"}}, PruneRefused, "--allow-remove=gone"},
+		{"hydra's proxy, unprotected addon, proxy/ changes nothing", proxy("c-plain", "plain"), PruneOptions{AllowRemove: []string{"proxy/c-plain"}}, PruneDelete, "no longer in hydra.yaml"},
 		{"duplicate proxy allowed by proxy name", proxy("c-kept-copy", "kept"), PruneOptions{AllowRemove: []string{"proxy/c-kept-copy"}}, PruneDelete, ""},
 		{"not named like hydra's, unprotected addon", proxy("handmade", "plain"), PruneOptions{}, PruneRefused, "--allow-remove=proxy/handmade"},
 		{"proxy without addon label", proxy("c-hand", ""), PruneOptions{}, PruneRefused, "--allow-remove=proxy/c-hand"},

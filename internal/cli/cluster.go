@@ -221,7 +221,9 @@ renders are deleted where that is safe (ADR-002).
     A value that names more than one removed pool refuses instead.
   - The Cluster, its control plane, health check and CNI objects: never.
 
-Refusals are checked before anything is written. Run plan first: it shows
+Pruning is the last step: an apply that times out waiting, or cannot write the
+kubeconfig, deletes nothing (with --wait=false it prunes right after the
+apply). Refusals are checked before anything is written. Run plan first: it shows
 each object and what apply would do with it. Like create, apply refuses a
 Kubernetes version change (use upgrade) and keeps nothing locally; an
 interrupted apply is finished by running it again.`,
@@ -338,10 +340,11 @@ func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.C
 			return "", fmt.Errorf("applied, but %s", msg)
 		}
 	}
-	if err := pruneOrReport(ctx, cmd, m, objs, ns, name, o.prune); err != nil {
-		return "", err
-	}
 	if !wait {
+		// Asked not to wait: prune now, as the last step.
+		if err := pruneOrReport(ctx, cmd, m, objs, ns, name, o.prune); err != nil {
+			return "", err
+		}
 		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "not waiting (--wait=false); follow with `hydra cluster status`")
 		return "", nil
 	}
@@ -372,6 +375,11 @@ func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.C
 		return "", err
 	}
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "kubeconfig written to %s\n", path)
+	// Prune last: a cluster that never became Available, or a kubeconfig that
+	// could not be written, deletes nothing.
+	if err := pruneOrReport(ctx, cmd, m, objs, ns, name, o.prune); err != nil {
+		return path, err
+	}
 	return path, nil
 }
 
