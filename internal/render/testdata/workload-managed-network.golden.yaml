@@ -1283,3 +1283,26 @@ spec:
   - kind: ConfigMap
     name: demo-cilium
   strategy: ApplyOnce
+---
+# Addon metrics-server 3.14.0, installed and kept in step by Cluster API Add-on Provider Helm.
+apiVersion: addons.cluster.x-k8s.io/v1alpha1
+kind: HelmChartProxy
+metadata:
+  labels:
+    hydra.io/addon: metrics-server
+    hydra.io/cluster: demo
+  name: demo-metrics-server
+  namespace: demo
+spec:
+  chartName: metrics-server
+  clusterSelector:
+    matchLabels:
+      hydra.io/cluster: demo
+  namespace: kube-system
+  reconcileStrategy: Continuous
+  releaseName: metrics-server
+  repoURL: https://kubernetes-sigs.github.io/metrics-server/
+  valuesTemplate: |
+    args:
+    - --kubelet-insecure-tls
+  version: 3.14.0

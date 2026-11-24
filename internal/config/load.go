@@ -8,12 +8,15 @@ import (
 	"net/netip"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/yaml"
+
+	"github.com/Petatron/hydra/internal/addons"
 )
 
 // Defaults applied when hydra.yaml leaves a field empty.
@@ -203,6 +206,12 @@ func (c *ClusterConfig) applyDefaults() {
 		schedulable := len(s.NodePools) == 0
 		cp.Schedulable = &schedulable
 	}
+	for i := range s.Addons {
+		a := &s.Addons[i]
+		if entry, ok := addons.Lookup(a.Name); ok && a.Version == "" {
+			a.Version = entry.DefaultVersion
+		}
+	}
 }
 
 // fieldErrors collects every problem, so one run reports them all.
@@ -251,7 +260,37 @@ func (c *ClusterConfig) Validate() error {
 	}
 	c.validateNetwork(&errs)
 	c.validateMachines(&errs)
+	c.validateAddons(&errs)
 	return errs.err()
+}
+
+// validateAddons checks each addon against the catalogue: known name, no
+// duplicates, an allowed version, and params the addon declares.
+func (c *ClusterConfig) validateAddons(errs *fieldErrors) {
+	seen := map[string]bool{}
+	for i, a := range c.Spec.Addons {
+		field := fmt.Sprintf("spec.addons[%d]", i)
+		entry, ok := addons.Lookup(a.Name)
+		if !ok {
+			errs.add(field+".name", "unknown addon %q; the catalogue has %s", a.Name, strings.Join(addons.Names(), ", "))
+			continue
+		}
+		if seen[a.Name] {
+			errs.add(field+".name", "%s is listed more than once", a.Name)
+		}
+		// CAAPH puts the proxy's name, <cluster>-<addon>, in a label value.
+		if n := len(c.Metadata.Name) + 1 + len(a.Name); n > validation.LabelValueMaxLength {
+			errs.add(field+".name", "%s-%s is %d characters; it names the addon's HelmChartProxy and must fit a label value (%d)", c.Metadata.Name, a.Name, n, validation.LabelValueMaxLength)
+		}
+		seen[a.Name] = true
+		if !slices.Contains(entry.Versions, a.Version) {
+			errs.add(field+".version", "%s allows %s, got %q", a.Name, strings.Join(entry.Versions, ", "), a.Version)
+		}
+		_, problems := entry.Resolve(a.Params)
+		for _, p := range problems {
+			errs.add(field, "%s", p)
+		}
+	}
 }
 
 // cidrFields pairs the cluster-wide CIDR fields with their names.

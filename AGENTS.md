@@ -37,6 +37,7 @@ Commands, in delivery order (Linear project *Hydra — Reliability & Productizat
 | `internal/cli/` | cobra command tree |
 | `internal/config/` | `hydra.yaml` types, defaults and validation (`Parse` is the only entry) |
 | `internal/render/` | `hydra.yaml` → Cluster API manifests; `templates/cluster.yaml.tmpl` |
+| `internal/addons/` | the **curated addon catalogue** (ADR-002): chart, allowed versions, params and how they map to Helm values. Adding an addon, version or param is a reviewed change, like any pin |
 | `internal/cluster/` | create/plan/status/delete against a management cluster: SSA apply, live dry-run diff, controller-reported status, label-scoped teardown, safety checks |
 | `internal/bootstrap/` | the temporary kind management cluster: kind and clusterctl as Go libraries behind small interfaces, faked in tests |
 | `internal/validate/` | read-only host and hypervisor checks behind small interfaces (libvirt over TLS, TCP probes from this host or the kind node), faked in tests |
@@ -61,8 +62,10 @@ Commands, in delivery order (Linear project *Hydra — Reliability & Productizat
    provider's `docs/examples/`, which were verified on hardware. When you change a setting there,
    find the provider ticket that proved it, and keep the two in step.
 5. **Pinned versions are code.** Kubernetes default, Cilium (`CILIUM_VERSION` in
-   `hack/gen-cilium.sh` and `render.CiliumVersion`), kube-vip, and bootstrap's kind node image,
-   cert-manager, Cluster API and Hydra provider (`internal/bootstrap`) change only in a reviewed PR.
+   `hack/gen-cilium.sh` and `render.CiliumVersion`), kube-vip, bootstrap's kind node image,
+   cert-manager, Cluster API, Hydra provider and CAAPH (`internal/bootstrap`; CAAPH's pin is also
+   `cluster.AddonProviderVersion`, kept equal by a test), and addon chart versions
+   (`internal/addons`) change only in a reviewed PR.
    The kind node image is pinned by digest.
 6. **Generic over lab.** No default may encode the reference lab (its bridge, pool, addresses).
    Lab values belong in `examples/` only, marked as such.

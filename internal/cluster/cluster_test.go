@@ -8,11 +8,13 @@ import (
 	"io"
 	"maps"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -58,10 +60,10 @@ func TestObjectsFromRender(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(objs) != 13 {
-		t.Fatalf("want 13 objects (header comment skipped), got %d", len(objs))
+	if len(objs) != 14 {
+		t.Fatalf("want 14 objects (header comment skipped), got %d", len(objs))
 	}
-	if objs[0].GetKind() != "HydraCluster" || objs[len(objs)-1].GetKind() != "ClusterResourceSet" {
+	if objs[0].GetKind() != "HydraCluster" || objs[len(objs)-1].GetKind() != "HelmChartProxy" {
 		t.Errorf("order not kept: first %s, last %s", objs[0].GetKind(), objs[len(objs)-1].GetKind())
 	}
 }
@@ -423,6 +425,35 @@ func TestDeleteRemovesUnownedInfrastructureFirst(t *testing.T) {
 	}
 }
 
+// An addon's HelmChartProxy is deleted only once the cluster's machines are
+// gone: deleting it while they run would uninstall the release from them.
+func TestDeleteRemovesAddonsAfterMachines(t *testing.T) {
+	ctx := context.Background()
+	md := labelled(mdGVK, "c-md-0", "c")
+	hcp := labelled(hcpGVK, "c-metrics-server", "c")
+	var order []string
+	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(hcp, md).WithInterceptorFuncs(interceptor.Funcs{
+		Delete: func(ctx context.Context, cl client.WithWatch, o client.Object, opts ...client.DeleteOption) error {
+			order = append(order, o.GetObjectKind().GroupVersionKind().Kind)
+			return cl.Delete(ctx, o, opts...)
+		},
+	}).Build()
+	var out bytes.Buffer
+	if err := (&Manager{C: c, Out: &out, Poll: time.Millisecond}).Delete(ctx, "ns", "c", time.Second, false); err != nil {
+		t.Fatalf("%v\n%s", err, out.String())
+	}
+	if got := strings.Join(order, ","); got != "MachineDeployment,HelmChartProxy" {
+		t.Errorf("delete order %s: the machines must go before the addons", got)
+	}
+}
+
+// The first delete phase (waited on until gone) never holds addons.
+func TestAddonsNotInTheFirstDeletePhase(t *testing.T) {
+	if slices.Contains(withMachines, hcpGVK) || !slices.Contains(afterMachines, hcpGVK) {
+		t.Errorf("HelmChartProxy must be deleted after the machines: withMachines=%v", withMachines)
+	}
+}
+
 func TestApplyDoesNotForceOwnershipByDefault(t *testing.T) {
 	for _, o := range applyOptions("c", false) {
 		if o == client.ForceOwnership {
@@ -709,5 +740,81 @@ func TestExternalCNIWaitHoldsUntilMachinesReady(t *testing.T) {
 	m := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cl, kcp).Build(), Out: io.Discard, Poll: time.Millisecond}
 	if err := m.WaitAvailable(context.Background(), "ns", "c", 50*time.Millisecond); !errors.Is(err, ErrTimeout) {
 		t.Fatalf("want a timeout while machines are not Ready, got %v", err)
+	}
+}
+
+// status reports each addon's proxy as CAAPH sees it, ready or not, with the
+// reason when it is not.
+func TestStatusReportsAddons(t *testing.T) {
+	ctx := context.Background()
+	cl := obj(clusterGVK, "ns", "c", map[string]any{"status": map[string]any{"conditions": []any{
+		map[string]any{"type": "Available", "status": "True", "reason": "Available"},
+	}}})
+	cl.SetLabels(map[string]string{render.ClusterLabelKey: "c"})
+	ready := obj(hcpGVK, "ns", "c-metrics-server", map[string]any{
+		"spec":   map[string]any{"version": "3.14.0"},
+		"status": map[string]any{"conditions": []any{map[string]any{"type": "Ready", "status": "True"}}},
+	})
+	ready.SetLabels(map[string]string{render.ClusterLabelKey: "c", render.AddonLabelKey: "metrics-server"})
+	failing := obj(hcpGVK, "ns", "c-other", map[string]any{
+		"spec":   map[string]any{"version": "1.0.0"},
+		"status": map[string]any{"conditions": []any{map[string]any{"type": "Ready", "status": "False", "reason": "IssuesReported", "message": "install failed"}}},
+	})
+	failing.SetLabels(map[string]string{render.ClusterLabelKey: "c", render.AddonLabelKey: "other"})
+	m := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cl, ready, failing).Build()}
+	s, err := m.Status(ctx, "ns", "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Addons) != 2 || s.AddonsReady() {
+		t.Fatalf("addons: %+v", s.Addons)
+	}
+	if !strings.Contains(s.Line(), "addons: metrics-server 3.14.0 ready, other 1.0.0 not ready") {
+		t.Errorf("line: %s", s.Line())
+	}
+	for _, a := range s.Addons {
+		if a.Name == "other" && (a.Message != "install failed" || a.Why() != "IssuesReported: install failed") {
+			t.Errorf("message: %+v", a)
+		}
+	}
+}
+
+// A HelmChartProxy hydra.yaml no longer renders is reported as orphaned, like
+// any other object labelled for the cluster.
+func TestOrphanedAddon(t *testing.T) {
+	ctx := context.Background()
+	gone := obj(hcpGVK, "ns", "c-metrics-server", nil)
+	gone.SetLabels(map[string]string{render.ClusterLabelKey: "c", render.AddonLabelKey: "metrics-server"})
+	m := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(gone).Build()}
+	orphans, err := m.Orphans(ctx, nil, "ns", "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(orphans) != 1 || !strings.Contains(orphans[0], "HelmChartProxy") {
+		t.Errorf("orphans: %v", orphans)
+	}
+}
+
+// A kubeconfig that may not list HelmChartProxies leaves status working: the
+// addons are reported unreadable, not the whole cluster.
+func TestStatusSurvivesUnreadableAddons(t *testing.T) {
+	ctx := context.Background()
+	cl := obj(clusterGVK, "ns", "c", map[string]any{"status": map[string]any{"conditions": []any{
+		map[string]any{"type": "Available", "status": "True"},
+	}}})
+	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cl).WithInterceptorFuncs(interceptor.Funcs{
+		List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if u, ok := list.(*unstructured.UnstructuredList); ok && u.GroupVersionKind().Kind == hcpGVK.Kind+"List" {
+				return apierrors.NewForbidden(schema.GroupResource{Group: addonsGroup, Resource: "helmchartproxies"}, "", errors.New("denied"))
+			}
+			return w.List(ctx, list, opts...)
+		},
+	}).Build()
+	s, err := (&Manager{C: c, Out: io.Discard}).Status(ctx, "ns", "c")
+	if err != nil {
+		t.Fatalf("status must not fail on unreadable addons: %v", err)
+	}
+	if s.AddonsError == "" || s.AddonsReady() || !strings.Contains(s.Line(), "addons: unreadable") {
+		t.Errorf("summary: %+v / %s", s, s.Line())
 	}
 }

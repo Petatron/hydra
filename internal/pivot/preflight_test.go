@@ -11,6 +11,8 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/Petatron/hydra/internal/render"
 )
 
 func TestPollDefaults(t *testing.T) {
@@ -199,6 +201,32 @@ func TestPivotStrangersSkipsUninstalledKinds(t *testing.T) {
 	}
 }
 
+// A reconciled addon is this cluster's, not a stranger: CAAPH labels its
+// HelmReleaseProxy only with Cluster API's cluster-name label and owns it by
+// the HelmChartProxy, never by the Cluster and never with hydra's label.
+func TestPivotAcceptsReconciledAddon(t *testing.T) {
+	hcp := addonProxy("True")
+	hrp := u(schema.GroupVersionKind{Group: crsGVK.Group, Version: caaphAPIVersion, Kind: "HelmReleaseProxy"}, ns, "metrics-server-c-abcde", nil)
+	hrp.SetLabels(map[string]string{clusterNameLabel: "c", "helmreleaseproxy.addons.cluster.x-k8s.io/helmchartproxy-name": "c-metrics-server"})
+	hrp.SetOwnerReferences([]metav1.OwnerReference{{APIVersion: crsGVK.Group + "/" + caaphAPIVersion, Kind: "HelmChartProxy", Name: "c-metrics-server", UID: "hcp-uid"}})
+	src := newClient(t, append(append(clusterObjects("src", true), hcp, hrp), labelledCRDs()...)...)
+	tgt := newClient(t, append(labelledCRDs(), addonProxy("True"))...)
+	if err := pivotFor(t, src, tgt, &recorder{takeOver: true}).Run(context.Background(), time.Second); err != nil {
+		t.Fatalf("a reconciled addon must not block the pivot: %v", err)
+	}
+}
+
+// The addons the source held before the move must all be on the target:
+// a target with none (where AddonsReady alone would pass) does not verify.
+func TestPivotRequiresTheSourceAddonsOnTheTarget(t *testing.T) {
+	src := newClient(t, append(append(clusterObjects("src", true), addonProxy("True")), labelledCRDs()...)...)
+	tgt := newClient(t, labelledCRDs()...)
+	err := pivotFor(t, src, tgt, &recorder{takeOver: true}).Run(context.Background(), 200*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "addon HelmChartProxy c-metrics-server did not arrive") {
+		t.Fatalf("got %v", err)
+	}
+}
+
 // verifyOnce passes only for a live, resumed, taken-over target whose
 // source no longer holds the Cluster.
 func TestVerifyOnce(t *testing.T) {
@@ -228,7 +256,9 @@ func TestVerifyOnce(t *testing.T) {
 		srcF    []*fault
 		mutate  func([]client.Object) []client.Object
 		tgtF    []*fault
-		want    string
+		// expect is the addons the source held before the move.
+		expect []string
+		want   string
 	}{
 		{name: "verified", want: ""},
 		{name: "source unreadable", srcF: []*fault{{verb: "get", kind: lcCluster, err: errBoom}}, want: "reading the bootstrap cluster"},
@@ -242,6 +272,20 @@ func TestVerifyOnce(t *testing.T) {
 		{name: "machines unlistable", tgtF: []*fault{{verb: "list", kind: lcHydraMachine, err: errBoom}}, want: "listing HydraMachines on cluster c"},
 		{name: "no machines", mutate: drop(hydraMachineGVK), want: "no HydraMachines on cluster c yet"},
 		{name: "machine not Ready", mutate: machineNotReady, want: "HydraMachine c-cp-1 is not Ready"},
+		{name: "addon not Ready on the target", mutate: func(o []client.Object) []client.Object {
+			return append(o, addonProxy("False"))
+		}, want: "addons on cluster c are not all Ready"},
+		{name: "addon Ready on the target", mutate: func(o []client.Object) []client.Object {
+			return append(o, addonProxy("True"))
+		}, want: ""},
+		{name: "expected addon arrived and Ready", mutate: func(o []client.Object) []client.Object {
+			return append(o, addonProxy("True"))
+		}, expect: []string{"c-metrics-server"}, want: ""},
+		// No proxies on the target at all: AddonsReady alone would pass.
+		{name: "expected addon missing", expect: []string{"c-metrics-server"}, want: "addon HelmChartProxy c-metrics-server did not arrive"},
+		{name: "only another addon on the target", mutate: func(o []client.Object) []client.Object {
+			return append(o, addonProxy("True"))
+		}, expect: []string{"c-cert-manager"}, want: "addon HelmChartProxy c-cert-manager did not arrive"},
 		{name: "CNI set missing", tgtF: []*fault{{verb: "get", kind: "ClusterResourceSet", err: errBoom}}, want: "the CNI ClusterResourceSet did not arrive"},
 		// cni: external: no CNI label, no set and no binding to carry.
 		{name: "external CNI", mutate: func(o []client.Object) []client.Object {
@@ -262,7 +306,9 @@ func TestVerifyOnce(t *testing.T) {
 			if tc.tgtF != nil {
 				tgt = faulty(t, tgt, tc.tgtF...)
 			}
-			err := pivotFor(t, src, tgt, &recorder{}).verifyOnce(ctx)
+			pv := pivotFor(t, src, tgt, &recorder{})
+			pv.expectedAddons = tc.expect
+			err := pv.verifyOnce(ctx)
 			if tc.want == "" {
 				if err != nil {
 					t.Fatal(err)
@@ -274,6 +320,17 @@ func TestVerifyOnce(t *testing.T) {
 			}
 		})
 	}
+}
+
+// addonProxy is cluster c's metrics-server HelmChartProxy with the given
+// Ready status.
+func addonProxy(ready string) client.Object {
+	h := u(schema.GroupVersionKind{Group: crsGVK.Group, Version: "v1alpha1", Kind: "HelmChartProxy"}, ns, "c-metrics-server", map[string]any{
+		"spec":   map[string]any{"version": "3.14.0"},
+		"status": map[string]any{"conditions": []any{map[string]any{"type": "Ready", "status": ready}}},
+	})
+	h.SetLabels(map[string]string{render.ClusterLabelKey: "c", render.AddonLabelKey: "metrics-server"})
+	return h
 }
 
 func TestConditionTrue(t *testing.T) {

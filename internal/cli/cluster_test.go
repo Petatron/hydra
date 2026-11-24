@@ -243,7 +243,27 @@ func TestCreateRefusesAVersionChange(t *testing.T) {
 func cluMapper() meta.RESTMapper {
 	m := meta.NewDefaultRESTMapper(nil)
 	m.Add(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta2", Kind: "Cluster"}, meta.RESTScopeNamespace)
+	// hydra bootstrap installs CAAPH, so a management cluster serves it.
+	m.Add(schema.GroupVersionKind{Group: "addons.cluster.x-k8s.io", Version: "v1alpha1", Kind: "HelmChartProxy"}, meta.RESTScopeNamespace)
 	return m
+}
+
+// A hydra.yaml with addons is refused, before anything is written, on a
+// management cluster without CAAPH.
+func TestCluCreateRefusesAddonsWithoutCAAPH(t *testing.T) {
+	cfg, objs := cluLoad(t, "../../examples/workload-managed-network.yaml")
+	ap := &cluApplies{}
+	tg, _ := cluTarget(t, true, ap, interceptor.Funcs{})
+	noCAAPH := meta.NewDefaultRESTMapper(nil)
+	noCAAPH.Add(schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta2", Kind: "Cluster"}, meta.RESTScopeNamespace)
+	tg.m.C = fake.NewClientBuilder().WithScheme(tg.m.C.Scheme()).WithRESTMapper(noCAAPH).Build()
+	cmd, _ := cluCmd()
+	if _, err := runCreate(t.Context(), cmd, tg, cfg, objs, createOptions{wait: false}); err == nil || !strings.Contains(err.Error(), "no Cluster API Add-on Provider Helm") {
+		t.Fatalf("got %v", err)
+	}
+	if ap.n != 0 {
+		t.Errorf("%d applies before the refusal", ap.n)
+	}
 }
 
 // cluApplies counts server-side applies and can fail them.
@@ -841,5 +861,24 @@ func TestCluCreateRefusesHydraCNIOnAForeignCNI(t *testing.T) {
 	if !strings.Contains(out, "! cni: create refuses this: cluster default/hydra-mgmt exists without the cni.hydra.io/cilium label") ||
 		!strings.Contains(out, "kubectl --kubeconfig /x label --overwrite cluster -n default hydra-mgmt cni.hydra.io/cilium=hydra-mgmt") {
 		t.Errorf("plan does not warn with a runnable fix:\n%s", out)
+	}
+}
+
+// create's addon note tells installing, failed and unreadable apart.
+func TestAddonNotes(t *testing.T) {
+	s := cluster.Summary{Addons: []cluster.AddonState{
+		{Name: "ok", Ready: cluster.ConditionTrue},
+		{Name: "new"},
+		{Name: "broken", Ready: "False", Message: "install  failed:\n chart not found"},
+		{Name: "terse", Ready: "False", Reason: "HelmInstallOrUpgradeFailed"},
+	}}
+	got := strings.Join(addonNotes(s), "\n")
+	if strings.Contains(got, "addon ok") || !strings.Contains(got, "addon new: still being installed") ||
+		!strings.Contains(got, "addon broken is not Ready: install failed: chart not found") ||
+		!strings.Contains(got, "addon terse is not Ready: HelmInstallOrUpgradeFailed") {
+		t.Errorf("got:\n%s", got)
+	}
+	if got := addonNotes(cluster.Summary{AddonsError: "forbidden"}); len(got) != 1 || got[0] != "addons could not be read: forbidden" {
+		t.Errorf("unreadable: %v", got)
 	}
 }

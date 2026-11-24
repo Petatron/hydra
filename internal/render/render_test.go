@@ -399,9 +399,14 @@ func TestExternalCNIRendersNoCNI(t *testing.T) {
 		if cut < 0 {
 			t.Fatalf("%s: default render has no Cilium section", name)
 		}
+		// The Cilium section runs to the first addon, if any, or the end.
+		end := len(withCNI)
+		if i := strings.Index(string(withCNI[cut:]), "---\n# Addon "); i >= 0 {
+			end = cut + i
+		}
 		labelLines := "\n    # Selects the ClusterResourceSet that installs Cilium.\n    " + CNILabelKey + ": " + strconv.Quote(c.Metadata.Name)
-		want := strings.Replace(string(withCNI[:cut]), labelLines, "", 1)
-		if want == string(withCNI[:cut]) {
+		want := strings.Replace(string(withCNI[:cut]), labelLines, "", 1) + string(withCNI[end:])
+		if want == string(withCNI[:cut])+string(withCNI[end:]) {
 			t.Fatalf("%s: default render has no CNI label on the Cluster", name)
 		}
 		if string(external) != want {
@@ -451,5 +456,55 @@ func TestOperatorReplicasFollowMinimumNodes(t *testing.T) {
 				t.Errorf("%s: manifest lacks %q", tc.name, l)
 			}
 		}
+	}
+}
+
+// Each spec.addons entry becomes one HelmChartProxy selecting this cluster by
+// its label, with hydra-filled values that CAAPH's templating cannot touch.
+func TestAddonsRenderHelmChartProxies(t *testing.T) {
+	c := load(t, "../../examples/hydra-mgmt.yaml")
+	c.Spec.Addons = []config.AddonSpec{{Name: "metrics-server", Version: "3.13.1", Params: map[string]any{"kubeletInsecureTLS": false}}}
+	out, err := Render(c, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hcps []map[string]any
+	for d := range strings.SplitSeq(string(out), "\n---\n") {
+		var o map[string]any
+		if err := yaml.Unmarshal([]byte(d), &o); err == nil && o["kind"] == KindHelmChartProxy {
+			hcps = append(hcps, o)
+		}
+	}
+	if len(hcps) != 1 {
+		t.Fatalf("want one HelmChartProxy, got %d", len(hcps))
+	}
+	h := hcps[0]
+	md, _ := h["metadata"].(map[string]any)
+	spec, _ := h["spec"].(map[string]any)
+	labels, _ := md["labels"].(map[string]any)
+	sel, _ := spec["clusterSelector"].(map[string]any)
+	ml, _ := sel["matchLabels"].(map[string]any)
+	if md["name"] != "hydra-mgmt-metrics-server" || labels[ClusterLabelKey] != "hydra-mgmt" || labels[AddonLabelKey] != "metrics-server" {
+		t.Errorf("metadata: %v", md)
+	}
+	if ml[ClusterLabelKey] != "hydra-mgmt" || len(ml) != 1 {
+		t.Errorf("selector: %v", sel)
+	}
+	if spec["version"] != "3.13.1" || spec["reconcileStrategy"] != "Continuous" || spec["namespace"] != "kube-system" {
+		t.Errorf("spec: %v", spec)
+	}
+	if v, _ := spec["valuesTemplate"].(string); strings.Contains(v, "kubelet-insecure-tls") || strings.Contains(v, "{{") {
+		t.Errorf("values: %q", v)
+	}
+}
+
+// With no addons, nothing addon-related is rendered.
+func TestNoAddonsNoHelmChartProxy(t *testing.T) {
+	out, err := Render(load(t, "../../examples/hydra-mgmt.yaml"), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), KindHelmChartProxy) {
+		t.Error("a HelmChartProxy rendered without spec.addons")
 	}
 }

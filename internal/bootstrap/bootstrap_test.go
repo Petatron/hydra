@@ -151,8 +151,8 @@ func TestFreshCreate(t *testing.T) {
 	if strings.Join(k.created, ",") != "hydra-bootstrap-lab" {
 		t.Errorf("created %v", k.created)
 	}
-	if len(c.inited) != 1 || len(c.inited[0]) != 4 {
-		t.Fatalf("want one init of all four providers, got %v", c.inited)
+	if len(c.inited) != 1 || len(c.inited[0]) != len(Providers()) {
+		t.Fatalf("want one init of every pinned provider, got %v", c.inited)
 	}
 	data := c.secrets["clusters/lab-libvirt-pki"]
 	if data == nil || len(data) != 3 {
@@ -199,7 +199,7 @@ func TestResumesPartialInstall(t *testing.T) {
 	for _, p := range c.inited[0] {
 		got = append(got, p.Name)
 	}
-	if strings.Join(got, ",") != "control-plane-kubeadm,infrastructure-hydra" {
+	if strings.Join(got, ",") != "control-plane-kubeadm,infrastructure-hydra,addon-helm" {
 		t.Errorf("only the missing providers should be installed, got %v", got)
 	}
 }
@@ -307,7 +307,8 @@ func TestInventoryNames(t *testing.T) {
 	}
 	// The names Providers() pins must be the ones InstalledProviders produces.
 	have := map[string]bool{inventoryName("CoreProvider", "cluster-api"): true, inventoryName("BootstrapProvider", "kubeadm"): true,
-		inventoryName("ControlPlaneProvider", "kubeadm"): true, inventoryName("InfrastructureProvider", "hydra"): true}
+		inventoryName("ControlPlaneProvider", "kubeadm"): true, inventoryName("InfrastructureProvider", "hydra"): true,
+		inventoryName("AddonProvider", "helm"): true}
 	for _, p := range Providers() {
 		if !have[p.Name] {
 			t.Errorf("pinned provider %s does not match any inventory name", p.Name)
@@ -491,7 +492,7 @@ func TestOverridesReplacePins(t *testing.T) {
 	ik := &imageKind{fakeKind: k}
 	b.Kind = ik
 	b.NodeImage = "kindest/node:test"
-	only := Providers()[3:]
+	only := Providers()[3:4]
 	b.ProviderFn = func() []Provider { return only }
 	if err := b.Create(context.Background(), cfg(t, cfgYAML), Options{Credentials: testCredentials(t)}); err != nil {
 		t.Fatal(err)

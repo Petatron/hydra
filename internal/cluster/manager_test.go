@@ -563,3 +563,40 @@ func TestCheckOwnershipReadError(t *testing.T) {
 		t.Error("an unreadable object must be an error, never \"ours\"")
 	}
 }
+
+// Addons need CAAPH on the management cluster; without addons nothing is
+// asked of it.
+func TestCheckAddonProvider(t *testing.T) {
+	hcp := obj(hcpGVK, "ns", "c-metrics-server", nil)
+	other := obj(clusterGVK, "ns", "c", nil)
+	plain := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).Build()}
+	if err := plain.CheckAddonProvider([]*unstructured.Unstructured{other}); err != nil {
+		t.Errorf("no addons, no requirement: %v", err)
+	}
+	if err := plain.CheckAddonProvider([]*unstructured.Unstructured{other, hcp}); err == nil || !strings.Contains(err.Error(), "clusterctl init --addon helm:"+AddonProviderVersion) {
+		t.Errorf("addons without CAAPH must be refused with the fix: %v", err)
+	}
+	rm := meta.NewDefaultRESTMapper(nil)
+	rm.Add(hcpGVK, meta.RESTScopeNamespace)
+	caaph := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithRESTMapper(rm).Build()}
+	if err := caaph.CheckAddonProvider([]*unstructured.Unstructured{hcp}); err != nil {
+		t.Errorf("CAAPH installed: %v", err)
+	}
+}
+
+// Only a missing kind means CAAPH is absent; any other discovery error is
+// reported as itself.
+func TestCheckAddonProviderPassesOtherErrorsThrough(t *testing.T) {
+	hcp := obj(hcpGVK, "ns", "c-metrics-server", nil)
+	m := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithRESTMapper(brokenMapper{}).Build()}
+	err := m.CheckAddonProvider([]*unstructured.Unstructured{hcp})
+	if err == nil || strings.Contains(err.Error(), "clusterctl init") || !strings.Contains(err.Error(), "discovery down") {
+		t.Errorf("got %v", err)
+	}
+}
+
+type brokenMapper struct{ meta.RESTMapper }
+
+func (brokenMapper) RESTMapping(schema.GroupKind, ...string) (*meta.RESTMapping, error) {
+	return nil, errors.New("discovery down")
+}

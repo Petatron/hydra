@@ -82,6 +82,18 @@ func TestSchedulableWithPools(t *testing.T) {
 
 // Each case replaces one line of the valid config (or appends) and must fail
 // naming the field.
+// An addon's version defaults to the catalogue's; params stay as written
+// (render resolves their defaults).
+func TestAddonDefaults(t *testing.T) {
+	c, err := Parse([]byte(strings.Replace(valid, "  storagePool: pool", "  storagePool: pool\n  addons:\n    - name: metrics-server", 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Spec.Addons) != 1 || c.Spec.Addons[0].Version != "3.14.0" {
+		t.Errorf("addons: %+v", c.Spec.Addons)
+	}
+}
+
 func TestRejects(t *testing.T) {
 	cases := []struct {
 		name, from, to, field string
@@ -108,6 +120,11 @@ func TestRejects(t *testing.T) {
 		{"autoscaled with replicas", "    bridges: [br0]", "    bridges: [br0]\n  nodePools:\n    - {name: w, replicas: 2, vcpus: 1, memory: 2Gi, diskSize: 20Gi, autoscaling: {min: 0, max: 3}}", "omitted with autoscaling"},
 		{"bad bounds", "    bridges: [br0]", "    bridges: [br0]\n  nodePools:\n    - {name: w, vcpus: 1, memory: 2Gi, diskSize: 20Gi, autoscaling: {min: 4, max: 3}}", "autoscaling"},
 		{"bad label", "    bridges: [br0]", "    bridges: [br0]\n  nodePools:\n    - {name: w, replicas: 1, vcpus: 1, memory: 2Gi, diskSize: 20Gi, labels: {'a b': x}}", "labels"},
+		{"unknown addon", "  storagePool: pool", "  storagePool: pool\n  addons:\n    - name: nope", "unknown addon \"nope\""},
+		{"duplicate addon", "  storagePool: pool", "  storagePool: pool\n  addons:\n    - name: metrics-server\n    - name: metrics-server", "more than once"},
+		{"addon version", "  storagePool: pool", "  storagePool: pool\n  addons:\n    - {name: metrics-server, version: 9.9.9}", "spec.addons[0].version"},
+		{"addon param", "  storagePool: pool", "  storagePool: pool\n  addons:\n    - {name: metrics-server, params: {kubeletInsecureTLS: maybe}}", "params.kubeletInsecureTLS"},
+		{"addon unknown param", "  storagePool: pool", "  storagePool: pool\n  addons:\n    - {name: metrics-server, params: {values: {a: b}}}", "params.values: unknown"},
 		{"bad hypervisor", "  storagePool: pool", "  storagePool: pool\n  hypervisor:\n    address: 'bad host'", "spec.hypervisor.address"},
 		{"hypervisor port range", "  storagePool: pool", "  storagePool: pool\n  hypervisor:\n    address: hv:99999", "spec.hypervisor.address"},
 		{"pool whitespace", "storagePool: pool", "storagePool: 'my pool'", "whitespace"},

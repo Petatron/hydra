@@ -115,6 +115,7 @@ autoscaled node pools, are in [`examples/`](examples/).
 | `spec.controlPlane` | 3 × 4 vCPU / 8Gi / 40Gi | Replicas must be 1, 3 or 5 |
 | `spec.controlPlane.schedulable` | `true` if no node pools | Removes the control-plane taint |
 | `spec.nodePools[]` | — | `name`, `replicas` or `autoscaling: {min, max}`, size, `labels` (not in the `kubernetes.io` / `k8s.io` namespaces, which the kubelet refuses) |
+| `spec.addons[]` | — | Platform addons from hydra's catalogue: `name`, optional `version` (one the catalogue allows), optional `params` (see below) |
 
 ## Render it
 
@@ -159,6 +160,44 @@ person owns the CNI, including a cluster built before hydra managed it.
   `create` fails after applying (rerunning is safe), `upgrade` refuses before rolling any machine,
   and `plan` warns when its dry-run keeps the label; all three print the `kubectl label` command that removes it, aimed at the management cluster.
 
+### Platform addons: `spec.addons`
+
+```yaml
+spec:
+  addons:
+    - name: metrics-server            # from hydra's catalogue
+      version: 3.14.0                 # optional; one the catalogue allows
+      params:
+        kubeletInsecureTLS: true      # optional; each addon declares its own
+```
+
+Each addon becomes a `HelmChartProxy` (`<cluster>-<addon>`) that
+[Cluster API Add-on Provider Helm](https://github.com/kubernetes-sigs/cluster-api-addon-provider-helm)
+(CAAPH) installs on the cluster and keeps in step with hydra.yaml (ADR-002). `hydra bootstrap`
+installs CAAPH; `create` refuses a hydra.yaml with addons on a management cluster without it, and
+`status` shows each addon's state.
+
+- Only catalogued addons, versions and params are accepted, checked by `validate`, `render` and
+  `create`; raw Helm values are not. The catalogue is in
+  [`internal/addons`](internal/addons/addons.go):
+
+  | Addon | Versions | Params |
+  |---|---|---|
+  | `metrics-server` | `3.13.1`, `3.14.0` (default) | `kubeletInsecureTLS` (default `true`): kubeadm's kubelets serve self-signed certificates, which metrics-server cannot verify without this |
+
+- A version change in hydra.yaml upgrades the addon on the next `create`. A change made on the
+  workload cluster behind CAAPH's back is put right at CAAPH's next resync (up to 10 minutes).
+- **Pin `version` for anything you care about.** An addon without one takes the catalogue's
+  default, so a hydra release that moves the default upgrades the addon on your next `create`
+  (`plan` shows the change first).
+- `create` does not wait for addons: they settle after the cluster is Available. `status` shows
+  each one, and the reason when it is not Ready. A pivot waits for every addon to be Ready on the
+  target before it deletes the bootstrap cluster.
+- **Removing an addon from hydra.yaml does not uninstall it yet**: its `HelmChartProxy` is listed as
+  no longer rendered and left in place. **Deleting that `HelmChartProxy`, or removing the Cluster's
+  `hydra.io/cluster` label, uninstalls the addon within seconds**, and CAAPH has no way to keep it.
+  Pruning with guards for protected addons arrives with `hydra cluster apply` (PET-99).
+
 Machine and bootstrap templates are named after their content (`<cluster>-cp-1a2b3c4d`), so
 changing a machine's size or a pool's labels produces a new template and a rolling replacement
 rather than an in-place edit Cluster API would refuse or apply only to future machines.
@@ -198,7 +237,8 @@ hydra bootstrap delete -f hydra.yaml
 
 `bootstrap` creates a kind cluster named `hydra-bootstrap-<name>` on this machine (Docker, Podman
 or nerdctl is needed, but no `kind` or `clusterctl` binary) and installs cert-manager, Cluster API
-and the Hydra provider at the versions this CLI pins. It then writes the hypervisor credentials
+the Hydra provider and Cluster API Add-on Provider Helm (for `spec.addons`) at the versions this
+CLI pins. It then writes the hypervisor credentials
 Secret named in `spec.hypervisor`, labelled so that `clusterctl move` carries it to the cluster's
 own control plane later. It takes about 75 seconds from nothing.
 
@@ -345,8 +385,9 @@ into its bootstrap kind cluster and deletes it from there:
 ## Pinned components
 
 `hydra version` prints them: Kubernetes `v1.35.3` (default), Cilium `1.19.1`, kube-vip `v0.8.9`;
-and for `bootstrap`, kind node `v1.35.8`, cert-manager `v1.21.1`, Cluster API `v1.14.0` and the Hydra
-provider `v0.2.0`.
+and for `bootstrap`, kind node `v1.35.8`, cert-manager `v1.21.1`, Cluster API `v1.14.0`, the Hydra
+provider `v0.2.0` and Cluster API Add-on Provider Helm `v0.6.6`. Addon chart versions are in the
+catalogue (`internal/addons`).
 They change only in a hydra release.
 
 ## Contributing

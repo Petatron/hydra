@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -34,7 +37,39 @@ func coreScheme(t *testing.T) *runtime.Scheme {
 	if err := clientgoscheme.AddToScheme(s); err != nil {
 		t.Fatal(err)
 	}
+	if err := apiextensionsv1.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
 	return s
+}
+
+// CAAPH installed without clusterctl has its CRDs but no inventory entry: it
+// is reported at an unknown version, so bootstrap refuses rather than letting
+// clusterctl init install over it.
+func TestCAAPHNotInstalledByClusterctl(t *testing.T) {
+	crd := &apiextensionsv1.CustomResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: caaphCRD}}
+	got, err := newKubeCluster(providerClient(t, nil, nil, crd)).InstalledProviders(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[caaphInventoryName] != notByClusterctl {
+		t.Errorf("got %v", got)
+	}
+	// The case that matters most: clusterctl never ran, so its inventory
+	// kind does not exist at all, yet CAAPH's CRD does.
+	noInventory := &meta.NoKindMatchError{GroupKind: providerListGVK.GroupKind()}
+	got, err = newKubeCluster(providerClient(t, nil, noInventory, crd)).InstalledProviders(context.Background())
+	if err != nil || got[caaphInventoryName] != notByClusterctl {
+		t.Errorf("no clusterctl inventory: %v %v", got, err)
+	}
+	if got, err := newKubeCluster(providerClient(t, nil, noInventory)).InstalledProviders(context.Background()); err != nil || len(got) != 0 {
+		t.Errorf("nothing installed at all: %v %v", got, err)
+	}
+	inv := []*unstructured.Unstructured{provider("caaph-system", "AddonProvider", "helm", CAAPHVersion)}
+	got, err = newKubeCluster(providerClient(t, inv, nil, crd)).InstalledProviders(context.Background())
+	if err != nil || got[caaphInventoryName] != CAAPHVersion {
+		t.Errorf("clusterctl-installed CAAPH: %v %v", got, err)
+	}
 }
 
 func provider(ns, typ, name, version string) *unstructured.Unstructured {
@@ -102,6 +137,7 @@ func TestInstalledProvidersReadsInventory(t *testing.T) {
 		provider("capi-kubeadm-bootstrap-system", "BootstrapProvider", "kubeadm", CAPIVersion),
 		provider("capi-kubeadm-control-plane-system", "ControlPlaneProvider", "kubeadm", CAPIVersion),
 		provider("hydra-system", "InfrastructureProvider", "hydra", HydraVersion),
+		provider("caaph-system", "AddonProvider", "helm", CAAPHVersion),
 	}
 	got, err := newKubeCluster(providerClient(t, inv, nil, cm)).InstalledProviders(ctx)
 	if err != nil {
@@ -278,13 +314,28 @@ func TestGetSecretReportsTerminatingAndErrors(t *testing.T) {
 }
 
 func TestInventoryNameUnknownType(t *testing.T) {
-	if got := inventoryName("AddonProvider", "helm"); got != "AddonProvider/helm" {
+	if got := inventoryName("IPAMProvider", "in-cluster"); got != "IPAMProvider/in-cluster" {
 		t.Errorf("got %q", got)
+	}
+	if got := inventoryName("AddonProvider", "helm"); got != "addon-helm" {
+		t.Errorf("addon provider: got %q", got)
+	}
+}
+
+// Every pinned provider lands in its own InitOptions list; CAAPH is an addon.
+func TestInitOptionsPlacesEveryPinnedProvider(t *testing.T) {
+	opts, err := initOptions("kc", Providers())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.CoreProvider != "cluster-api:"+CAPIVersion || !slices.Contains(opts.InfrastructureProviders, "hydra:"+HydraVersion) ||
+		!slices.Equal(opts.AddonProviders, []string{"helm:" + CAAPHVersion}) {
+		t.Errorf("got %+v", opts)
 	}
 }
 
 func TestInitOptionsRejectsUnknownKind(t *testing.T) {
-	if _, err := initOptions("kc", []Provider{{Name: "x", Ref: "x:v1", Kind: "addon"}}); err == nil || !strings.Contains(err.Error(), `unknown provider kind "addon"`) {
+	if _, err := initOptions("kc", []Provider{{Name: "x", Ref: "x:v1", Kind: "ipam"}}); err == nil || !strings.Contains(err.Error(), `unknown provider kind "ipam"`) {
 		t.Errorf("got %v", err)
 	}
 }
@@ -295,7 +346,7 @@ func TestInitRefusesUnknownKindAndCleansUp(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("TMPDIR", tmp)
 	k := &KubeCluster{kubeconfig: testKubeconfig}
-	err := k.Init(context.Background(), []Provider{{Name: "x", Ref: "x:v1", Kind: "addon"}})
+	err := k.Init(context.Background(), []Provider{{Name: "x", Ref: "x:v1", Kind: "ipam"}})
 	if err == nil || !strings.Contains(err.Error(), "unknown provider kind") {
 		t.Fatalf("got %v", err)
 	}

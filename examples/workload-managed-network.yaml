@@ -42,3 +42,9 @@ spec:
       autoscaling:
         min: 0
         max: 6
+  # Platform addons from hydra's catalogue, installed by Cluster API Add-on
+  # Provider Helm (ADR-002). The version defaults to the catalogue's; params
+  # default too (metrics-server skips verifying kubelets' self-signed
+  # serving certificates unless kubeletInsecureTLS: false).
+  addons:
+    - name: metrics-server

@@ -318,6 +318,9 @@ func TestCertManagerCheckedWithoutInventory(t *testing.T) {
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
+	if err := apiextensionsv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
 	cm := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: "cert-manager", Name: "cert-manager",
 		Annotations: map[string]string{"cert-manager.clusterctl.cluster.x-k8s.io/version": "v1.17.0"}}}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cm).WithInterceptorFuncs(interceptor.Funcs{
