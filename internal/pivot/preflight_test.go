@@ -287,11 +287,17 @@ func TestVerifyOnce(t *testing.T) {
 			return append(o, addonProxy("True"))
 		}, expect: []string{"c-cert-manager"}, want: "addon HelmChartProxy c-cert-manager did not arrive"},
 		{name: "CNI proxy unreadable", tgtF: []*fault{{verb: "get", kind: "HelmChartProxy", err: errBoom}}, want: "reading the CNI HelmChartProxy"},
-		// cni: external: no CNI label, and no CNI proxy to read.
+		// cni: external: no CNI label, and no CNI proxy.
 		{name: "external CNI", mutate: func(o []client.Object) []client.Object {
 			o[0].SetLabels(nil)
 			return drop(hcpGVK)(drop(hrpGVK)(o))
-		}, tgtF: []*fault{{verb: "get", kind: hcpGVK.Kind, err: errBoom}}, want: ""},
+		}, want: ""},
+		// The label was removed while hydra's proxy exists: CAAPH has
+		// uninstalled Cilium, whatever the nodes say.
+		{name: "CNI label removed", mutate: func(o []client.Object) []client.Object {
+			o[0].SetLabels(nil)
+			return o
+		}, want: "CNI uninstalled"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			src := newClient(t, tc.srcObjs...)

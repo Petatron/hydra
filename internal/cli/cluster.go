@@ -126,7 +126,7 @@ func renderObjects(cfg *config.ClusterConfig) ([]*unstructured.Unstructured, err
 func newCreateCommand() *cobra.Command {
 	var file, mgmt, kubeconfigOut, credentials string
 	var timeout time.Duration
-	var wait, adopt, forceConflicts, selfHosted bool
+	var wait, adopt, adoptCNI, forceConflicts, selfHosted bool
 	var po pivotOptions
 	c := &cobra.Command{
 		Use:   "create",
@@ -159,7 +159,7 @@ used.`,
 			}
 			ctx, stop := interruptible(cmd)
 			defer stop()
-			co := createOptions{kubeconfigOut: kubeconfigOut, configFile: file, timeout: timeout, wait: wait, adopt: adopt, forceConflicts: forceConflicts}
+			co := createOptions{kubeconfigOut: kubeconfigOut, configFile: file, timeout: timeout, wait: wait, adopt: adopt, adoptCNI: adoptCNI, forceConflicts: forceConflicts}
 			if selfHosted {
 				if mgmt != "" {
 					return fmt.Errorf("--self-hosted builds its own bootstrap cluster; it cannot be combined with --management-kubeconfig (use pivot for that)")
@@ -188,6 +188,7 @@ used.`,
 	c.Flags().DurationVar(&timeout, "timeout", 30*time.Minute, "how long to wait for the cluster to be Available")
 	c.Flags().BoolVar(&wait, "wait", true, "wait for the cluster to be Available")
 	c.Flags().BoolVar(&adopt, "adopt", false, "take over existing objects of the same names that hydra did not make (never ones labelled for another cluster)")
+	c.Flags().BoolVar(&adoptCNI, "adopt-cni", false, adoptCNIUsage)
 	c.Flags().BoolVar(&forceConflicts, "force-conflicts", false, "take over fields another field manager owns (e.g. a hand edit) instead of failing")
 	c.Flags().BoolVar(&selfHosted, "self-hosted", false, "bootstrap a kind cluster, create the cluster from it, pivot the cluster onto itself and delete kind")
 	c.Flags().StringVar(&credentials, "hypervisor-credentials", "", "with --self-hosted: directory holding cacert.pem, clientcert.pem and clientkey.pem (needed the first time)")
@@ -199,7 +200,7 @@ used.`,
 func newApplyCommand() *cobra.Command {
 	var file, mgmt, kubeconfigOut string
 	var timeout time.Duration
-	var wait, adopt, forceConflicts bool
+	var wait, adopt, adoptCNI, forceConflicts bool
 	var prune cluster.PruneOptions
 	c := &cobra.Command{
 		Use:   "apply",
@@ -244,7 +245,7 @@ interrupted apply is finished by running it again.`,
 				return err
 			}
 			p := prune
-			_, err = runCreate(ctx, cmd, t, cfg, objs, createOptions{prune: &p, kubeconfigOut: kubeconfigOut, configFile: file, timeout: timeout, wait: wait, adopt: adopt, forceConflicts: forceConflicts})
+			_, err = runCreate(ctx, cmd, t, cfg, objs, createOptions{prune: &p, kubeconfigOut: kubeconfigOut, configFile: file, timeout: timeout, wait: wait, adopt: adopt, adoptCNI: adoptCNI, forceConflicts: forceConflicts})
 			return err
 		},
 	}
@@ -254,12 +255,16 @@ interrupted apply is finished by running it again.`,
 	c.Flags().DurationVar(&timeout, "timeout", 30*time.Minute, "how long to wait for the cluster to be Available")
 	c.Flags().BoolVar(&wait, "wait", true, "wait for the cluster to be Available")
 	c.Flags().BoolVar(&adopt, "adopt", false, "take over existing objects of the same names that hydra did not make (never ones labelled for another cluster)")
+	c.Flags().BoolVar(&adoptCNI, "adopt-cni", false, adoptCNIUsage)
 	c.Flags().BoolVar(&forceConflicts, "force-conflicts", false, "take over fields another field manager owns (e.g. a hand edit) instead of failing")
 	addPruneFlags(c, &prune)
 	return c
 }
 
 // addPruneFlags adds apply's pruning flags, which plan takes too.
+// adoptCNIUsage is --adopt-cni's help: create, apply and plan take it.
+const adoptCNIUsage = "with cni: hydra, let hydra's Cilium take over a cluster that already runs without it (no CNI label, or the label but no hydra Cilium proxy): it is installed over whatever runs there, taking over Cilium objects without a Helm release. Check what runs first"
+
 func addPruneFlags(c *cobra.Command, p *cluster.PruneOptions) {
 	c.Flags().StringSliceVar(&p.Pools, "prune-pools", nil, "node pools removed from hydra.yaml to delete, with their machines and VMs, by name; repeat or comma-separate")
 	c.Flags().StringSliceVar(&p.AllowRemove, "allow-remove", nil, "protected or uncatalogued addons to uninstall although apply would refuse, by addon name, or any other proxy as proxy/<name>; repeat or comma-separate")
@@ -271,9 +276,9 @@ type createOptions struct {
 	prune         *cluster.PruneOptions
 	kubeconfigOut string
 	// configFile is hydra.yaml's path, for commands printed in messages.
-	configFile                  string
-	timeout                     time.Duration
-	wait, adopt, forceConflicts bool
+	configFile                            string
+	timeout                               time.Duration
+	wait, adopt, adoptCNI, forceConflicts bool
 }
 
 // runCreate is create's body after the management cluster is resolved: every
@@ -308,7 +313,7 @@ func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.C
 	if err := m.CheckOwnership(ctx, objs, name, adopt); err != nil {
 		return "", err
 	}
-	if msg := st.CNIConflict(render.HydraCNI(cfg), t.kubectl(o.configFile)); msg != "" {
+	if msg := st.CNIConflict(render.HydraCNI(cfg), o.adoptCNI, t.kubectl(o.configFile)); msg != "" {
 		return "", errors.New(msg)
 	}
 	if drift, err := upgrade.Drift(ctx, m.C, cfg); err != nil {
@@ -454,7 +459,7 @@ func addonNotes(s cluster.Summary) []string {
 
 func newPlanCommand() *cobra.Command {
 	var file, mgmt string
-	var forceConflicts bool
+	var forceConflicts, adoptCNI bool
 	var prune cluster.PruneOptions
 	c := &cobra.Command{
 		Use:   "plan",
@@ -502,7 +507,7 @@ them would do. Templates still in use are re-checked by apply after it applies.`
 			if err != nil {
 				return err
 			}
-			if msg := st.CNIConflict(render.HydraCNI(cfg), t.kubectl(file)); msg != "" {
+			if msg := st.CNIConflict(render.HydraCNI(cfg), adoptCNI, t.kubectl(file)); msg != "" {
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "! cni: create refuses this: %s\n", msg)
 			}
 			// Judge the label by what the apply would leave: when hydra is its
@@ -524,6 +529,7 @@ them would do. Templates still in use are re-checked by apply after it applies.`
 	c.Flags().StringVar(&mgmt, "management-kubeconfig", "", "kubeconfig of the management cluster (default: the cluster's bootstrap kind cluster)")
 	c.Flags().BoolVar(&forceConflicts, "force-conflicts", false, "plan as create --force-conflicts would apply")
 	addPruneFlags(c, &prune)
+	c.Flags().BoolVar(&adoptCNI, "adopt-cni", false, adoptCNIUsage)
 	return c
 }
 

@@ -354,8 +354,8 @@ func (u *Upgrader) checkInSync(ctx context.Context, l Live) error {
 	}
 	// The CNI choice must be one create would accept: upgrade applies the
 	// same objects, and dropping the CNI label uninstalls hydra's Cilium.
-	if msg := st.CNIConflict(render.HydraCNI(u.Config), u.kubectl()); msg != "" {
-		return &Refusal{Reason: msg, Fix: "fix spec.network.cni as shown, then run upgrade again", Always: true}
+	if msg := st.CNIConflict(render.HydraCNI(u.Config), false, u.kubectl()); msg != "" {
+		return &Refusal{Reason: msg, Fix: "fix spec.network.cni as shown (for --adopt-cni, run `hydra cluster apply --adopt-cni` first), then run upgrade again", Always: true}
 	}
 	if msg := st.Planned(changes).CNILabelLeft(render.HydraCNI(u.Config), u.kubectl()); msg != "" {
 		return &Refusal{Reason: msg, Fix: "remove the label as shown, then run upgrade again", Always: true}

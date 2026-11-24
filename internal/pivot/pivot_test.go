@@ -51,7 +51,7 @@ func cniObjects() (*unstructured.Unstructured, *unstructured.Unstructured) {
 	hcp.SetLabels(map[string]string{"hydra.io/cluster": name, "hydra.io/addon": "cilium"})
 	hrp := u(hrpGVK, ns, name+"-cilium-abc", map[string]any{
 		"spec":   map[string]any{"version": "1.19.1"},
-		"status": map[string]any{"conditions": []any{map[string]any{"type": "Ready", "status": "True"}}},
+		"status": map[string]any{"conditions": []any{map[string]any{"type": "Ready", "status": "True", "observedGeneration": int64(1)}}},
 	})
 	hrp.SetLabels(map[string]string{clusterNameLabel: name, "helmreleaseproxy.addons.cluster.x-k8s.io/helmchartproxy-name": name + "-cilium"})
 	return hcp, hrp

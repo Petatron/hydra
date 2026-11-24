@@ -619,8 +619,8 @@ func TestUnprotectedRoll(t *testing.T) {
 	}
 }
 
-// A Cluster without the CNI label has no hydra CNI proxy selecting it
-// (cni: external): status says so, never reads the proxy, and the wait
+// A Cluster without the CNI label and no hydra CNI proxy (cni: external):
+// status says so, and the wait
 // ends on Available and rolled out alone.
 func TestStatusAndWaitWithExternalCNI(t *testing.T) {
 	ctx := context.Background()
@@ -628,14 +628,7 @@ func TestStatusAndWaitWithExternalCNI(t *testing.T) {
 		map[string]any{"type": "Available", "status": "True", "reason": "Available"},
 	}}})
 	kcp := obj(kcpGVK, "ns", "c-cp", map[string]any{"spec": map[string]any{"replicas": int64(1)}, "status": map[string]any{"replicas": int64(1), "readyReplicas": int64(1), "upToDateReplicas": int64(1)}})
-	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cl, kcp).WithInterceptorFuncs(interceptor.Funcs{
-		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, o client.Object, opts ...client.GetOption) error {
-			if o.GetObjectKind().GroupVersionKind().Kind == hcpGVK.Kind {
-				return errors.New("CNI proxy read with an external CNI")
-			}
-			return c.Get(ctx, key, o, opts...)
-		},
-	}).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cl, kcp).Build()
 	m := &Manager{C: c, Out: io.Discard, Poll: time.Millisecond}
 	s, err := m.Status(ctx, "ns", "c")
 	if err != nil {
@@ -684,7 +677,7 @@ func TestCNIConflict(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		msg := st.CNIConflict(tc.hydraCNI, "kubectl --kubeconfig m.yaml")
+		msg := st.CNIConflict(tc.hydraCNI, false, "kubectl --kubeconfig m.yaml")
 		if (msg != "") != tc.conflict {
 			t.Errorf("%s hydraCNI=%v: got %q", tc.name, tc.hydraCNI, msg)
 		}
@@ -712,24 +705,39 @@ func TestCNIConflictWithCAAPH(t *testing.T) {
 		o.SetLabels(map[string]string{render.CNILabelKey: name})
 		return o
 	}
+	running := func(o *unstructured.Unstructured) *unstructured.Unstructured {
+		_ = unstructured.SetNestedField(o.Object, true, "status", "initialization", "controlPlaneInitialized")
+		return o
+	}
+	unlabelled := running(obj(clusterGVK, "ns", "lost", nil))
 	objs := []client.Object{
-		cl("caaph"), labelledFor(hcpGVK, "caaph-cilium", "caaph"),
-		cl("legacy"), labelledFor(crsGVK, "legacy-cilium", "legacy"),
-		cl("foreign"), labelledFor(hcpGVK, "foreign-cilium", "someone-else"),
+		running(cl("caaph")), labelledFor(hcpGVK, "caaph-cilium", "caaph"),
+		running(cl("legacy")), obj(crsGVK, "ns", "legacy-cilium", nil), // by name, whoever made it
+		running(cl("foreign")), labelledFor(hcpGVK, "foreign-cilium", "someone-else"),
+		cl("fresh"),
+		unlabelled, labelledFor(hcpGVK, "lost-cilium", "lost"),
 	}
 	m := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(objs...).Build()}
 	for _, tc := range []struct {
-		name     string
-		hydraCNI bool
-		proxy    bool
-		legacy   bool
-		want     string
+		name            string
+		hydraCNI, adopt bool
+		proxy, legacy   bool
+		want            string
 	}{
-		{"caaph", true, true, false, ""},
-		{"caaph", false, true, false, "would uninstall Cilium from the running cluster"},
-		{"legacy", true, false, true, "Clusters on the old ClusterResourceSet"},
-		{"legacy", false, false, true, ""},
-		{"foreign", false, false, false, ""}, // not labelled for this cluster
+		{"caaph", true, false, true, false, ""},
+		{"caaph", false, false, true, false, "would uninstall Cilium from the running cluster"},
+		{"caaph", false, true, true, false, "would uninstall Cilium from the running cluster"}, // --adopt-cni never allows that
+		{"legacy", true, false, false, true, "Clusters on the old ClusterResourceSet"},
+		{"legacy", true, true, false, true, "Clusters on the old ClusterResourceSet"}, // the set must go first
+		{"legacy", false, false, false, true, ""},
+		// Labelled and running, but hydra's proxy never installed it (the
+		// one there is another cluster's): only with --adopt-cni.
+		{"foreign", true, false, false, false, "rerun with --adopt-cni"},
+		{"foreign", true, true, false, false, ""},
+		{"foreign", false, false, false, false, ""},
+		{"fresh", true, false, false, false, ""}, // nothing runs yet: an interrupted create resumes
+		{"lost", true, false, true, false, "CAAPH has uninstalled Cilium"},
+		{"lost", true, true, true, false, ""},
 	} {
 		st, err := m.State(ctx, "ns", tc.name)
 		if err != nil {
@@ -738,10 +746,20 @@ func TestCNIConflictWithCAAPH(t *testing.T) {
 		if st.CNIProxy != tc.proxy || st.LegacyCNI != tc.legacy {
 			t.Errorf("%s: proxy=%v legacy=%v", tc.name, st.CNIProxy, st.LegacyCNI)
 		}
-		msg := st.CNIConflict(tc.hydraCNI, "kubectl")
+		msg := st.CNIConflict(tc.hydraCNI, tc.adopt, "kubectl")
 		if (tc.want == "") != (msg == "") || !strings.Contains(msg, tc.want) {
-			t.Errorf("%s hydraCNI=%v: got %q, want %q", tc.name, tc.hydraCNI, msg, tc.want)
+			t.Errorf("%s hydraCNI=%v adopt=%v: got %q, want %q", tc.name, tc.hydraCNI, tc.adopt, msg, tc.want)
 		}
+	}
+
+	// Status: a Cluster that lost its CNI label while hydra's proxy exists
+	// has had Cilium uninstalled; it is not an external CNI, and not ready.
+	s, err := m.Status(ctx, "ns", "lost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.CNIExternal || !s.CNILabelMissing || s.CNIReady() || !strings.Contains(s.Line(), "CNI uninstalled") {
+		t.Errorf("lost label: %+v %q", s, s.Line())
 	}
 
 	// A read that fails is an error, not "no proxy".

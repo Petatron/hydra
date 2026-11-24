@@ -336,6 +336,10 @@ type Summary struct {
 	// Cilium proxy does not select it (cni: external): something else
 	// installs the CNI, and the other CNI fields say nothing.
 	CNIExternal bool
+	// CNILabelMissing: hydra's Cilium proxy exists but the Cluster lost the
+	// label it selects by, so CAAPH has uninstalled Cilium (PET-97). Not
+	// ready, whatever the nodes say.
+	CNILabelMissing bool
 	// Addons are the cluster's HelmChartProxies, as CAAPH reports them.
 	Addons []AddonState
 	// AddonsError is why the proxies could not be read, if they could not.
@@ -385,6 +389,8 @@ func (s Summary) Line() string {
 	}
 	parts = append(parts, "machines: "+strings.Join(phases, ", "))
 	switch {
+	case s.CNILabelMissing:
+		parts = append(parts, "CNI uninstalled: the Cluster lost its "+render.CNILabelKey+" label")
 	case s.CNIExternal:
 		parts = append(parts, "CNI external (not installed by hydra)")
 	case s.CNIApplied:
@@ -548,6 +554,15 @@ func (m *Manager) Status(ctx context.Context, namespace, name string) (Summary, 
 	}
 
 	if s.CNIExternal {
+		// No label, but hydra's proxy for it: the label was removed, and
+		// CAAPH uninstalled Cilium. That is no external CNI.
+		proxy, err := m.labelledExists(ctx, hcpGVK, namespace, render.CNIName(name), name)
+		if err != nil {
+			return s, fmt.Errorf("reading the CNI HelmChartProxy: %w", err)
+		}
+		if proxy {
+			s.CNIExternal, s.CNILabelMissing = false, true
+		}
 		return s, nil
 	}
 	if err := m.cniStatus(ctx, namespace, name, &s); err != nil {
@@ -610,11 +625,12 @@ func (m *Manager) cniStatus(ctx context.Context, namespace, name string, s *Summ
 }
 
 // observedCurrent reports whether a condition was set for the object's
-// current generation (a condition without observedGeneration counts).
+// current generation. CAAPH sets observedGeneration on every condition (Cluster
+// API's condition setter does), so one without it is not trusted.
 func observedCurrent(o *unstructured.Unstructured, c map[string]any) bool {
 	g, ok := c["observedGeneration"]
 	if !ok {
-		return true
+		return false
 	}
 	switch v := g.(type) {
 	case int64:

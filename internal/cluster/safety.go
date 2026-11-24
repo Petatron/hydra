@@ -113,9 +113,13 @@ type ClusterState struct {
 	// CAAPH keeps Cilium installed while the Cluster carries the CNI label,
 	// and uninstalls it when the label goes.
 	CNIProxy bool
-	// LegacyCNI: the ClusterResourceSet that installed hydra's Cilium before
-	// PET-100 is still there, so Cilium on the cluster has no Helm release.
+	// LegacyCNI: a ClusterResourceSet named like the one that installed
+	// hydra's Cilium before PET-100 is still there, so Cilium on the cluster
+	// has no Helm release.
 	LegacyCNI bool
+	// ControlPlaneInitialized: the cluster's API has come up, so a CNI may
+	// already run there.
+	ControlPlaneInitialized bool
 }
 
 // CheckOwner reports whether this CLI may delete the Cluster as cluster:
@@ -128,20 +132,24 @@ func (st ClusterState) CheckOwner(cluster string, adopt bool) error {
 }
 
 // CNIConflict explains why applying hydra.yaml's CNI choice to an existing
-// Cluster would be wrong, or returns "". kubectl is the command prefix that
-// reaches the management cluster, so a printed fix never relies on the
-// current context. Three cases:
+// Cluster would be wrong, or returns "". adoptCNI is --adopt-cni: the
+// operator has checked what runs there and wants hydra's Cilium to take it
+// over. kubectl is the command prefix that reaches the management cluster,
+// so a printed fix never relies on the current context. The cases:
 //
 //   - cni: external on a cluster whose Cilium hydra's proxy installs: the
 //     apply would drop the Cluster's CNI label, and CAAPH would uninstall
-//     Cilium from the running cluster (PET-97).
-//   - cni: hydra on a cluster still on the ClusterResourceSet hydra used
-//     before PET-100: its Cilium has no Helm release, and the switch is a
-//     migration, never done implicitly.
-//   - cni: hydra on a Cluster without the CNI label: hydra's proxy never
-//     selected it (or the label was removed), so its CNI may come from
-//     somewhere else. Adding the label would install hydra's Cilium on top.
-func (st ClusterState) CNIConflict(hydraCNI bool, kubectl string) string {
+//     Cilium from the running cluster (PET-97). Never allowed.
+//   - cni: hydra on a cluster still on a ClusterResourceSet named like the
+//     one hydra used before PET-100: its Cilium has no Helm release. The
+//     set must go first (a migration); --adopt-cni does not skip that.
+//   - cni: hydra where hydra's proxy would newly select a cluster that
+//     already runs: the Cluster lacks the CNI label (or carries another
+//     value, or lost it), or carries it on a running cluster hydra's proxy
+//     never installed. Its CNI may come from somewhere else, and hydra's
+//     Cilium would land on top of it, taking over any Cilium objects without
+//     a Helm release. Only with --adopt-cni.
+func (st ClusterState) CNIConflict(hydraCNI, adoptCNI bool, kubectl string) string {
 	if !st.Exists || st.object == nil {
 		return ""
 	}
@@ -157,8 +165,16 @@ func (st ClusterState) CNIConflict(hydraCNI bool, kubectl string) string {
 		return fmt.Sprintf("cluster %s/%s got its Cilium from the ClusterResourceSet %s that hydra v0.5 and earlier rendered, so that Cilium has no Helm release; this hydra installs Cilium through Cluster API Add-on Provider Helm instead, and does not switch a running cluster over on its own. Migrate it (README, \"Clusters on the old ClusterResourceSet\"), or set spec.network.cni: %s to leave its Cilium as it is",
 			ns, name, render.CNIName(name), config.CNIExternal)
 	}
-	if HydraCNISelected(st.object) {
+	if adoptCNI {
 		return ""
+	}
+	selected := HydraCNISelected(st.object)
+	if selected && (st.CNIProxy || !st.ControlPlaneInitialized) {
+		return "" // hydra's own Cilium, or nothing runs yet
+	}
+	if selected {
+		return fmt.Sprintf("cluster %s/%s is running and carries the %s label, but hydra's Cilium HelmChartProxy has never installed its CNI (it was built or adopted with the label, or an older hydra's ClusterResourceSet was removed). cni: %s would install hydra's Cilium over whatever runs there, taking over any Cilium objects that have no Helm release. If that CNI is managed elsewhere, set spec.network.cni: %s. If no CNI runs there, or its Cilium already matches hydra's canonical values at spec.network.ciliumVersion, rerun with --adopt-cni",
+			ns, name, render.CNILabelKey, config.CNIHydra, config.CNIExternal)
 	}
 	has := "exists without the " + render.CNILabelKey + " label"
 	if v := st.object.GetLabels()[render.CNILabelKey]; v != "" {
@@ -166,7 +182,10 @@ func (st ClusterState) CNIConflict(hydraCNI bool, kubectl string) string {
 		// cluster's: hydra's apply would retarget it onto this one.
 		has = fmt.Sprintf("carries the %s label with value %q, not %q", render.CNILabelKey, v, name)
 	}
-	return fmt.Sprintf("cluster %s/%s %s, so hydra's Cilium HelmChartProxy does not select it, and cni: %s would install hydra's Cilium on top of whatever CNI runs there. If that CNI is managed elsewhere, set spec.network.cni: %s. If no CNI runs there yet (removing the label from a cluster running hydra's Cilium uninstalled it), set the label, and hydra's Cilium is installed: %s label --overwrite cluster -n %s %s %s=%s",
+	if st.CNIProxy {
+		has += " although hydra's Cilium HelmChartProxy exists, so CAAPH has uninstalled Cilium from it"
+	}
+	return fmt.Sprintf("cluster %s/%s %s, so hydra's Cilium HelmChartProxy does not select it, and cni: %s would install hydra's Cilium on top of whatever CNI runs there. If that CNI is managed elsewhere, set spec.network.cni: %s. If no CNI runs there, or its Cilium already matches hydra's canonical values at spec.network.ciliumVersion, rerun with --adopt-cni (or set the label yourself: %s label --overwrite cluster -n %s %s %s=%s)",
 		ns, name, has, config.CNIHydra, config.CNIExternal, kubectl, ns, name, render.CNILabelKey, name)
 }
 
@@ -190,7 +209,7 @@ func (st ClusterState) CNILabelLeft(hydraCNI bool, kubectl string) string {
 		return ""
 	}
 	ns, name := st.object.GetNamespace(), st.object.GetName()
-	return fmt.Sprintf("cluster %s/%s still carries the %s label although hydra.yaml says cni: %s, because another field manager also owns it; it keeps hydra's ClusterResourceSet selecting the cluster, which installs hydra's Cilium if it has not applied yet. Remove it, then delete the orphaned %s-cilium ClusterResourceSet and ConfigMap: %s label cluster -n %s %s %s-",
+	return fmt.Sprintf("cluster %s/%s still carries the %s label although hydra.yaml says cni: %s, because another field manager also owns it; it keeps any selector of hydra's Cilium (an older hydra's ClusterResourceSet %s-cilium, if one is left) picking the cluster up. Remove it, and delete such a leftover set and its ConfigMap: %s label cluster -n %s %s %s-",
 		ns, name, render.CNILabelKey, config.CNIExternal, name, kubectl, ns, name, render.CNILabelKey)
 }
 
@@ -225,8 +244,14 @@ func (m *Manager) State(ctx context.Context, namespace, name string) (ClusterSta
 	if st.CNIProxy, err = m.labelledExists(ctx, hcpGVK, namespace, render.CNIName(name), name); err != nil {
 		return ClusterState{}, fmt.Errorf("reading the CNI HelmChartProxy: %w", err)
 	}
-	if st.LegacyCNI, err = m.labelledExists(ctx, crsGVK, namespace, render.CNIName(name), name); err != nil {
+	// By name alone: whoever made it, a set by that name installed this
+	// cluster's Cilium outside Helm.
+	if st.LegacyCNI, err = m.exists(ctx, crsGVK, namespace, render.CNIName(name)); err != nil {
 		return ClusterState{}, fmt.Errorf("reading the CNI ClusterResourceSet: %w", err)
+	}
+	st.ControlPlaneInitialized, _, _ = unstructured.NestedBool(cl.Object, "status", "initialization", "controlPlaneInitialized")
+	if c := condition(cl, "ControlPlaneInitialized"); c != nil && c["status"] == ConditionTrue {
+		st.ControlPlaneInitialized = true
 	}
 	host, _, _ := unstructured.NestedString(cl.Object, "spec", "controlPlaneEndpoint", "host")
 	port, _, _ := unstructured.NestedInt64(cl.Object, "spec", "controlPlaneEndpoint", "port")
@@ -392,6 +417,21 @@ func (m *Manager) Orphans(ctx context.Context, objs []*unstructured.Unstructured
 	}
 	slices.Sort(out)
 	return out, nil
+}
+
+// exists reports whether the named object exists. A kind the management
+// cluster does not serve counts as absent; any other read error is returned.
+func (m *Manager) exists(ctx context.Context, gvk schema.GroupVersionKind, namespace, name string) (bool, error) {
+	o := &unstructured.Unstructured{}
+	o.SetGroupVersionKind(gvk)
+	err := m.C.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, o)
+	switch {
+	case apierrors.IsNotFound(err), meta.IsNoMatchError(err):
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+	return true, nil
 }
 
 // labelledExists reports whether the named object exists and carries hydra's

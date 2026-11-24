@@ -375,7 +375,7 @@ func cniInstalled(ns, name string) []client.Object {
 	hrp.SetName(name + "-cilium-abc")
 	hrp.SetLabels(map[string]string{"cluster.x-k8s.io/cluster-name": name, "helmreleaseproxy.addons.cluster.x-k8s.io/helmchartproxy-name": name + "-cilium"})
 	_ = unstructured.SetNestedField(hrp.Object, "1.19.1", "spec", "version")
-	_ = unstructured.SetNestedSlice(hrp.Object, []any{map[string]any{"type": "Ready", lcStatus: "True"}}, lcStatus, "conditions")
+	_ = unstructured.SetNestedSlice(hrp.Object, []any{map[string]any{"type": "Ready", lcStatus: "True", "observedGeneration": int64(1)}}, lcStatus, "conditions")
 	return []client.Object{hcp, hrp}
 }
 
@@ -893,8 +893,18 @@ func TestCluCreateRefusesHydraCNIOnAForeignCNI(t *testing.T) {
 	if ap.n != 0 {
 		t.Errorf("%d applies before the refusal", ap.n)
 	}
+	// --adopt-cni is the operator's say-so: create applies.
+	ap = &cluApplies{}
+	tg, _ = cluTarget(t, true, ap, interceptor.Funcs{}, foreign())
+	cmd, _ = cluCmd()
+	if _, err := runCreate(t.Context(), cmd, tg, cfg, objs, createOptions{wait: false, adoptCNI: true}); err != nil {
+		t.Fatalf("--adopt-cni: %v", err)
+	}
+	if ap.n == 0 {
+		t.Error("--adopt-cni applied nothing")
+	}
 
-	cfg.Spec.Network.CNI, cfg.Spec.Network.MTU = config.CNIExternal, 0
+	cfg.Spec.Network.CNI, cfg.Spec.Network.MTU, cfg.Spec.Network.CiliumVersion = config.CNIExternal, 0, ""
 	objs, err := renderObjects(cfg)
 	if err != nil {
 		t.Fatal(err)

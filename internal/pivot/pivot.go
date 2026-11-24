@@ -107,8 +107,9 @@ type Pivot struct {
 	FinishSplit bool
 	// Rerun names the command to run again in messages; default "pivot".
 	Rerun string
-	// allowUnsettled skips preflight's Available-and-rolled-out check: set
-	// by Teardown, which must be able to remove a degraded cluster.
+	// allowUnsettled skips preflight's Available-and-rolled-out check and its
+	// CNI check: set by Teardown, which must be able to remove a degraded
+	// cluster and never waits for its CNI in kind.
 	allowUnsettled bool
 	// credentialsSecret is read from the live HydraCluster by preflight.
 	credentialsSecret string
@@ -568,11 +569,18 @@ func (p *Pivot) preflight(ctx context.Context) error {
 	return nil
 }
 
-// legacyCNI explains why a cluster whose Cilium came from the
-// ClusterResourceSet hydra v0.5 and earlier rendered cannot be pivoted, or
-// returns "": it would never verify on the target, where this hydra waits for
-// CAAPH to report Cilium installed, and nothing installed it that way.
+// legacyCNI explains why the cluster's CNI rules out a pivot, or returns "":
+// Cilium from the ClusterResourceSet hydra v0.5 and earlier rendered would
+// never verify on the target, where this hydra waits for CAAPH to report it
+// installed; and a cluster that lost its CNI label has had Cilium
+// uninstalled. Teardown skips it.
 func (p *Pivot) legacyCNI(ctx context.Context, src *cluster.Manager, st cluster.Summary) (string, error) {
+	if p.allowUnsettled {
+		return "", nil
+	}
+	if st.CNILabelMissing {
+		return fmt.Sprintf("the Cluster lost its %s label, so Cluster API Add-on Provider Helm has uninstalled Cilium from it; restore the label (or run `hydra cluster apply --adopt-cni`) and let Cilium come back before moving it", render.CNILabelKey), nil
+	}
 	if st.CNIExternal {
 		return "", nil
 	}

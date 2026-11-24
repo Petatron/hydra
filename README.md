@@ -160,7 +160,18 @@ management cluster needs CAAPH: `hydra bootstrap` installs it, and `create` refu
   catalogue (`internal/addons`); `hack/check-cilium.sh` renders the chart with hydra's values at
   each of them, weekly and on every change.
 - `create`, `apply` and the pivot wait for CAAPH to report Cilium installed at the version asked for;
-  `status` shows `CNI installing` with CAAPH's reason until then.
+  `status` shows `CNI installing` with CAAPH's reason until then, and `CNI uninstalled` if the
+  Cluster lost its label. A pivot refuses to start, or to finish, on a cluster without its CNI.
+- **Pin `ciliumVersion`.** Without it a cluster takes the catalogue's default, so a hydra release
+  that moves the default upgrades Cilium on your next `apply` (`plan` shows it first), and `upgrade`
+  refuses until that has been applied.
+- **hydra's Cilium is never put on a running cluster without your say-so.** For a cluster that
+  already runs, `create` and `apply` refuse `cni: hydra` unless hydra's proxy installed its CNI:
+  when the Cluster lacks the label, or carries it but hydra's proxy never installed anything (built
+  or adopted with the label, or an older hydra's ClusterResourceSet removed). Check what runs there,
+  then rerun with **`--adopt-cni`**: hydra's Cilium is installed over it, taking over Cilium objects
+  that have no Helm release. `plan --adopt-cni` previews it. A new cluster, or one whose API has not
+  come up yet, needs no flag.
 - The proxy sets `takeOwnership`, so CAAPH adopts Cilium objects that exist without a Helm release
   (a cluster whose Cilium was installed another way) instead of failing. CAAPH applies options only
   when it first installs, so this is set from the first render.
@@ -196,9 +207,9 @@ Cilium as it is, set `cni: external`. To move it under CAAPH:
 2. Delete the old ClusterResourceSet and its ConfigMap on the management cluster
    (`kubectl -n <ns> delete clusterresourceset,configmap <cluster>-cilium`). This leaves Cilium
    running: a ClusterResourceSet never deletes what it applied.
-3. `hydra cluster plan`, then `hydra cluster apply`. CAAPH takes the existing objects over
-   (`takeOwnership`), and any value that differs is set right at CAAPH's next resync (up to 10
-   minutes).
+3. `hydra cluster plan --adopt-cni`, then `hydra cluster apply --adopt-cni`. CAAPH takes the
+   existing objects over (`takeOwnership`), and any value that differs is set right at CAAPH's next
+   resync (up to 10 minutes).
 
 This takeover was proven in kind for a Cilium without a Helm release (PET-97), not yet for one
 applied by a ClusterResourceSet on hardware.
@@ -214,7 +225,7 @@ person owns the CNI, including a cluster built before hydra managed it.
   while `create` waits, or pass `--wait=false` and follow with `status`.
 - `create` refuses `cni: hydra` for an existing Cluster that lacks the CNI label (or carries it with
   a value other than the cluster's name), because hydra's Cilium would then be installed on top of
-  the CNI already there. `plan` warns about the same case.
+  the CNI already there, unless `--adopt-cni` says to (see above). `plan` warns about the same case.
 - A cluster whose Cilium hydra installs through CAAPH cannot be switched to `external` (see above).
   For one still on the old ClusterResourceSet, `external` leaves Cilium running: the set applied it
   once and never removes it. Server-side apply drops the Cluster's `cni.hydra.io/cilium` label only

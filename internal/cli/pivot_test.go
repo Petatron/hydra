@@ -408,7 +408,7 @@ func pivSettled() []client.Object {
 	cl := pivObj("cluster.x-k8s.io/v1beta2", "Cluster", "c", map[string]any{lcStatus: map[string]any{
 		"conditions": []any{map[string]any{"type": "Available", lcStatus: "True"}},
 	}})
-	cl.SetLabels(map[string]string{"hydra.io/cluster": "c"})
+	cl.SetLabels(map[string]string{"hydra.io/cluster": "c", "cni.hydra.io/cilium": "c"})
 	kcp := pivObj("controlplane.cluster.x-k8s.io/v1beta2", "KubeadmControlPlane", "c-cp", map[string]any{
 		"spec":   map[string]any{"replicas": int64(1)},
 		lcStatus: map[string]any{"readyReplicas": int64(1), "upToDateReplicas": int64(1), "replicas": int64(1)},
