@@ -281,13 +281,18 @@ current kubectl context is never used.
 
   | No longer in hydra.yaml | `apply` |
   |---|---|
-  | An addon's `HelmChartProxy` (uninstalls it) | deletes it; a protected or uncatalogued addon only with `--allow-remove=<name>`, otherwise apply refuses before writing anything |
+  | hydra's `HelmChartProxy` for a removed addon (`<cluster>-<addon>`; deleting it uninstalls the addon) | deletes it; a protected or uncatalogued addon only with `--allow-remove=<addon>`, otherwise apply refuses before writing anything |
+  | Any other proxy labelled for the cluster (a duplicate, one made by hand) | refuses unless named as `--allow-remove=proxy/<name>`: a duplicate shares the release of the addon hydra.yaml still lists |
   | A superseded machine or bootstrap template | deletes it once no machine, MachineSet or control plane uses it (a later apply removes one still in use) |
-  | A node pool (`MachineDeployment`) | keeps it unless `--prune-pools`, because deleting it deletes its machines and VMs |
+  | A node pool (`MachineDeployment`) | keeps it unless named with `--prune-pools=<pool>`, because deleting it deletes its machines and VMs |
   | The control plane, `HydraCluster`, health check, CNI objects | never |
 
   `plan` takes `--prune-pools` and `--allow-remove` too, to show exactly what `apply` with them would
-  do. Like `create`, `apply` refuses a Kubernetes version change (use `upgrade`).
+  do. Like `create`, `apply` refuses a Kubernetes version change (use `upgrade`). An object that
+  changes while apply runs is left, and apply exits non-zero; run it again. Do not run two applies
+  for one cluster at once, nor roll a pool back by hand while one runs: hydra keeps no lock
+  (ADR-001), and a template that becomes used again between apply's check and its delete could be
+  removed.
 - **Replacing a control-plane machine keeps the API up (PET-88).** The control-plane template asks
   the provider (v0.2.0 or later) to run `/usr/local/sbin/hydra-pre-drain` in the guest before
   Cluster API drains the machine. If that node holds the control-plane VIP, the script stops

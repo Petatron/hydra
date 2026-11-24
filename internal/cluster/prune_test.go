@@ -3,14 +3,18 @@ package cluster
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/Petatron/hydra/internal/addons"
 	"github.com/Petatron/hydra/internal/render"
@@ -53,7 +57,13 @@ func proxy(name, addon string) *unstructured.Unstructured {
 // The decision table, one row per case (ADR-002 decisions 3 and 4).
 func TestClassify(t *testing.T) {
 	withCatalogue(t)
-	inUse := map[string]bool{kindHydraMachineTemplate + "/c-cp-used": true, kindKubeadmConfigTemplate + "/c-w-used": true}
+	pc := func(opts PruneOptions) pruneContext {
+		return pruneContext{
+			cluster: "c", opts: opts,
+			inUse:          map[string]bool{kindHydraMachineTemplate + "/c-cp-used": true, kindKubeadmConfigTemplate + "/c-w-used": true},
+			renderedAddons: map[string]bool{"kept": true},
+		}
+	}
 	for _, tc := range []struct {
 		name string
 		obj  *unstructured.Unstructured
@@ -61,27 +71,34 @@ func TestClassify(t *testing.T) {
 		want PruneAction
 		why  string
 	}{
-		{"unprotected addon", proxy("c-plain", "plain"), PruneOptions{}, PruneDelete, "uninstalls"},
-		{"protected addon", proxy("c-guarded", "guarded"), PruneOptions{}, PruneRefused, "--allow-remove=guarded"},
-		{"protected addon allowed", proxy("c-guarded", "guarded"), PruneOptions{AllowRemove: []string{"guarded"}}, PruneDelete, "--allow-remove"},
+		{"hydra's proxy, unprotected addon removed", proxy("c-plain", "plain"), PruneOptions{}, PruneDelete, "uninstalls"},
+		{"hydra's proxy, protected addon", proxy("c-guarded", "guarded"), PruneOptions{}, PruneRefused, "--allow-remove=guarded"},
+		{"hydra's proxy, protected addon allowed", proxy("c-guarded", "guarded"), PruneOptions{AllowRemove: []string{"guarded"}}, PruneDelete, "--allow-remove"},
 		{"another addon allowed is not this one", proxy("c-guarded", "guarded"), PruneOptions{AllowRemove: []string{"plain"}}, PruneRefused, ""},
-		{"uncatalogued addon", proxy("c-gone", "gone"), PruneOptions{}, PruneRefused, "--allow-remove=gone"},
-		{"uncatalogued addon allowed", proxy("c-gone", "gone"), PruneOptions{AllowRemove: []string{"gone"}}, PruneDelete, ""},
-		{"proxy without addon label", proxy("c-hand", ""), PruneOptions{}, PruneRefused, "--allow-remove=c-hand"},
-		{"proxy without addon label allowed by name", proxy("c-hand", ""), PruneOptions{AllowRemove: []string{"c-hand"}}, PruneDelete, ""},
+		{"hydra's proxy, uncatalogued addon", proxy("c-gone", "gone"), PruneOptions{}, PruneRefused, "--allow-remove=gone"},
+		{"hydra's proxy, uncatalogued addon allowed", proxy("c-gone", "gone"), PruneOptions{AllowRemove: []string{"gone"}}, PruneDelete, ""},
+		// Deleting a duplicate would uninstall the release the listed addon uses.
+		{"duplicate proxy for an addon still listed", proxy("c-kept-copy", "kept"), PruneOptions{AllowRemove: []string{"kept"}}, PruneRefused, "still lists"},
+		{"duplicate proxy allowed by proxy name", proxy("c-kept-copy", "kept"), PruneOptions{AllowRemove: []string{"proxy/c-kept-copy"}}, PruneDelete, ""},
+		{"not named like hydra's, unprotected addon", proxy("handmade", "plain"), PruneOptions{}, PruneRefused, "--allow-remove=proxy/handmade"},
+		{"proxy without addon label", proxy("c-hand", ""), PruneOptions{}, PruneRefused, "--allow-remove=proxy/c-hand"},
+		{"proxy without addon label, bare name is not enough", proxy("c-hand", ""), PruneOptions{AllowRemove: []string{"c-hand"}}, PruneRefused, ""},
+		{"proxy without addon label allowed as proxy/", proxy("c-hand", ""), PruneOptions{AllowRemove: []string{"proxy/c-hand"}}, PruneDelete, ""},
 		{"unused machine template", labelled(hmtGVK, "c-cp-old", "c"), PruneOptions{}, PruneDelete, "unused"},
-		{"used machine template", labelled(hmtGVK, "c-cp-used", "c"), PruneOptions{Pools: true}, PruneInUse, "later apply"},
+		{"used machine template", labelled(hmtGVK, "c-cp-used", "c"), PruneOptions{Pools: []string{"c-cp-used"}}, PruneInUse, "later apply"},
 		{"unused bootstrap template", labelled(kctGVK, "c-w-old", "c"), PruneOptions{}, PruneDelete, ""},
 		{"used bootstrap template", labelled(kctGVK, "c-w-used", "c"), PruneOptions{}, PruneInUse, ""},
-		{"removed pool", labelled(mdGVK, "c-old", "c"), PruneOptions{}, PruneNeedsFlag, "--prune-pools"},
-		{"removed pool with --prune-pools", labelled(mdGVK, "c-old", "c"), PruneOptions{Pools: true}, PruneDelete, "VMs"},
-		{kindHydraCluster, labelled(hydraClusterGVK, "c-x", "c"), PruneOptions{Pools: true, AllowRemove: []string{"c-x"}}, PruneNever, ""},
-		{"control plane", labelled(kcpGVK, "c-x", "c"), PruneOptions{Pools: true}, PruneNever, ""},
-		{"health check", labelled(mhcGVK, "c-x", "c"), PruneOptions{Pools: true}, PruneNever, ""},
-		{"CNI set", labelled(crsGVK, "c-cilium", "c"), PruneOptions{Pools: true}, PruneNever, ""},
+		{"removed pool", labelled(mdGVK, "c-old", "c"), PruneOptions{}, PruneNeedsFlag, "--prune-pools=old"},
+		{"removed pool named", labelled(mdGVK, "c-old", "c"), PruneOptions{Pools: []string{"old"}}, PruneDelete, "VMs"},
+		{"removed pool named by MachineDeployment", labelled(mdGVK, "c-old", "c"), PruneOptions{Pools: []string{"c-old"}}, PruneDelete, ""},
+		{"another pool named is not this one", labelled(mdGVK, "c-old", "c"), PruneOptions{Pools: []string{"other"}}, PruneNeedsFlag, ""},
+		{kindHydraCluster, labelled(hydraClusterGVK, "c-x", "c"), PruneOptions{Pools: []string{"x"}, AllowRemove: []string{"c-x"}}, PruneNever, ""},
+		{"control plane", labelled(kcpGVK, "c-x", "c"), PruneOptions{Pools: []string{"x"}}, PruneNever, ""},
+		{"health check", labelled(mhcGVK, "c-x", "c"), PruneOptions{}, PruneNever, ""},
+		{"CNI set", labelled(crsGVK, "c-cilium", "c"), PruneOptions{}, PruneNever, ""},
 		{"CNI ConfigMap", labelled(schema.GroupVersionKind{Version: "v1", Kind: kindConfigMap}, "c-cilium", "c"), PruneOptions{}, PruneNever, ""},
 	} {
-		got := classify(tc.obj, tc.opts, inUse)
+		got := classify(tc.obj, pc(tc.opts))
 		if got.Action != tc.want || !strings.Contains(got.Why, tc.why) {
 			t.Errorf("%s: got %s (%s), want %s containing %q", tc.name, got.Action, got.Why, tc.want, tc.why)
 		}
@@ -103,10 +120,16 @@ func TestPlanPrune(t *testing.T) {
 	hm := obj(hydraMachineGVK, "ns", "c-cp-x1", nil)
 	hm.SetLabels(map[string]string{clusterNameLabel: "c"})
 	hm.SetAnnotations(map[string]string{clonedFromName: "c-cp-machine"})
+	md := labelled(mdGVK, "c-w", "c")
+	_ = unstructured.SetNestedField(md.Object, "c-w-md", "spec", "template", "spec", "infrastructureRef", "name")
+	kc := obj(kubeadmConfigGVK, "ns", "c-w-kc1", nil)
+	kc.SetLabels(map[string]string{render.ClusterLabelKey: "c"}) // only hydra's label
+	kc.SetAnnotations(map[string]string{clonedFromName: "c-w-kct-machine"})
 	deleting := labelled(hmtGVK, "c-cp-going", "c")
 	deleting.SetFinalizers([]string{"x"})
 	objs := []client.Object{
-		kcp, ms, hm,
+		kcp, ms, hm, md, kc,
+		labelled(hmtGVK, "c-w-md", "c"), labelled(kctGVK, "c-w-kct-machine", "c"),
 		labelled(hmtGVK, "c-cp-current", "c"), labelled(hmtGVK, "c-w-ms", "c"), labelled(hmtGVK, "c-cp-machine", "c"),
 		labelled(hmtGVK, "c-cp-stale", "c"), labelled(kctGVK, "c-w-kct-ms", "c"), deleting,
 		proxy("c-plain", "plain"), labelled(hmtGVK, "d-cp-other", "d"),
@@ -116,7 +139,7 @@ func TestPlanPrune(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := &Manager{C: c, Out: &bytes.Buffer{}}
-	rendered := []*unstructured.Unstructured{kcp, labelled(hmtGVK, "c-cp-current", "c")}
+	rendered := []*unstructured.Unstructured{kcp, md, labelled(hmtGVK, "c-cp-current", "c")}
 	orphans, err := m.PlanPrune(ctx, rendered, "ns", "c", PruneOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -126,11 +149,13 @@ func TestPlanPrune(t *testing.T) {
 		got[o.Object.GetKind()+"/"+o.Object.GetName()] = o.Action
 	}
 	want := map[string]PruneAction{
-		kindHydraMachineTemplate + "/c-w-ms":       PruneInUse,
-		kindHydraMachineTemplate + "/c-cp-machine": PruneInUse,
-		kindHydraMachineTemplate + "/c-cp-stale":   PruneDelete,
-		kindKubeadmConfigTemplate + "/c-w-kct-ms":  PruneInUse,
-		render.KindHelmChartProxy + "/c-plain":     PruneDelete,
+		kindHydraMachineTemplate + "/c-w-ms":           PruneInUse,
+		kindHydraMachineTemplate + "/c-cp-machine":     PruneInUse,
+		kindHydraMachineTemplate + "/c-cp-stale":       PruneDelete,
+		kindKubeadmConfigTemplate + "/c-w-kct-ms":      PruneInUse,
+		kindHydraMachineTemplate + "/c-w-md":           PruneInUse,
+		kindKubeadmConfigTemplate + "/c-w-kct-machine": PruneInUse,
+		render.KindHelmChartProxy + "/c-plain":         PruneDelete,
 	}
 	if len(got) != len(want) {
 		t.Fatalf("orphans: %v, want %v", got, want)
@@ -170,9 +195,9 @@ func TestPrune(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	n, err := (&Manager{C: c, Out: &out}).Prune(ctx, orphans)
-	if err != nil || n != 1 {
-		t.Fatalf("n=%d err=%v\n%s", n, err, out.String())
+	n, skipped, err := (&Manager{C: c, Out: &out}).Prune(ctx, orphans)
+	if err != nil || n != 1 || skipped != 1 {
+		t.Fatalf("n=%d skipped=%d err=%v\n%s", n, skipped, err, out.String())
 	}
 	for _, o := range []*unstructured.Unstructured{kept, changed} {
 		u := &unstructured.Unstructured{}
@@ -193,5 +218,44 @@ func TestRefusals(t *testing.T) {
 	err := Refusals([]Orphan{{Object: proxy("c-g", "guarded"), Action: PruneRefused, Why: "pass --allow-remove=guarded"}})
 	if err == nil || !strings.Contains(err.Error(), "not applying") || !strings.Contains(err.Error(), "--allow-remove=guarded") {
 		t.Errorf("got %v", err)
+	}
+}
+
+// A reference kind that is not served means no references only when the
+// templates it protects are not served either; a kind that cannot be listed
+// for another reason (Forbidden) stops the prune.
+func TestTemplatesInUseFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	failing := func(kind string, err error) interceptor.Funcs {
+		return interceptor.Funcs{List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if u, ok := list.(*unstructured.UnstructuredList); ok && u.GroupVersionKind().Kind == kind+"List" {
+				return err
+			}
+			return w.List(ctx, list, opts...)
+		}}
+	}
+	served := meta.NewDefaultRESTMapper(nil)
+	served.Add(hmtGVK, meta.RESTScopeNamespace)
+	served.Add(kctGVK, meta.RESTScopeNamespace)
+	notServed := meta.NewDefaultRESTMapper(nil)
+	noKind := &meta.NoKindMatchError{GroupKind: hydraMachineGVK.GroupKind()}
+	for _, tc := range []struct {
+		name    string
+		mapper  meta.RESTMapper
+		funcs   interceptor.Funcs
+		wantErr string
+	}{
+		{"HydraMachine not served, its template served", served, failing("HydraMachine", noKind), "listing HydraMachine"},
+		{"HydraMachine and its template not served", notServed, failing("HydraMachine", noKind), ""},
+		{"MachineSets forbidden", served, failing("MachineSet", apierrors.NewForbidden(schema.GroupResource{Resource: "machinesets"}, "", errors.New("denied"))), "listing MachineSet"},
+	} {
+		c := fake.NewClientBuilder().WithScheme(scheme(t)).WithRESTMapper(tc.mapper).WithInterceptorFuncs(tc.funcs).Build()
+		_, err := (&Manager{C: c, Out: &bytes.Buffer{}}).templatesInUse(ctx, "ns", "c")
+		switch {
+		case tc.wantErr == "" && err != nil:
+			t.Errorf("%s: %v", tc.name, err)
+		case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+			t.Errorf("%s: want %q, got %v", tc.name, tc.wantErr, err)
+		}
 	}
 }

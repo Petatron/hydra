@@ -38,10 +38,13 @@ const (
 
 // PruneOptions are apply's pruning flags.
 type PruneOptions struct {
-	// Pools lets apply delete a removed pool's MachineDeployment, and with
-	// it the pool's machines and VMs.
-	Pools bool
-	// AllowRemove names protected or uncatalogued addons apply may remove.
+	// Pools names removed node pools apply may delete, with their machines
+	// and VMs: by pool name (as in hydra.yaml) or MachineDeployment name.
+	// Named one by one, so a wrong or stale hydra.yaml cannot take them all.
+	Pools []string
+	// AllowRemove names what apply may remove although it would refuse:
+	// protected or uncatalogued addons by addon name, and any other proxy as
+	// proxy/<name>.
 	AllowRemove []string
 }
 
@@ -59,43 +62,39 @@ func (o Orphan) String() string {
 	return fmt.Sprintf("%s %s (%s)", o.Action, describe(o.Object), o.Why)
 }
 
-// classify is the decision table. inUse holds the template names something
-// live still references, as Kind/name.
-func classify(o *unstructured.Unstructured, opts PruneOptions, inUse map[string]bool) Orphan {
+// pruneContext is what classify needs beyond the object.
+type pruneContext struct {
+	cluster string
+	opts    PruneOptions
+	// inUse holds the template names something live still references, as
+	// Kind/name.
+	inUse map[string]bool
+	// renderedAddons are the addons hydra.yaml still lists.
+	renderedAddons map[string]bool
+}
+
+// ProxyPrefix marks a HelmChartProxy named in --allow-remove by its object
+// name rather than its addon.
+const ProxyPrefix = "proxy/"
+
+// classify is the decision table.
+func classify(o *unstructured.Unstructured, pc pruneContext) Orphan {
 	out := Orphan{Object: o}
 	switch o.GetKind() {
 	case render.KindHelmChartProxy:
-		name := o.GetLabels()[render.AddonLabelKey]
-		entry, known := lookupAddon(name)
-		switch {
-		case known && !entry.Protected:
-			out.Action, out.Why = PruneDelete, "addon "+name+" is no longer in hydra.yaml; deleting its proxy uninstalls it"
-		case name != "" && slices.Contains(opts.AllowRemove, name):
-			out.Action, out.Why = PruneDelete, "addon "+name+" removal allowed by --allow-remove; deleting its proxy uninstalls it"
-		case known:
-			out.Action, out.Why = PruneRefused, fmt.Sprintf("addon %s is protected; put it back in hydra.yaml, or pass --allow-remove=%s to uninstall it", name, name)
-		default:
-			key := name
-			if key == "" {
-				key = o.GetName()
-			}
-			if slices.Contains(opts.AllowRemove, key) {
-				out.Action, out.Why = PruneDelete, "removal allowed by --allow-remove; deleting the proxy uninstalls its release"
-			} else {
-				out.Action, out.Why = PruneRefused, fmt.Sprintf("not an addon this hydra knows, so not removed on its own; pass --allow-remove=%s to uninstall it", key)
-			}
-		}
+		out.Action, out.Why = classifyProxy(o, pc)
 	case kindHydraMachineTemplate, kindKubeadmConfigTemplate:
-		if inUse[o.GetKind()+"/"+o.GetName()] {
+		if pc.inUse[o.GetKind()+"/"+o.GetName()] {
 			out.Action, out.Why = PruneInUse, "a machine, MachineSet or the control plane still uses it; a later apply removes it"
 		} else {
 			out.Action, out.Why = PruneDelete, "superseded and unused"
 		}
 	case mdGVK.Kind:
-		if opts.Pools {
-			out.Action, out.Why = PruneDelete, "pool removed from hydra.yaml; --prune-pools deletes its machines and VMs"
+		pool := strings.TrimPrefix(o.GetName(), pc.cluster+"-")
+		if slices.Contains(pc.opts.Pools, pool) || slices.Contains(pc.opts.Pools, o.GetName()) {
+			out.Action, out.Why = PruneDelete, "pool removed from hydra.yaml; --prune-pools="+pool+" deletes its machines and VMs"
 		} else {
-			out.Action, out.Why = PruneNeedsFlag, "pool removed from hydra.yaml; deleting it deletes its machines and VMs, so it needs --prune-pools"
+			out.Action, out.Why = PruneNeedsFlag, "pool removed from hydra.yaml; deleting it deletes its machines and VMs, so it needs --prune-pools="+pool
 		}
 	default:
 		// The Cluster's own objects and the CNI's are never pruned: they are
@@ -103,6 +102,34 @@ func classify(o *unstructured.Unstructured, opts PruneOptions, inUse map[string]
 		out.Action, out.Why = PruneNever, "apply never deletes a "+o.GetKind()
 	}
 	return out
+}
+
+// classifyProxy decides a HelmChartProxy. Without a flag apply deletes only
+// hydra's own proxy (named <cluster>-<addon>) for a catalogued, unprotected
+// addon hydra.yaml no longer lists. Deleting a proxy uninstalls its release,
+// and any proxy for the same addon shares that release, so anything else is
+// removed only when named.
+func classifyProxy(o *unstructured.Unstructured, pc pruneContext) (PruneAction, string) {
+	name := o.GetLabels()[render.AddonLabelKey]
+	byProxy := ProxyPrefix + o.GetName()
+	allowedProxy := slices.Contains(pc.opts.AllowRemove, byProxy)
+	hydras := name != "" && o.GetName() == render.AddonName(pc.cluster, name)
+	entry, known := lookupAddon(name)
+	switch {
+	case allowedProxy:
+		return PruneDelete, "removal allowed by --allow-remove=" + byProxy + "; deleting the proxy uninstalls its release"
+	case name != "" && pc.renderedAddons[name]:
+		return PruneRefused, fmt.Sprintf("another proxy for addon %s, which hydra.yaml still lists; deleting it would uninstall the release the addon uses. Remove it by hand, or pass --allow-remove=%s", name, byProxy)
+	case !hydras:
+		return PruneRefused, "not a proxy hydra made, so not removed on its own; pass --allow-remove=" + byProxy + " to uninstall its release"
+	case known && !entry.Protected:
+		return PruneDelete, "addon " + name + " is no longer in hydra.yaml; deleting its proxy uninstalls it"
+	case slices.Contains(pc.opts.AllowRemove, name):
+		return PruneDelete, "addon " + name + " removal allowed by --allow-remove; deleting its proxy uninstalls it"
+	case known:
+		return PruneRefused, fmt.Sprintf("addon %s is protected; put it back in hydra.yaml, or pass --allow-remove=%s to uninstall it", name, name)
+	}
+	return PruneRefused, fmt.Sprintf("addon %s is not one this hydra knows, so not removed on its own; pass --allow-remove=%s to uninstall it", name, name)
 }
 
 // lookupAddon finds a catalogue entry; tests replace it to cover protected
@@ -131,6 +158,12 @@ func (m *Manager) PlanPrune(ctx context.Context, objs []*unstructured.Unstructur
 	if err != nil {
 		return nil, err
 	}
+	pc := pruneContext{cluster: cluster, opts: opts, inUse: inUse, renderedAddons: map[string]bool{}}
+	for _, o := range objs {
+		if o.GetKind() == render.KindHelmChartProxy {
+			pc.renderedAddons[o.GetLabels()[render.AddonLabelKey]] = true
+		}
+	}
 	var out []Orphan
 	for _, gvk := range ownedKinds {
 		items, err := m.listLabelled(ctx, namespace, cluster, gvk)
@@ -142,7 +175,7 @@ func (m *Manager) PlanPrune(ctx context.Context, objs []*unstructured.Unstructur
 			if rendered[o.GetKind()+"/"+o.GetName()] || o.GetDeletionTimestamp() != nil {
 				continue
 			}
-			out = append(out, classify(o, opts, inUse))
+			out = append(out, classify(o, pc))
 		}
 	}
 	slices.SortFunc(out, func(a, b Orphan) int { return strings.Compare(describe(a.Object), describe(b.Object)) })
@@ -164,8 +197,9 @@ func Refusals(orphans []Orphan) error {
 }
 
 // Prune deletes the orphans marked PruneDelete, each only if it is still the
-// version that was classified, and returns how many it deleted.
-func (m *Manager) Prune(ctx context.Context, orphans []Orphan) (int, error) {
+// version that was classified, and returns how many it deleted and how many
+// it skipped because they changed after they were classified.
+func (m *Manager) Prune(ctx context.Context, orphans []Orphan) (deleted, skipped int, err error) {
 	n := 0
 	for _, o := range orphans {
 		if o.Action != PruneDelete {
@@ -174,14 +208,15 @@ func (m *Manager) Prune(ctx context.Context, orphans []Orphan) (int, error) {
 		switch err := m.deleteExactly(ctx, o.Object); {
 		case errors.Is(err, errChanged):
 			m.logf("skipped %s: it changed after it was checked; apply again to reconsider it", describe(o.Object))
+			skipped++
 		case err != nil:
-			return n, fmt.Errorf("pruning %s: %w", describe(o.Object), err)
+			return n, skipped, fmt.Errorf("pruning %s: %w", describe(o.Object), err)
 		default:
 			m.logf("pruned %s (%s)", describe(o.Object), o.Why)
 			n++
 		}
 	}
-	return n, nil
+	return n, skipped, nil
 }
 
 // templatesInUse names, as Kind/name, every machine or bootstrap template
@@ -195,18 +230,22 @@ func (m *Manager) templatesInUse(ctx context.Context, namespace, cluster string)
 			inUse[kind+"/"+name] = true
 		}
 	}
+	hmt := schema.GroupVersionKind{Group: infraGroup, Version: infraVersion, Kind: kindHydraMachineTemplate}
+	kct := schema.GroupVersionKind{Group: bootstrapGroup, Version: capiVersion, Kind: kindKubeadmConfigTemplate}
 	refs := []struct {
-		gvk  schema.GroupVersionKind
-		read func(o *unstructured.Unstructured)
+		gvk schema.GroupVersionKind
+		// protects are the template kinds this kind's objects reference.
+		protects []schema.GroupVersionKind
+		read     func(o *unstructured.Unstructured)
 	}{
-		{kcpGVK, func(o *unstructured.Unstructured) {
+		{kcpGVK, []schema.GroupVersionKind{hmt}, func(o *unstructured.Unstructured) {
 			n, _, _ := unstructured.NestedString(o.Object, "spec", "machineTemplate", "spec", "infrastructureRef", "name")
 			add(kindHydraMachineTemplate, n)
 		}},
-		{mdGVK, func(o *unstructured.Unstructured) { addPoolRefs(o, add) }},
-		{msGVK, func(o *unstructured.Unstructured) { addPoolRefs(o, add) }},
-		{hydraMachineGVK, func(o *unstructured.Unstructured) { add(kindHydraMachineTemplate, o.GetAnnotations()[clonedFromName]) }},
-		{kubeadmConfigGVK, func(o *unstructured.Unstructured) { add(kindKubeadmConfigTemplate, o.GetAnnotations()[clonedFromName]) }},
+		{mdGVK, []schema.GroupVersionKind{hmt, kct}, func(o *unstructured.Unstructured) { addPoolRefs(o, add) }},
+		{msGVK, []schema.GroupVersionKind{hmt, kct}, func(o *unstructured.Unstructured) { addPoolRefs(o, add) }},
+		{hydraMachineGVK, []schema.GroupVersionKind{hmt}, func(o *unstructured.Unstructured) { add(kindHydraMachineTemplate, o.GetAnnotations()[clonedFromName]) }},
+		{kubeadmConfigGVK, []schema.GroupVersionKind{kct}, func(o *unstructured.Unstructured) { add(kindKubeadmConfigTemplate, o.GetAnnotations()[clonedFromName]) }},
 	}
 	for _, r := range refs {
 		list := &unstructured.UnstructuredList{}
@@ -216,7 +255,10 @@ func (m *Manager) templatesInUse(ctx context.Context, namespace, cluster string)
 		for _, sel := range []client.MatchingLabels{{clusterNameLabel: cluster}, {render.ClusterLabelKey: cluster}} {
 			list.Items = nil
 			if err := m.C.List(ctx, list, client.InNamespace(namespace), sel); err != nil {
-				if meta.IsNoMatchError(err) {
+				// A kind not served holds no references only if the
+				// templates it would reference are not served either;
+				// otherwise "none" is a guess, and the unsafe one.
+				if meta.IsNoMatchError(err) && !m.anyServed(r.protects) {
 					break
 				}
 				return nil, fmt.Errorf("listing %s to see which templates are in use: %w", r.gvk.Kind, err)
@@ -227,6 +269,16 @@ func (m *Manager) templatesInUse(ctx context.Context, namespace, cluster string)
 		}
 	}
 	return inUse, nil
+}
+
+// anyServed reports whether the management cluster serves any of kinds.
+func (m *Manager) anyServed(kinds []schema.GroupVersionKind) bool {
+	for _, k := range kinds {
+		if _, err := m.C.RESTMapper().RESTMapping(k.GroupKind(), k.Version); err == nil || !meta.IsNoMatchError(err) {
+			return true
+		}
+	}
+	return false
 }
 
 // addPoolRefs records the templates a MachineDeployment or MachineSet uses.

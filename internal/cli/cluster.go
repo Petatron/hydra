@@ -208,14 +208,16 @@ func newApplyCommand() *cobra.Command {
 -- and then prunes: objects labelled for the cluster that hydra.yaml no longer
 renders are deleted where that is safe (ADR-002).
 
-  - An addon removed from spec.addons: its HelmChartProxy is deleted, which
-    uninstalls the addon. A protected addon is refused unless named with
-    --allow-remove; so is a proxy for an addon this hydra does not know.
+  - An addon removed from spec.addons: hydra's own HelmChartProxy for it
+    (<cluster>-<addon>) is deleted, which uninstalls the addon. A protected
+    or uncatalogued addon is refused unless named with --allow-remove; any
+    other proxy labelled for the cluster (a duplicate, one made by hand) is
+    refused unless named as --allow-remove=proxy/<name>.
   - A superseded machine or bootstrap template: deleted once no machine,
     MachineSet or control plane uses it (a later apply removes one still in
     use).
-  - A node pool removed from hydra.yaml: kept unless --prune-pools, because
-    deleting it deletes its machines and VMs.
+  - A node pool removed from hydra.yaml: kept unless named with
+    --prune-pools=<pool>, because deleting it deletes its machines and VMs.
   - The Cluster, its control plane, health check and CNI objects: never.
 
 Refusals are checked before anything is written. Run plan first: it shows
@@ -256,8 +258,8 @@ interrupted apply is finished by running it again.`,
 
 // addPruneFlags adds apply's pruning flags, which plan takes too.
 func addPruneFlags(c *cobra.Command, p *cluster.PruneOptions) {
-	c.Flags().BoolVar(&p.Pools, "prune-pools", false, "delete node pools removed from hydra.yaml, with their machines and VMs")
-	c.Flags().StringSliceVar(&p.AllowRemove, "allow-remove", nil, "addons (or uncatalogued proxies) that may be uninstalled although protected; repeat or comma-separate")
+	c.Flags().StringSliceVar(&p.Pools, "prune-pools", nil, "node pools removed from hydra.yaml to delete, with their machines and VMs, by name; repeat or comma-separate")
+	c.Flags().StringSliceVar(&p.AllowRemove, "allow-remove", nil, "protected or uncatalogued addons to uninstall although apply would refuse, by addon name, or any other proxy as proxy/<name>; repeat or comma-separate")
 }
 
 type createOptions struct {
@@ -396,13 +398,18 @@ func pruneOrReport(ctx context.Context, cmd *cobra.Command, m *cluster.Manager, 
 		if err != nil {
 			return fmt.Errorf("applied, but could not work out what to prune (run apply again): %w", err)
 		}
-		if _, err := m.Prune(ctx, orphans); err != nil {
+		_, skipped, err := m.Prune(ctx, orphans)
+		if err != nil {
 			return fmt.Errorf("applied, but %w (run apply again)", err)
 		}
 		for _, or := range orphans {
 			if or.Action != cluster.PruneDelete {
 				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "%s\n", or)
 			}
+		}
+		if skipped > 0 {
+			// Not done: a script must not read this as a finished apply.
+			return fmt.Errorf("applied, but %d object(s) to prune changed while apply ran and were left; run apply again", skipped)
 		}
 		return nil
 	}
