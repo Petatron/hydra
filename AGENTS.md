@@ -29,7 +29,7 @@ Commands, in delivery order (Linear project *Hydra — Reliability & Productizat
 | `hydra cluster delete --self-hosted`, `--finish-split` | PET-87 | implemented, proven on hardware |
 | `hydra cluster upgrade` | PET-24 | implemented (hardware proof pending) |
 | `spec.addons` (CAAPH, catalogue in `internal/addons`) | PET-98 | implemented |
-| `hydra cluster apply` (create + scoped pruning) | PET-99 | implemented |
+| `hydra cluster apply` (create + scoped pruning) | PET-99 | implemented, kind e2e (hardware proof pending) |
 
 ## Layout
 
@@ -80,7 +80,7 @@ make golden        # regenerate golden files after an intended output change
 make lint          # golangci-lint, built with the pinned toolchain (see below)
 make verify        # go.mod tidy + gofmt
 make cilium        # regenerate the embedded Cilium manifest (needs helm)
-make e2e           # kind management cluster via `hydra bootstrap`, dry-run every example (needs Docker)
+make e2e           # kind management cluster via `hydra bootstrap`, dry-run every example, apply + prune (needs Docker)
 make vuln          # govulncheck
 make actionlint    # lint .github/workflows
 make dist          # release binaries + checksums into dist/

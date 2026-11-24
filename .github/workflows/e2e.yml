@@ -3,8 +3,9 @@ name: E2E
 # hydra against a real management cluster, with no lab: `hydra bootstrap`
 # creates a kind cluster and installs cert-manager, Cluster API and the Hydra
 # provider from its release; every example is then rendered and server-side
-# dry-run against it, so a template the CRDs or webhooks reject fails here.
-# See hack/e2e/run.sh.
+# dry-run against it, so a template the CRDs or webhooks reject fails here;
+# then `hydra cluster apply` creates a cluster's objects and prunes, refuses
+# and keeps what hydra.yaml stops listing. See hack/e2e/run.sh.
 on:
   pull_request:
     paths:
