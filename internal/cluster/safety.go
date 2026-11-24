@@ -26,7 +26,12 @@ import (
 var (
 	hydraClusterGVK = schema.GroupVersionKind{Group: infraGroup, Version: infraVersion, Kind: "HydraCluster"}
 	mdGVK           = schema.GroupVersionKind{Group: capiGroup, Version: capiVersion, Kind: "MachineDeployment"}
+	// hcpGVK is CAAPH's per-addon object (ADR-002).
+	hcpGVK = schema.GroupVersionKind{Group: addonsGroup, Version: "v1alpha1", Kind: render.KindHelmChartProxy}
 )
+
+// addonsGroup holds ClusterResourceSets and CAAPH's HelmChartProxies.
+const addonsGroup = "addons.cluster.x-k8s.io"
 
 // ownedKinds are every kind render produces that this CLI may find again by
 // the hydra.io/cluster label: to report as orphaned, or to delete.
@@ -37,8 +42,12 @@ var ownedKinds = []schema.GroupVersionKind{
 	{Group: capiGroup, Version: capiVersion, Kind: "MachineHealthCheck"},
 	{Group: "bootstrap.cluster.x-k8s.io", Version: capiVersion, Kind: "KubeadmConfigTemplate"},
 	{Group: infraGroup, Version: infraVersion, Kind: kindHydraMachineTemplate},
-	{Group: "addons.cluster.x-k8s.io", Version: capiVersion, Kind: "ClusterResourceSet"},
+	{Group: addonsGroup, Version: capiVersion, Kind: "ClusterResourceSet"},
 	{Group: "", Version: "v1", Kind: kindConfigMap},
+	// Last, so delete removes addons only after the machines are gone: a
+	// HelmChartProxy deleted while its cluster still runs uninstalls the
+	// release there.
+	hcpGVK,
 }
 
 // CheckManagementCluster fails, before anything is written, when the target
@@ -50,6 +59,24 @@ func (m *Manager) CheckManagementCluster() error {
 	}
 	return nil
 }
+
+// CheckAddonProvider fails, before anything is written, when objs hold a
+// HelmChartProxy but the management cluster has no Cluster API Add-on
+// Provider Helm to reconcile it.
+func (m *Manager) CheckAddonProvider(objs []*unstructured.Unstructured) error {
+	if !slices.ContainsFunc(objs, func(o *unstructured.Unstructured) bool { return o.GetKind() == render.KindHelmChartProxy }) {
+		return nil
+	}
+	if _, err := m.C.RESTMapper().RESTMapping(hcpGVK.GroupKind(), hcpGVK.Version); err != nil {
+		return fmt.Errorf("hydra.yaml lists addons, but the management cluster has no Cluster API Add-on Provider Helm (no %s %s): `hydra bootstrap` installs it on a new management cluster; on an existing one install it with `clusterctl init --addon helm:%s`, or remove spec.addons (%w)",
+			hcpGVK.GroupVersion(), hcpGVK.Kind, AddonProviderVersion, err)
+	}
+	return nil
+}
+
+// AddonProviderVersion is the CAAPH release this CLI renders for; it must
+// match bootstrap.CAAPHVersion (a test keeps them equal).
+const AddonProviderVersion = "v0.6.6"
 
 // ClusterState is what create and delete need to know about the Cluster
 // before acting.

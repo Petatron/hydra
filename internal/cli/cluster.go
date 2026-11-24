@@ -215,6 +215,9 @@ func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.C
 	if err := m.CheckManagementCluster(); err != nil {
 		return "", err
 	}
+	if err := m.CheckAddonProvider(objs); err != nil {
+		return "", err
+	}
 	st, err := m.State(ctx, ns, name)
 	if err != nil {
 		return "", err
@@ -327,6 +330,9 @@ anything stored locally.`,
 			if err != nil {
 				return err
 			}
+			if err := t.m.CheckAddonProvider(objs); err != nil {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "! addons: create refuses this: %v\n", err)
+			}
 			if unprotected, err := t.m.UnprotectedRoll(contextOf(cmd), objs, cfg.Metadata.Namespace, cfg.Metadata.Name); err != nil {
 				return err
 			} else if unprotected {
@@ -420,6 +426,13 @@ func newStatusCommand() *cobra.Command {
 			if s.AvailableMessage != "" && s.Available != cluster.ConditionTrue {
 				out += "  " + s.AvailableMessage + "\n"
 			}
+			var addonLines strings.Builder
+			for _, a := range s.Addons {
+				if a.Message != "" {
+					addonLines.WriteString("  addon " + a.Name + ": " + strings.Join(strings.Fields(a.Message), " ") + "\n")
+				}
+			}
+			out += addonLines.String()
 			_, err = io.WriteString(cmd.OutOrStdout(), out)
 			return err
 		},

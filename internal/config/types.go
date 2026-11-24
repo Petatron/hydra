@@ -61,6 +61,22 @@ type ClusterSpec struct {
 	Network      NetworkSpec      `json:"network"`
 	ControlPlane ControlPlaneSpec `json:"controlPlane"`
 	NodePools    []NodePoolSpec   `json:"nodePools,omitempty"`
+
+	// Addons are platform addons from hydra's catalogue (internal/addons),
+	// each installed by Cluster API Add-on Provider Helm (ADR-002).
+	Addons []AddonSpec `json:"addons,omitempty"`
+}
+
+// AddonSpec selects one catalogue addon.
+type AddonSpec struct {
+	// Name is the catalogue entry, e.g. metrics-server.
+	Name string `json:"name"`
+	// Version is the chart version, one the catalogue allows. Defaults to the
+	// catalogue's default for this addon.
+	Version string `json:"version,omitempty"`
+	// Params are the addon's declared settings; unset ones take their
+	// defaults. Raw Helm values are not accepted.
+	Params map[string]any `json:"params,omitempty"`
 }
 
 // HypervisorSpec points the cluster at a hypervisor.

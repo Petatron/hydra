@@ -54,7 +54,7 @@ var (
 	clusterGVK = schema.GroupVersionKind{Group: capiGroup, Version: capiVersion, Kind: "Cluster"}
 	kcpGVK     = schema.GroupVersionKind{Group: "controlplane.cluster.x-k8s.io", Version: capiVersion, Kind: "KubeadmControlPlane"}
 	machineGVK = schema.GroupVersionKind{Group: capiGroup, Version: capiVersion, Kind: "Machine"}
-	bindingGVK = schema.GroupVersionKind{Group: "addons.cluster.x-k8s.io", Version: capiVersion, Kind: "ClusterResourceSetBinding"}
+	bindingGVK = schema.GroupVersionKind{Group: addonsGroup, Version: capiVersion, Kind: "ClusterResourceSetBinding"}
 )
 
 // Manager acts on one management cluster.
@@ -332,6 +332,8 @@ type Summary struct {
 	// hydra ClusterResourceSet installs its CNI (cni: external): something
 	// else does, and CNIApplied and CNIBindingPresent say nothing.
 	CNIExternal bool
+	// Addons are the cluster's HelmChartProxies, as CAAPH reports them.
+	Addons []AddonState
 	// RolledOut is true when the control plane and every MachineDeployment
 	// have observed their latest spec and have all replicas up to date, so a
 	// rerun after a change does not report success before the rollout.
@@ -386,7 +388,52 @@ func (s Summary) Line() string {
 	default:
 		parts = append(parts, "CNI waiting for the API")
 	}
+	if len(s.Addons) > 0 {
+		var ad []string
+		for _, a := range s.Addons {
+			state := "ready"
+			if a.Ready != ConditionTrue {
+				state = "not ready"
+			}
+			ad = append(ad, a.Name+" "+a.Version+" "+state)
+		}
+		parts = append(parts, "addons: "+strings.Join(ad, ", "))
+	}
 	return strings.Join(parts, " · ")
+}
+
+// AddonState is one addon's progress, as CAAPH reports it on its
+// HelmChartProxy.
+type AddonState struct {
+	Name, Version string
+	// Ready is the proxy's Ready condition status ("" if not yet reported).
+	Ready   string
+	Message string
+}
+
+func addonState(hcp *unstructured.Unstructured) AddonState {
+	a := AddonState{Name: hcp.GetLabels()[render.AddonLabelKey]}
+	if a.Name == "" {
+		a.Name = hcp.GetName()
+	}
+	a.Version, _, _ = unstructured.NestedString(hcp.Object, "spec", "version")
+	if c := condition(hcp, "Ready"); c != nil {
+		a.Ready, _ = c["status"].(string)
+		if a.Ready != ConditionTrue {
+			a.Message, _ = c["message"].(string)
+		}
+	}
+	return a
+}
+
+// AddonsReady reports whether every addon's proxy is Ready.
+func (s Summary) AddonsReady() bool {
+	for _, a := range s.Addons {
+		if a.Ready != ConditionTrue {
+			return false
+		}
+	}
+	return true
 }
 
 func orDash(s string) string {
@@ -454,6 +501,14 @@ func (m *Manager) Status(ctx context.Context, namespace, name string) (Summary, 
 	for _, mc := range machines.Items {
 		phase, _, _ := unstructured.NestedString(mc.Object, "status", "phase")
 		s.Machines[orDash(phase)]++
+	}
+
+	hcps, err := m.listLabelled(ctx, namespace, name, hcpGVK)
+	if err != nil {
+		return s, err
+	}
+	for i := range hcps {
+		s.Addons = append(s.Addons, addonState(&hcps[i]))
 	}
 
 	if s.CNIExternal {

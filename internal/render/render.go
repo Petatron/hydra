@@ -19,6 +19,7 @@ import (
 
 	"sigs.k8s.io/yaml"
 
+	"github.com/Petatron/hydra/internal/addons"
 	"github.com/Petatron/hydra/internal/config"
 )
 
@@ -39,11 +40,15 @@ const (
 	// name, so commands can find all of a cluster's objects (to delete what
 	// Cluster API does not own) without needing hydra.yaml to still validate.
 	ClusterLabelKey = "hydra.io/cluster"
+	// AddonLabelKey names the catalogue addon a HelmChartProxy installs.
+	AddonLabelKey = "hydra.io/addon"
 )
 
 const (
 	kindConfigMap          = "ConfigMap"
 	kindClusterResourceSet = "ClusterResourceSet"
+	// KindHelmChartProxy is CAAPH's per-addon object.
+	KindHelmChartProxy = "HelmChartProxy"
 )
 
 // Sentinels hack/gen-cilium.sh renders in place of the per-cluster values.
@@ -216,6 +221,97 @@ func Render(c *config.ClusterConfig, opts Options) ([]byte, error) {
 			return nil, err
 		}
 		out.Write(cni)
+	}
+	add, err := renderAddons(c)
+	if err != nil {
+		return nil, err
+	}
+	out.Write(add)
+	return out.Bytes(), nil
+}
+
+// helmChartProxy is the part of CAAPH's HelmChartProxy render writes.
+type helmChartProxy struct {
+	APIVersion string             `json:"apiVersion"`
+	Kind       string             `json:"kind"`
+	Metadata   objectMeta         `json:"metadata"`
+	Spec       helmChartProxySpec `json:"spec"`
+}
+
+type objectMeta struct {
+	Name      string            `json:"name"`
+	Namespace string            `json:"namespace"`
+	Labels    map[string]string `json:"labels,omitempty"`
+}
+
+type labelSelector struct {
+	MatchLabels map[string]string `json:"matchLabels"`
+}
+
+type helmChartProxySpec struct {
+	ClusterSelector   labelSelector `json:"clusterSelector"`
+	RepoURL           string        `json:"repoURL"`
+	ChartName         string        `json:"chartName"`
+	Version           string        `json:"version"`
+	ReleaseName       string        `json:"releaseName"`
+	Namespace         string        `json:"namespace"`
+	ReconcileStrategy string        `json:"reconcileStrategy"`
+	ValuesTemplate    string        `json:"valuesTemplate"`
+}
+
+// AddonName is the HelmChartProxy's name for one of a cluster's addons.
+func AddonName(cluster, addon string) string { return cluster + "-" + addon }
+
+// renderAddons returns one HelmChartProxy per spec.addons entry (ADR-002).
+// CAAPH installs each on the Cluster it selects: by the cluster label hydra
+// puts on the Cluster, in the Cluster's namespace.
+//
+// Values are filled in here, not with CAAPH's valuesTemplate templating, so
+// the output shows exactly what will be installed and stays deterministic.
+// Continuous keeps the release matching the proxy. Helm options are left to
+// CAAPH's defaults: CAAPH does not copy a later change of options onto an
+// existing release (PET-97), so any option added here later reaches only
+// clusters whose addon is installed after that change.
+func renderAddons(c *config.ClusterConfig) ([]byte, error) {
+	var out bytes.Buffer
+	for _, a := range c.Spec.Addons {
+		entry, ok := addons.Lookup(a.Name)
+		if !ok {
+			return nil, fmt.Errorf("addon %q is not in the catalogue", a.Name)
+		}
+		params, problems := entry.Resolve(a.Params)
+		if len(problems) > 0 {
+			return nil, fmt.Errorf("addon %s: %s", a.Name, strings.Join(problems, "; "))
+		}
+		values, err := yaml.Marshal(entry.Values(params))
+		if err != nil {
+			return nil, err
+		}
+		hcp := helmChartProxy{
+			APIVersion: "addons.cluster.x-k8s.io/v1alpha1",
+			Kind:       KindHelmChartProxy,
+			Metadata: objectMeta{
+				Name:      AddonName(c.Metadata.Name, a.Name),
+				Namespace: c.Metadata.Namespace,
+				Labels:    map[string]string{ClusterLabelKey: c.Metadata.Name, AddonLabelKey: a.Name},
+			},
+			Spec: helmChartProxySpec{
+				ClusterSelector:   labelSelector{MatchLabels: map[string]string{ClusterLabelKey: c.Metadata.Name}},
+				RepoURL:           entry.RepoURL,
+				ChartName:         entry.Chart,
+				Version:           a.Version,
+				ReleaseName:       entry.ReleaseName,
+				Namespace:         entry.Namespace,
+				ReconcileStrategy: "Continuous",
+				ValuesTemplate:    string(values),
+			},
+		}
+		b, err := yaml.Marshal(hcp)
+		if err != nil {
+			return nil, err
+		}
+		fmt.Fprintf(&out, "---\n# Addon %s %s, installed and kept in step by Cluster API Add-on Provider Helm.\n", a.Name, a.Version)
+		out.Write(b)
 	}
 	return out.Bytes(), nil
 }

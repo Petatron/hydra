@@ -47,9 +47,9 @@ func newVersionCommand() *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			_, err := fmt.Fprintf(cmd.OutOrStdout(),
 				"hydra %s\n  kubernetes (default) %s\n  cilium %s\n  kube-vip %s\n"+
-					"  bootstrap: kind node %s\n  bootstrap: cert-manager %s, cluster-api %s, hydra provider %s\n",
+					"  bootstrap: kind node %s\n  bootstrap: cert-manager %s, cluster-api %s, hydra provider %s, addon provider helm %s\n",
 				Version, config.DefaultKubernetesVersion, render.CiliumVersion, render.KubeVIPImage,
-				bootstrap.NodeImage, bootstrap.CertManagerVersion, bootstrap.CAPIVersion, bootstrap.HydraVersion)
+				bootstrap.NodeImage, bootstrap.CertManagerVersion, bootstrap.CAPIVersion, bootstrap.HydraVersion, bootstrap.CAAPHVersion)
 			return err
 		},
 	}

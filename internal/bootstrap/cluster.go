@@ -136,6 +136,8 @@ func inventoryName(typ, name string) string {
 		return "control-plane-" + name
 	case clusterctlv1.InfrastructureProviderType:
 		return "infrastructure-" + name
+	case clusterctlv1.AddonProviderType:
+		return "addon-" + name
 	}
 	return typ + "/" + name
 }
@@ -284,6 +286,8 @@ func initOptions(kubeconfigPath string, providers []Provider) (clusterctl.InitOp
 			opts.ControlPlaneProviders = append(opts.ControlPlaneProviders, p.Ref)
 		case InfrastructureProvider:
 			opts.InfrastructureProviders = append(opts.InfrastructureProviders, p.Ref)
+		case AddonProvider:
+			opts.AddonProviders = append(opts.AddonProviders, p.Ref)
 		default:
 			return opts, fmt.Errorf("unknown provider kind %q", p.Kind)
 		}

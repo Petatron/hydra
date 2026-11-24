@@ -31,6 +31,11 @@ const (
 	// MinHydraVersion is the oldest Hydra provider whose schema accepts what
 	// render produces (preDrainHook, PET-88).
 	MinHydraVersion = "v0.2.0"
+	// CAAPHVersion is Cluster API Add-on Provider Helm, which installs the
+	// addons in spec.addons (ADR-002). Proven against CAPIVersion in kind
+	// (PET-97): install, upgrade, uninstall, clusterctl move, and Cilium on
+	// NotReady nodes.
+	CAAPHVersion = "v0.6.6"
 
 	// HydraComponentsURL is where clusterctl finds the Hydra provider: the
 	// pinned release itself, so no "latest" lookup (and no GitHub API call to
@@ -74,6 +79,7 @@ const (
 	BootstrapProvider      ProviderKind = "bootstrap"
 	ControlPlaneProvider   ProviderKind = "control-plane"
 	InfrastructureProvider ProviderKind = "infrastructure"
+	AddonProvider          ProviderKind = "addon"
 )
 
 // Providers returns the pinned provider set, core first.
@@ -83,6 +89,7 @@ func Providers() []Provider {
 		{Name: "bootstrap-kubeadm", Ref: "kubeadm:" + CAPIVersion, Version: CAPIVersion, Kind: BootstrapProvider},
 		{Name: "control-plane-kubeadm", Ref: "kubeadm:" + CAPIVersion, Version: CAPIVersion, Kind: ControlPlaneProvider},
 		{Name: "infrastructure-hydra", Ref: "hydra:" + HydraVersion, Version: HydraVersion, Kind: InfrastructureProvider},
+		{Name: "addon-helm", Ref: "helm:" + CAAPHVersion, Version: CAAPHVersion, Kind: AddonProvider},
 	}
 }
 
