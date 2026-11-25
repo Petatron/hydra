@@ -336,7 +336,8 @@ func TestSummaryLineStates(t *testing.T) {
 	}{
 		{Summary{Exists: true, Terminating: true}, "Cluster is being deleted"},
 		{Summary{Exists: true, Terminating: true, DeletingMessage: "waiting for\n  2 machines"}, "Cluster is being deleted: waiting for 2 machines"},
-		{Summary{Exists: true, Available: "True", CNIApplied: true}, "Available=True · rolling out · control plane - · machines: none · CNI applied"},
+		{Summary{Exists: true, Available: "True", CNIApplied: true}, "Available=True · rolling out · control plane - · machines: none · CNI ready"},
+		{Summary{Exists: true, CNIProxyPresent: true, CNIWhy: "moving to 1.19.11"}, "Available=- · control plane - · machines: none · CNI installing (moving to 1.19.11)"},
 		{Summary{Exists: true, RolledOut: true}, "Available=- · control plane - · machines: none · CNI waiting for the API"},
 	} {
 		if got := tc.s.Line(); got != tc.want {
@@ -363,8 +364,8 @@ func TestStatusTerminatingAndMissingControlPlane(t *testing.T) {
 	if s.RolledOut {
 		t.Error("no control plane yet is not rolled out")
 	}
-	if s.CNIBindingPresent {
-		t.Error("no binding exists")
+	if s.CNIProxyPresent {
+		t.Error("no CNI release exists")
 	}
 }
 
@@ -392,7 +393,7 @@ func TestStatusReadErrors(t *testing.T) {
 		{"Cluster", "", "forbidden"},
 		{"KubeadmControlPlane", "", "reading KubeadmControlPlane"},
 		{"", "MachineList", "listing Machines"},
-		{"ClusterResourceSetBinding", "", "reading ClusterResourceSetBinding"},
+		{"HelmChartProxy", "", "reading the CNI HelmChartProxy"},
 	} {
 		_, err := (&Manager{C: failOn(tc.getKind, tc.listKind)}).Status(context.Background(), "ns", "c")
 		if err == nil || !strings.Contains(err.Error(), tc.want) {

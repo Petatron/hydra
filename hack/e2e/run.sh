@@ -10,7 +10,10 @@
 #      deleted, an addon it does not know is refused before anything is
 #      written, and a removed pool is kept until --prune-pools names it. The
 #      hypervisor never resolves, so no VM is made;
-#   4. the bootstrap cluster is deleted, whatever happened.
+#   4. dropping the CNI (cni: external) is refused by plan and apply, even
+#      with --allow-remove, and the Cilium proxy and the Cluster's CNI label
+#      stay;
+#   5. the bootstrap cluster is deleted, whatever happened.
 #
 # Needs Docker (or Podman/nerdctl), kubectl, openssl and Go. Run from the repo
 # root: ./hack/e2e/run.sh
@@ -36,7 +39,11 @@ cleanup() {
   # ${work:?} refuses to expand if work were ever empty.
   rm -r -- "${work:?}"
 }
-trap cleanup EXIT INT TERM
+# On INT or TERM, clean up and stop: a trap that only cleaned up would let
+# the script carry on without its work directory. EXIT cleans up otherwise.
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 echo "--- building hydra"
 (cd "$root" && go build -o "$hydra" ./cmd/hydra)
@@ -265,5 +272,26 @@ if [ "$hmt2" != "$hmt" ] || [ "$kct2" != "$kct" ]; then
 fi
 expect hydramachinetemplate "$hmt" live
 expect kubeadmconfigtemplate "$kct" live
+
+echo "--- the CNI is never removed, not even with --allow-remove"
+# cni: external would drop the Cluster's CNI label and orphan the Cilium
+# proxy; Cluster API Add-on Provider Helm would then uninstall Cilium from the
+# running cluster. Cilium is the catalogue's first protected addon.
+external="$work/external.yaml"
+awk '{print} /^    bridges: \[br0\]$/ {print "    cni: external"}' "$cfg" >"$external"
+grep -q '^    cni: external$' "$external"
+run plan-cni "$hydra" cluster plan -f "$external" --allow-remove=cilium
+says plan-cni "! refused HelmChartProxy $ns/$name-cilium"
+says plan-cni "not even with --allow-remove"
+says plan-cni "would uninstall Cilium from the running cluster"
+refused apply-cni "$hydra" cluster apply -f "$external" --wait=false
+says apply-cni "would uninstall Cilium from the running cluster"
+lacks apply-cni "applied "
+refused apply-cni-allowed "$hydra" cluster apply -f "$external" --wait=false --allow-remove=cilium "--allow-remove=proxy/$name-cilium"
+lacks apply-cni-allowed "applied "
+expect helmchartproxy "$name-cilium" live
+kubectl get cluster -n "$ns" "$name" -o 'jsonpath={.metadata.labels.cni\.hydra\.io/cilium}' >"$work/label.out"
+[ "$(cat "$work/label.out")" = "$name" ] || { echo "FAIL: the Cluster lost its CNI label" >&2; exit 1; }
+echo "    Cluster $ns/$name keeps cni.hydra.io/cilium=$name"
 
 echo "--- e2e passed"

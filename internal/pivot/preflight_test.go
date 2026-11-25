@@ -122,6 +122,16 @@ func TestPivotPreflightFailures(t *testing.T) {
 			o[0].SetFinalizers([]string{"cluster.cluster.x-k8s.io"})
 			return o
 		}, want: "is being deleted; not moving it"},
+		// Machines settled, but CAAPH does not report Cilium installed (an
+		// upgrade in progress, or failing): the move does not start.
+		{name: "CNI not installed", mutate: func(o []client.Object) []client.Object {
+			for _, x := range o {
+				if x.GetObjectKind().GroupVersionKind() == hrpGVK {
+					_ = unstructured.SetNestedSlice(x.(*unstructured.Unstructured).Object, []any{map[string]any{"type": "Ready", "status": "False", "reason": "HelmInstallOrUpgradeFailed", "observedGeneration": int64(1)}}, "status", "conditions")
+				}
+			}
+			return o
+		}, want: "does not report hydra's Cilium installed (HelmInstallOrUpgradeFailed)"},
 		{name: "no machines", mutate: func(o []client.Object) []client.Object {
 			var out []client.Object
 			for _, x := range o {
@@ -221,7 +231,7 @@ func TestPivotAcceptsReconciledAddon(t *testing.T) {
 func TestPivotRequiresTheSourceAddonsOnTheTarget(t *testing.T) {
 	src := newClient(t, append(append(clusterObjects("src", true), addonProxy("True")), labelledCRDs()...)...)
 	tgt := newClient(t, labelledCRDs()...)
-	err := pivotFor(t, src, tgt, &recorder{takeOver: true}).Run(context.Background(), 200*time.Millisecond)
+	err := pivotFor(t, src, tgt, &recorder{takeOver: true, lose: []string{"c-metrics-server"}}).Run(context.Background(), 200*time.Millisecond)
 	if err == nil || !strings.Contains(err.Error(), "addon HelmChartProxy c-metrics-server did not arrive") {
 		t.Fatalf("got %v", err)
 	}
@@ -286,12 +296,28 @@ func TestVerifyOnce(t *testing.T) {
 		{name: "only another addon on the target", mutate: func(o []client.Object) []client.Object {
 			return append(o, addonProxy("True"))
 		}, expect: []string{"c-cert-manager"}, want: "addon HelmChartProxy c-cert-manager did not arrive"},
-		{name: "CNI set missing", tgtF: []*fault{{verb: "get", kind: "ClusterResourceSet", err: errBoom}}, want: "the CNI ClusterResourceSet did not arrive"},
-		// cni: external: no CNI label, no set and no binding to carry.
+		{name: "CNI proxy unreadable", tgtF: []*fault{{verb: "get", kind: "HelmChartProxy", err: errBoom}}, want: "reading the CNI HelmChartProxy"},
+		// cni: external: no CNI label, and no CNI proxy.
 		{name: "external CNI", mutate: func(o []client.Object) []client.Object {
 			o[0].SetLabels(nil)
-			return drop(crsGVK)(drop(bindGVK)(o))
-		}, tgtF: []*fault{{verb: "get", kind: crsGVK.Kind, err: errBoom}}, want: ""},
+			return drop(hcpGVK)(drop(hrpGVK)(o))
+		}, want: ""},
+		// Settled machines, but CAAPH does not report Cilium installed (an
+		// upgrade in progress, or failing): not moved.
+		{name: "CNI not installed", mutate: func(o []client.Object) []client.Object {
+			for _, x := range o {
+				if x.GetObjectKind().GroupVersionKind() == hrpGVK {
+					_ = unstructured.SetNestedSlice(x.(*unstructured.Unstructured).Object, []any{map[string]any{"type": "Ready", "status": "False", "reason": "HelmInstallOrUpgradeFailed", "observedGeneration": int64(1)}}, "status", "conditions")
+				}
+			}
+			return o
+		}, want: "CNI installing (HelmInstallOrUpgradeFailed)"},
+		// The label was removed while hydra's proxy exists: CAAPH has
+		// uninstalled Cilium, whatever the nodes say.
+		{name: "CNI label removed", mutate: func(o []client.Object) []client.Object {
+			o[0].SetLabels(nil)
+			return o
+		}, want: "CNI uninstalled"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			src := newClient(t, tc.srcObjs...)

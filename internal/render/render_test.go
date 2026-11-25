@@ -5,12 +5,14 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 
 	"sigs.k8s.io/yaml"
 
+	"github.com/Petatron/hydra/internal/addons"
 	"github.com/Petatron/hydra/internal/config"
 )
 
@@ -130,6 +132,42 @@ func TestNoSecretsOrSentinels(t *testing.T) {
 	}
 }
 
+// ciliumProxy is the rendered CNI HelmChartProxy, or nil.
+func ciliumProxy(t *testing.T, out []byte) map[string]any {
+	t.Helper()
+	var found map[string]any
+	for d := range strings.SplitSeq(string(out), "\n---\n") {
+		var o map[string]any
+		if err := yaml.Unmarshal([]byte(d), &o); err != nil || o["kind"] != KindHelmChartProxy {
+			continue
+		}
+		md, _ := o["metadata"].(map[string]any)
+		labels, _ := md["labels"].(map[string]any)
+		if labels[AddonLabelKey] == addons.Cilium {
+			if found != nil {
+				t.Fatal("two Cilium HelmChartProxies")
+			}
+			found = o
+		}
+	}
+	return found
+}
+
+// proxyValues is a HelmChartProxy's valuesTemplate, parsed.
+func proxyValues(t *testing.T, hcp map[string]any) map[string]any {
+	t.Helper()
+	spec, _ := hcp["spec"].(map[string]any)
+	v, _ := spec["valuesTemplate"].(string)
+	var out map[string]any
+	if err := yaml.Unmarshal([]byte(v), &out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// cni: hydra renders one HelmChartProxy that selects the Cluster by its CNI
+// label, takes over from the first render, and carries the canonical values
+// with exactly the four per-cluster values changed.
 func TestCiliumCarriesClusterValues(t *testing.T) {
 	c := load(t, "../../examples/hydra-mgmt.yaml")
 	c.Spec.Network.PodCIDR = "10.50.0.0/16"
@@ -138,35 +176,82 @@ func TestCiliumCarriesClusterValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var cm, crs *object
-	var cluster *object
-	objs := documents(t, out)
-	for i := range objs {
-		switch objs[i].Kind {
-		case "ConfigMap":
-			cm = &objs[i]
-		case "ClusterResourceSet":
-			crs = &objs[i]
-		case "Cluster":
-			cluster = &objs[i]
+	hcp := ciliumProxy(t, out)
+	if hcp == nil {
+		t.Fatal("no Cilium HelmChartProxy")
+	}
+	md, _ := hcp["metadata"].(map[string]any)
+	spec, _ := hcp["spec"].(map[string]any)
+	labels, _ := md["labels"].(map[string]any)
+	sel, _ := spec["clusterSelector"].(map[string]any)
+	ml, _ := sel["matchLabels"].(map[string]any)
+	opts, _ := spec["options"].(map[string]any)
+	if md["name"] != "hydra-mgmt-cilium" || labels[ClusterLabelKey] != "hydra-mgmt" {
+		t.Errorf("metadata: %v", md)
+	}
+	if len(ml) != 1 || ml[CNILabelKey] != "hydra-mgmt" {
+		t.Errorf("selector must be the CNI label alone: %v", sel)
+	}
+	if spec["version"] != "1.19.1" || spec["chartName"] != "cilium" || spec["releaseName"] != "cilium" ||
+		spec["namespace"] != "kube-system" || spec["reconcileStrategy"] != "Continuous" || spec["repoURL"] != "https://helm.cilium.io" {
+		t.Errorf("spec: %v", spec)
+	}
+	if opts["takeOwnership"] != true {
+		t.Errorf("options: %v", opts)
+	}
+
+	got := proxyValues(t, hcp)
+	var want map[string]any
+	if err := yaml.Unmarshal(addons.CiliumValues, &want); err != nil {
+		t.Fatal(err)
+	}
+	want["cluster"].(map[string]any)["name"] = "hydra-mgmt"
+	want["ipam"].(map[string]any)["operator"].(map[string]any)["clusterPoolIPv4PodCIDRList"] = []any{"10.50.0.0/16"}
+	want["MTU"] = float64(1450)
+	want["operator"].(map[string]any)["replicas"] = float64(2)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("values differ from the canonical set with the cluster's filled in:\n got %v\nwant %v", got, want)
+	}
+
+	cluster := false
+	for _, o := range documents(t, out) {
+		if o.Kind == "Cluster" {
+			cluster = o.Metadata.Labels[CNILabelKey] == "hydra-mgmt"
 		}
 	}
-	if cm == nil || crs == nil || cluster == nil {
-		t.Fatal("missing ConfigMap, ClusterResourceSet or Cluster")
+	if !cluster {
+		t.Error("the Cluster is not labelled for its CNI proxy")
 	}
-	manifest := cm.Data["cilium.yaml"]
-	for _, want := range []string{`cluster-name: "hydra-mgmt"`, `cluster-pool-ipv4-cidr: "10.50.0.0/16"`, `mtu: "1450"`} {
-		if !strings.Contains(manifest, want) {
-			t.Errorf("Cilium manifest lacks %s", want)
+
+	c.Spec.Network.CiliumVersion = "1.19.11"
+	out, err = Render(c, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec, _ := ciliumProxy(t, out)["spec"].(map[string]any); spec["version"] != "1.19.11" {
+		t.Errorf("ciliumVersion not rendered: %v", spec["version"])
+	}
+}
+
+// A canonical values file whose sentinels moved fails render, rather than
+// installing a sentinel.
+func TestCiliumValuesNeedTheirSentinels(t *testing.T) {
+	c := load(t, "../../examples/hydra-mgmt.yaml")
+	orig := addons.CiliumValues
+	t.Cleanup(func() { addons.CiliumValues = orig })
+	for _, tc := range []struct{ from, to string }{
+		{"name: hydra-sentinel-cluster", "name: someone"},
+		{"- 10.255.254.0/24", "- 10.1.0.0/16"},
+		{"MTU: 65000", "MTU: 1500"},
+		{"  replicas: 1", "  replicas: 3"},
+	} {
+		if !bytes.Contains(orig, []byte(tc.from)) {
+			t.Fatalf("canonical values lack %q", tc.from)
 		}
-	}
-	if cluster.Metadata.Labels[CNILabelKey] != "hydra-mgmt" {
-		t.Errorf("Cluster is not labelled for its ClusterResourceSet: %v", cluster.Metadata.Labels)
-	}
-	// The tightest real limit: client-side `kubectl apply` stores the whole
-	// object in a 256KiB annotation. (A ConfigMap itself holds 1MiB.)
-	if len(manifest) > 250*1024 {
-		t.Errorf("Cilium manifest is %d bytes; client-side apply of its ConfigMap fails above 256KiB", len(manifest))
+		addons.CiliumValues = bytes.Replace(orig, []byte(tc.from), []byte(tc.to), 1)
+		if _, err := Render(c, Options{}); err == nil || !strings.Contains(err.Error(), "sentinel") {
+			t.Errorf("%s: got %v", tc.to, err)
+		}
 	}
 }
 
@@ -395,7 +480,7 @@ func TestExternalCNIRendersNoCNI(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		cut := strings.Index(string(withCNI), "---\n# Cilium ")
+		cut := strings.Index(string(withCNI), "---\n# The CNI: Cilium ")
 		if cut < 0 {
 			t.Fatalf("%s: default render has no Cilium section", name)
 		}
@@ -404,7 +489,7 @@ func TestExternalCNIRendersNoCNI(t *testing.T) {
 		if i := strings.Index(string(withCNI[cut:]), "---\n# Addon "); i >= 0 {
 			end = cut + i
 		}
-		labelLines := "\n    # Selects the ClusterResourceSet that installs Cilium.\n    " + CNILabelKey + ": " + strconv.Quote(c.Metadata.Name)
+		labelLines := "\n    # Selects the HelmChartProxy that installs Cilium. Never remove it from a\n    # running cluster: CAAPH would uninstall Cilium.\n    " + CNILabelKey + ": " + strconv.Quote(c.Metadata.Name)
 		want := strings.Replace(string(withCNI[:cut]), labelLines, "", 1) + string(withCNI[end:])
 		if want == string(withCNI[:cut])+string(withCNI[end:]) {
 			t.Fatalf("%s: default render has no CNI label on the Cluster", name)
@@ -413,7 +498,7 @@ func TestExternalCNIRendersNoCNI(t *testing.T) {
 			t.Errorf("%s: cni: external changes more than the CNI objects and label", name)
 		}
 		for _, o := range documents(t, external) {
-			if o.Kind == kindClusterResourceSet || o.Metadata.Labels[CNILabelKey] != "" {
+			if o.Kind == "ClusterResourceSet" || o.Metadata.Labels[CNILabelKey] != "" || o.Metadata.Labels[AddonLabelKey] == addons.Cilium {
 				t.Errorf("%s: %s %s is hydra's CNI", name, o.Kind, o.Metadata.Name)
 			}
 		}
@@ -421,40 +506,39 @@ func TestExternalCNIRendersNoCNI(t *testing.T) {
 }
 
 // The Cilium operator runs 2 replicas when the cluster always has at least
-// two nodes, and 1 when it can shrink to one; the two lines the chart derives
-// from the count follow it.
+// two nodes, and 1 when it can shrink to one.
 func TestOperatorReplicasFollowMinimumNodes(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		edit  func(c *config.ClusterConfig)
-		want  int
-		lines []string
+		name string
+		edit func(c *config.ClusterConfig)
+		want int
 	}{
-		{"3 control-plane nodes", func(*config.ClusterConfig) {}, 2, []string{`\n  replicas: 2\n`, `\n      maxUnavailable: 50%\n`}},
-		{"1 control-plane node, no pools", func(c *config.ClusterConfig) { c.Spec.ControlPlane.Replicas = 1 }, 1, []string{`\n  replicas: 1\n`, `\n      maxUnavailable: 100%\n`}},
+		{"3 control-plane nodes", func(*config.ClusterConfig) {}, 2},
+		{"1 control-plane node, no pools", func(c *config.ClusterConfig) { c.Spec.ControlPlane.Replicas = 1 }, 1},
 		{"1 control-plane node, a pool that scales to 0", func(c *config.ClusterConfig) {
 			c.Spec.ControlPlane.Replicas = 1
 			c.Spec.NodePools = []config.NodePoolSpec{{Name: "p", Autoscaling: &config.AutoscalingSpec{Min: 0, Max: 3}}}
-		}, 1, []string{`\n  replicas: 1\n`}},
+		}, 1},
 		{"1 control-plane node, a fixed pool", func(c *config.ClusterConfig) {
 			c.Spec.ControlPlane.Replicas = 1
 			c.Spec.NodePools = []config.NodePoolSpec{{Name: "p", Replicas: 1}}
-		}, 2, []string{`\n  replicas: 2\n`}},
+		}, 2},
 	} {
 		c := load(t, "../../examples/hydra-mgmt.yaml")
 		tc.edit(c)
 		if got := OperatorReplicas(c); got != tc.want {
 			t.Errorf("%s: OperatorReplicas = %d, want %d", tc.name, got, tc.want)
 		}
-		m, err := ciliumFor(c)
+		v, err := CiliumValues(c)
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, l := range tc.lines {
-			l = strings.ReplaceAll(l, `\n`, "\n")
-			if !strings.Contains(m, l) {
-				t.Errorf("%s: manifest lacks %q", tc.name, l)
-			}
+		var m map[string]any
+		if err := yaml.Unmarshal([]byte(v), &m); err != nil {
+			t.Fatal(err)
+		}
+		if got := m["operator"].(map[string]any)["replicas"]; got != float64(tc.want) {
+			t.Errorf("%s: operator.replicas %v, want %d", tc.name, got, tc.want)
 		}
 	}
 }
@@ -472,11 +556,13 @@ func TestAddonsRenderHelmChartProxies(t *testing.T) {
 	for d := range strings.SplitSeq(string(out), "\n---\n") {
 		var o map[string]any
 		if err := yaml.Unmarshal([]byte(d), &o); err == nil && o["kind"] == KindHelmChartProxy {
-			hcps = append(hcps, o)
+			if md, _ := o["metadata"].(map[string]any); md["name"] != "hydra-mgmt-cilium" {
+				hcps = append(hcps, o)
+			}
 		}
 	}
 	if len(hcps) != 1 {
-		t.Fatalf("want one HelmChartProxy, got %d", len(hcps))
+		t.Fatalf("want one addon HelmChartProxy besides the CNI's, got %d", len(hcps))
 	}
 	h := hcps[0]
 	md, _ := h["metadata"].(map[string]any)
@@ -498,13 +584,16 @@ func TestAddonsRenderHelmChartProxies(t *testing.T) {
 	}
 }
 
-// With no addons, nothing addon-related is rendered.
+// With no addons and cni: external, no HelmChartProxy is rendered.
 func TestNoAddonsNoHelmChartProxy(t *testing.T) {
-	out, err := Render(load(t, "../../examples/hydra-mgmt.yaml"), Options{})
+	c := load(t, "../../examples/hydra-mgmt.yaml")
+	c.Spec.Network.CNI, c.Spec.Network.MTU, c.Spec.Network.CiliumVersion = config.CNIExternal, 0, ""
+	out, err := Render(c, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(out), KindHelmChartProxy) {
-		t.Error("a HelmChartProxy rendered without spec.addons")
+		t.Error("a HelmChartProxy rendered without spec.addons or hydra's CNI")
 	}
+
 }

@@ -124,8 +124,9 @@ type NetworkSpec struct {
 	// ServiceCIDR. Default 10.96.0.0/12.
 	ServiceCIDR string `json:"serviceCIDR,omitempty"`
 	// CNI is who installs the cluster's network plugin:
-	//   hydra     hydra installs Cilium through a ClusterResourceSet once the
-	//             API is up (the default)
+	//   hydra     hydra renders a Cilium HelmChartProxy, which Cluster API
+	//             Add-on Provider Helm installs once the API is up and keeps
+	//             at CiliumVersion (the default)
 	//   external  hydra installs no CNI. Something else must (Argo CD, Helm, a
 	//             person), with a pod CIDR matching PodCIDR. Nodes stay
 	//             NotReady, and create keeps waiting, until it does.
@@ -133,6 +134,10 @@ type NetworkSpec struct {
 	// MTU for hydra's Cilium. Default 1500. Only valid with CNI hydra: an
 	// external CNI takes its MTU from its own configuration.
 	MTU int `json:"mtu,omitempty"`
+	// CiliumVersion is hydra's Cilium chart version, one of those the
+	// catalogue allows. Default: the catalogue's. Changing it upgrades
+	// Cilium on the next apply. Only valid with CNI hydra.
+	CiliumVersion string `json:"ciliumVersion,omitempty"`
 	// NodeInterface is the guest interface whose address a node registers
 	// with. Default enp1s0, the first virtio NIC.
 	NodeInterface string `json:"nodeInterface,omitempty"`

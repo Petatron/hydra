@@ -26,7 +26,6 @@ var (
 	hmtGVK = schema.GroupVersionKind{Group: infraGroup, Version: infraVersion, Kind: kindHydraMachineTemplate}
 	kctGVK = schema.GroupVersionKind{Group: bootstrapGroup, Version: capiVersion, Kind: kindKubeadmConfigTemplate}
 	mhcGVK = schema.GroupVersionKind{Group: capiGroup, Version: capiVersion, Kind: "MachineHealthCheck"}
-	crsGVK = schema.GroupVersionKind{Group: addonsGroup, Version: capiVersion, Kind: "ClusterResourceSet"}
 )
 
 // withCatalogue makes "guarded" a protected addon and "plain" an
@@ -41,6 +40,8 @@ func withCatalogue(t *testing.T) {
 			return addons.Addon{Name: name, Protected: true}, true
 		case "plain":
 			return addons.Addon{Name: name}, true
+		case addons.Cilium:
+			return orig(name)
 		}
 		return addons.Addon{}, false
 	}
@@ -84,6 +85,10 @@ func TestClassify(t *testing.T) {
 		{"hydra's proxy, protected addon, proxy/ is not enough", proxy("c-guarded", "guarded"), PruneOptions{AllowRemove: []string{"proxy/c-guarded"}}, PruneRefused, "--allow-remove=guarded"},
 		{"hydra's proxy, uncatalogued addon, proxy/ is not enough", proxy("c-gone", "gone"), PruneOptions{AllowRemove: []string{"proxy/c-gone"}}, PruneRefused, "--allow-remove=gone"},
 		{"hydra's proxy, unprotected addon, proxy/ changes nothing", proxy("c-plain", "plain"), PruneOptions{AllowRemove: []string{"proxy/c-plain"}}, PruneDelete, "no longer in hydra.yaml"},
+		{"the CNI", proxy("c-cilium", "cilium"), PruneOptions{}, PruneRefused, "not even with --allow-remove"},
+		{"the CNI, named by addon", proxy("c-cilium", "cilium"), PruneOptions{AllowRemove: []string{"cilium"}}, PruneRefused, "the CNI"},
+		{"the CNI, named by proxy", proxy("c-cilium", "cilium"), PruneOptions{AllowRemove: []string{"proxy/c-cilium"}}, PruneRefused, "the CNI"},
+		{"another proxy for the CNI, named by proxy", proxy("c-cilium-copy", "cilium"), PruneOptions{AllowRemove: []string{"proxy/c-cilium-copy"}}, PruneRefused, "the CNI"},
 		{"duplicate proxy allowed by proxy name", proxy("c-kept-copy", "kept"), PruneOptions{AllowRemove: []string{"proxy/c-kept-copy"}}, PruneDelete, ""},
 		{"not named like hydra's, unprotected addon", proxy("handmade", "plain"), PruneOptions{}, PruneRefused, "--allow-remove=proxy/handmade"},
 		{"proxy without addon label", proxy("c-hand", ""), PruneOptions{}, PruneRefused, "--allow-remove=proxy/c-hand"},

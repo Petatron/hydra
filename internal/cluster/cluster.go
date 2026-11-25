@@ -27,6 +27,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 
+	"github.com/Petatron/hydra/internal/addons"
 	"github.com/Petatron/hydra/internal/bootstrap"
 	"github.com/Petatron/hydra/internal/render"
 )
@@ -54,8 +55,15 @@ var (
 	clusterGVK = schema.GroupVersionKind{Group: capiGroup, Version: capiVersion, Kind: "Cluster"}
 	kcpGVK     = schema.GroupVersionKind{Group: "controlplane.cluster.x-k8s.io", Version: capiVersion, Kind: "KubeadmControlPlane"}
 	machineGVK = schema.GroupVersionKind{Group: capiGroup, Version: capiVersion, Kind: "Machine"}
-	bindingGVK = schema.GroupVersionKind{Group: addonsGroup, Version: capiVersion, Kind: "ClusterResourceSetBinding"}
+	// crsGVK is the ClusterResourceSet hydra rendered for its CNI before
+	// PET-100; State looks for one left on a cluster.
+	crsGVK = schema.GroupVersionKind{Group: addonsGroup, Version: capiVersion, Kind: "ClusterResourceSet"}
+	hrpGVK = schema.GroupVersionKind{Group: addonsGroup, Version: hcpGVK.Version, Kind: "HelmReleaseProxy"}
 )
+
+// hcpNameLabel is the label CAAPH puts on a HelmReleaseProxy naming its
+// HelmChartProxy; it also sets clusterNameLabel.
+const hcpNameLabel = "helmreleaseproxy.addons.cluster.x-k8s.io/helmchartproxy-name"
 
 // Manager acts on one management cluster.
 type Manager struct {
@@ -242,10 +250,6 @@ type Change struct {
 	Result *unstructured.Unstructured
 }
 
-// cniNote explains that a changed CNI ConfigMap does not reach a running
-// cluster: its ClusterResourceSet uses ApplyOnce (see render).
-const cniNote = "the CNI ClusterResourceSet applies once: this updates the ConfigMap, but Cilium on an existing cluster is not changed"
-
 // Plan server-side dry-runs every object and compares the result with the
 // live object. Nothing is written, and nothing local is consulted: the live
 // cluster is the only "state" (ADR-001).
@@ -276,11 +280,7 @@ func (m *Manager) Plan(ctx context.Context, objs []*unstructured.Unstructured, c
 		}
 		before, after := comparable(live), comparable(dry)
 		if before != after {
-			ch := Change{Object: describe(o), Action: "update", Diff: unifiedDiff(before, after), Result: dry}
-			if o.GetKind() == kindConfigMap && o.GetLabels()[render.CNILabelKey] != "" {
-				ch.Note = cniNote
-			}
-			changes = append(changes, ch)
+			changes = append(changes, Change{Object: describe(o), Action: "update", Diff: unifiedDiff(before, after), Result: dry})
 		}
 	}
 	return changes, nil
@@ -320,18 +320,26 @@ func comparable(o *unstructured.Unstructured) string {
 
 // Summary is a cluster's progress as its controllers report it.
 type Summary struct {
-	Exists            bool
-	Available         string // condition status, "" if not yet reported
-	AvailableReason   string
-	AvailableMessage  string
-	ControlPlane      string // "ready/desired"
-	Machines          map[string]int
-	CNIApplied        bool
-	CNIBindingPresent bool
-	// CNIExternal is true when the Cluster carries no CNI label, so no
-	// hydra ClusterResourceSet installs its CNI (cni: external): something
-	// else does, and CNIApplied and CNIBindingPresent say nothing.
+	Exists           bool
+	Available        string // condition status, "" if not yet reported
+	AvailableReason  string
+	AvailableMessage string
+	ControlPlane     string // "ready/desired"
+	Machines         map[string]int
+	// CNIApplied: CAAPH reports hydra's Cilium installed at the version the
+	// proxy asks for. CNIProxyPresent: CAAPH has a HelmReleaseProxy for it,
+	// installed or not; CNIWhy is why it is not Ready yet.
+	CNIApplied      bool
+	CNIProxyPresent bool
+	CNIWhy          string
+	// CNIExternal is true when the Cluster carries no CNI label, so hydra's
+	// Cilium proxy does not select it (cni: external): something else
+	// installs the CNI, and the other CNI fields say nothing.
 	CNIExternal bool
+	// CNILabelMissing: hydra's Cilium proxy exists but the Cluster lost the
+	// label it selects by, so CAAPH has uninstalled Cilium (PET-97). Not
+	// ready, whatever the nodes say.
+	CNILabelMissing bool
 	// Addons are the cluster's HelmChartProxies, as CAAPH reports them.
 	Addons []AddonState
 	// AddonsError is why the proxies could not be read, if they could not.
@@ -347,8 +355,8 @@ type Summary struct {
 }
 
 // CNIReady reports whether the CNI no longer holds the cluster up as far as
-// hydra can tell: hydra's ClusterResourceSet applied it, or hydra does not
-// install it. An external CNI that is missing shows as Machines that never
+// hydra can tell: CAAPH installed hydra's Cilium, or hydra does not install
+// it. An external CNI that is missing shows as Machines that never
 // become Ready, which RolledOut already waits for.
 func (s Summary) CNIReady() bool { return s.CNIExternal || s.CNIApplied }
 
@@ -381,12 +389,16 @@ func (s Summary) Line() string {
 	}
 	parts = append(parts, "machines: "+strings.Join(phases, ", "))
 	switch {
+	case s.CNILabelMissing:
+		parts = append(parts, "CNI uninstalled: the Cluster lost its "+render.CNILabelKey+" label")
 	case s.CNIExternal:
 		parts = append(parts, "CNI external (not installed by hydra)")
 	case s.CNIApplied:
-		parts = append(parts, "CNI applied")
-	case s.CNIBindingPresent:
-		parts = append(parts, "CNI pending")
+		parts = append(parts, "CNI ready")
+	case s.CNIProxyPresent && s.CNIWhy != "":
+		parts = append(parts, "CNI installing ("+s.CNIWhy+")")
+	case s.CNIProxyPresent:
+		parts = append(parts, "CNI installing")
 	default:
 		parts = append(parts, "CNI waiting for the API")
 	}
@@ -533,25 +545,106 @@ func (m *Manager) Status(ctx context.Context, namespace, name string) (Summary, 
 		s.AddonsError = err.Error()
 	} else {
 		for i := range hcps {
+			// The CNI's proxy is reported as the CNI, not as an addon.
+			if hcps[i].GetLabels()[render.AddonLabelKey] == addons.Cilium {
+				continue
+			}
 			s.Addons = append(s.Addons, addonState(&hcps[i]))
 		}
 	}
 
 	if s.CNIExternal {
+		// No label, but hydra's proxy for it: the label was removed, and
+		// CAAPH uninstalled Cilium. That is no external CNI.
+		proxy, err := m.hydraCNIProxy(ctx, namespace, name)
+		if err != nil {
+			return s, fmt.Errorf("reading the CNI HelmChartProxy: %w", err)
+		}
+		if proxy {
+			s.CNIExternal, s.CNILabelMissing = false, true
+		}
 		return s, nil
 	}
-	binding := &unstructured.Unstructured{}
-	binding.SetGroupVersionKind(bindingGVK)
-	switch err := m.C.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, binding); {
-	case err == nil:
-		s.CNIBindingPresent = true
-		s.CNIApplied = bindingApplied(binding, render.CNIName(name))
-	case apierrors.IsNotFound(err), meta.IsNoMatchError(err):
-		// No binding yet: Cluster API makes it once the API is reachable.
-	default:
-		return s, fmt.Errorf("reading ClusterResourceSetBinding: %w", err)
+	if err := m.cniStatus(ctx, namespace, name, &s); err != nil {
+		return s, err
 	}
 	return s, nil
+}
+
+// cniStatus reads how far CAAPH has got installing hydra's Cilium: the
+// HelmReleaseProxy it made for the cluster from the CNI proxy. Applied means
+// Ready for the proxy's current version and the generation CAAPH last
+// reconciled, so a version change is not reported done by the old release.
+// A read that fails is an error, never "installed".
+func (m *Manager) cniStatus(ctx context.Context, namespace, name string, s *Summary) error {
+	proxy := render.CNIName(name)
+	hcp := &unstructured.Unstructured{}
+	hcp.SetGroupVersionKind(hcpGVK)
+	switch err := m.C.Get(ctx, client.ObjectKey{Namespace: namespace, Name: proxy}, hcp); {
+	case apierrors.IsNotFound(err), meta.IsNoMatchError(err):
+		return nil // not applied yet, or no CAAPH: nothing installs it
+	case err != nil:
+		return fmt.Errorf("reading the CNI HelmChartProxy: %w", err)
+	}
+	if hcp.GetDeletionTimestamp() != nil {
+		// CAAPH uninstalls the release while it cleans the proxy up; the
+		// HelmReleaseProxy may still say Ready until it is gone.
+		s.CNIProxyPresent, s.CNIWhy = true, "its HelmChartProxy is being deleted, which uninstalls Cilium"
+		return nil
+	}
+	want, _, _ := unstructured.NestedString(hcp.Object, "spec", "version")
+	hrps := &unstructured.UnstructuredList{}
+	hrps.SetGroupVersionKind(hrpGVK.GroupVersion().WithKind(hrpGVK.Kind + "List"))
+	err := m.C.List(ctx, hrps, client.InNamespace(namespace), client.MatchingLabels{clusterNameLabel: name, hcpNameLabel: proxy})
+	switch {
+	case meta.IsNoMatchError(err):
+		return nil
+	case err != nil:
+		return fmt.Errorf("listing the CNI HelmReleaseProxy: %w", err)
+	}
+	for i := range hrps.Items {
+		h := &hrps.Items[i]
+		if h.GetDeletionTimestamp() != nil {
+			continue
+		}
+		s.CNIProxyPresent = true
+		version, _, _ := unstructured.NestedString(h.Object, "spec", "version")
+		c := condition(h, "Ready")
+		switch {
+		case version != want:
+			s.CNIWhy = "moving to " + want
+		case c == nil:
+		case c["status"] == ConditionTrue && observedCurrent(h, c):
+			s.CNIApplied = true
+			s.CNIWhy = ""
+			return nil
+		case c["status"] == ConditionTrue:
+			// Ready for an older generation: CAAPH has not caught up yet.
+		default:
+			reason, _ := c["reason"].(string)
+			msg, _ := c["message"].(string)
+			s.CNIWhy = strings.TrimSpace(reason + ": " + strings.Join(strings.Fields(msg), " "))
+			s.CNIWhy = strings.TrimSuffix(strings.TrimPrefix(s.CNIWhy, ": "), ":")
+		}
+	}
+	return nil
+}
+
+// observedCurrent reports whether a condition was set for the object's
+// current generation. CAAPH sets observedGeneration on every condition (Cluster
+// API's condition setter does), so one without it is not trusted.
+func observedCurrent(o *unstructured.Unstructured, c map[string]any) bool {
+	g, ok := c["observedGeneration"]
+	if !ok {
+		return false
+	}
+	switch v := g.(type) {
+	case int64:
+		return v >= o.GetGeneration()
+	case float64:
+		return int64(v) >= o.GetGeneration()
+	}
+	return false
 }
 
 // UpToDate reports whether a KubeadmControlPlane or MachineDeployment has
@@ -587,29 +680,6 @@ func condition(o *unstructured.Unstructured, typ string) map[string]any {
 		}
 	}
 	return nil
-}
-
-// bindingApplied reports whether the ClusterResourceSet named crs has
-// applied all its resources to the cluster.
-func bindingApplied(b *unstructured.Unstructured, crs string) bool {
-	bindings, _, _ := unstructured.NestedSlice(b.Object, "spec", "bindings")
-	for _, x := range bindings {
-		bm, ok := x.(map[string]any)
-		if !ok || bm["clusterResourceSetName"] != crs {
-			continue
-		}
-		res, _ := bm["resources"].([]any)
-		if len(res) == 0 {
-			return false
-		}
-		for _, r := range res {
-			if rm, ok := r.(map[string]any); !ok || rm["applied"] != true {
-				return false
-			}
-		}
-		return true
-	}
-	return false
 }
 
 // ErrTimeout is returned when a wait ends before the cluster gets there.

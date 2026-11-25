@@ -437,14 +437,38 @@ func TestRerunResumesMidWorkers(t *testing.T) {
 	}
 }
 
-// Switching to cni: external while the Cluster keeps hydra's CNI label (another
-// field manager owns it, so the dry-run leaves it) is refused: the old
-// ClusterResourceSet still selects the cluster.
-func TestRunRefusesALeftoverCNILabel(t *testing.T) {
+// Switching to cni: external is refused on a cluster whose Cilium hydra's
+// proxy installs: the apply would drop the CNI label, which uninstalls it.
+func TestRunRefusesSwitchingAwayFromHydrasCilium(t *testing.T) {
 	cfg := loadConfig(t, "v1.35.3")
 	fc := newFakeCluster(t, cfg, "v1.35.3", nil)
 	external := loadConfig(t, "v1.35.3")
-	external.Spec.Network.CNI, external.Spec.Network.MTU = config.CNIExternal, 0
+	external.Spec.Network.CNI, external.Spec.Network.MTU, external.Spec.Network.CiliumVersion = config.CNIExternal, 0, ""
+	u, out := fc.upgrader(external, okRemote)
+	if err := u.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "would uninstall Cilium from the running cluster") {
+		t.Fatalf("got %v\n%s", err, out)
+	}
+	if len(fc.applied) != 0 {
+		t.Fatalf("applied %v", fc.applied)
+	}
+}
+
+// Switching to cni: external while the Cluster keeps hydra's CNI label (another
+// field manager owns it, so the dry-run leaves it) is refused: a selector of
+// an older hydra (its ClusterResourceSet) may still pick the cluster up. Here
+// the cluster has no CNI proxy, as one built by hydra v0.5 or earlier.
+func TestRunRefusesALeftoverCNILabel(t *testing.T) {
+	cfg := loadConfig(t, "v1.35.3")
+	fc := newFakeCluster(t, cfg, "v1.35.3", nil)
+	hcp := &unstructured.Unstructured{}
+	hcp.SetGroupVersionKind(schema.GroupVersionKind{Group: "addons.cluster.x-k8s.io", Version: "v1alpha1", Kind: "HelmChartProxy"})
+	hcp.SetNamespace("ns")
+	hcp.SetName("c-cilium")
+	if err := fc.c.Delete(context.Background(), hcp); err != nil {
+		t.Fatal(err)
+	}
+	external := loadConfig(t, "v1.35.3")
+	external.Spec.Network.CNI, external.Spec.Network.MTU, external.Spec.Network.CiliumVersion = config.CNIExternal, 0, ""
 	u, out := fc.upgrader(external, okRemote)
 	u.Kubectl = "kubectl --kubeconfig m.yaml"
 	// The server keeps a label another field manager also owns: the dry-run

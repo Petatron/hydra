@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Petatron/hydra/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Petatron/hydra/actions/workflows/ci.yml)
 [![E2E](https://github.com/Petatron/hydra/actions/workflows/e2e.yml/badge.svg?branch=main)](https://github.com/Petatron/hydra/actions/workflows/e2e.yml)
-[![Cilium drift](https://github.com/Petatron/hydra/actions/workflows/cilium-drift.yml/badge.svg?branch=main)](https://github.com/Petatron/hydra/actions/workflows/cilium-drift.yml)
+[![Cilium chart](https://github.com/Petatron/hydra/actions/workflows/cilium-chart.yml/badge.svg?branch=main)](https://github.com/Petatron/hydra/actions/workflows/cilium-chart.yml)
 [![Coverage](https://codecov.io/gh/Petatron/hydra/branch/main/graph/badge.svg)](https://codecov.io/gh/Petatron/hydra)
 [![Go](https://img.shields.io/github/go-mod/go-version/Petatron/hydra?logo=go&logoColor=white)](./go.mod)
 [![Cluster API](https://img.shields.io/badge/Cluster%20API-v1.14-326CE5?logo=kubernetes&logoColor=white)](https://cluster-api.sigs.k8s.io/)
@@ -20,8 +20,9 @@ The CLI is a **stateless orchestrator**: every cluster's desired and actual stat
 Kubernetes, never on your machine. There is no local database, cache or inventory, and an
 interrupted command can always be re-run.
 
-> **Status:** early, latest release v0.5.0. `validate`, `render`, `bootstrap`,
-> `cluster create/apply/plan/status/delete`, platform addons (`spec.addons`), the self-hosting pivot
+> **Status:** early, latest release v0.6.0. `validate`, `render`, `bootstrap`,
+> `cluster create/apply/plan/status/delete`, platform addons (`spec.addons`), Cilium through CAAPH
+> (`cni: hydra`, `spec.network.ciliumVersion`), the self-hosting pivot
 > and self-hosted teardown work today.
 
 ## Install
@@ -30,7 +31,7 @@ Release binaries for Linux and macOS (amd64 and arm64), with SHA256 sums in `che
 the [releases page](https://github.com/Petatron/hydra/releases). For example, on Linux amd64:
 
 ```bash
-v=v0.5.0; os=linux; arch=amd64
+v=v0.6.0; os=linux; arch=amd64
 curl -fsSLO https://github.com/Petatron/hydra/releases/download/$v/hydra-$os-$arch
 curl -fsSLO https://github.com/Petatron/hydra/releases/download/$v/checksums.txt
 grep " hydra-$os-$arch\$" checksums.txt | sha256sum -c -   # macOS: shasum -a 256 -c -
@@ -115,8 +116,9 @@ autoscaled node pools, are in [`examples/`](examples/).
 | `spec.image.bootstrap` | `packages` | `packages` installs containerd and Kubernetes at boot; `prebaked` expects an image that carries them |
 | `spec.network.controlPlaneEndpoint` | — | IPv4 or DNS name (port 6443 only). Required unless `managedNetwork` is set, in which case Hydra picks it |
 | `spec.network.podCIDR` / `serviceCIDR` | `10.244.0.0/16` / `10.96.0.0/12` | The pod CIDR is also Cilium's IPAM pool and must hold a /24 per node; the service CIDR may be at most a /12 |
-| `spec.network.cni` | `hydra` | `hydra` installs Cilium; `external` installs no CNI, for a CNI managed elsewhere (see below) |
+| `spec.network.cni` | `hydra` | `hydra` installs Cilium through CAAPH; `external` installs no CNI, for a CNI managed elsewhere (see below) |
 | `spec.network.mtu` | `1500` | Cilium MTU. Only with `cni: hydra` |
+| `spec.network.ciliumVersion` | `1.19.1` | Cilium chart version, one hydra allows (`1.19.1`, `1.19.11`); changing it upgrades Cilium. Only with `cni: hydra` |
 | `spec.network.nodeInterface` / `vipInterface` | `enp1s0` / derived | Guest NICs for the Node address and the API VIP |
 | `spec.controlPlane` | 3 × 4 vCPU / 8Gi / 40Gi | Replicas must be 1, 3 or 5 |
 | `spec.controlPlane.schedulable` | `true` if no node pools | Removes the control-plane taint |
@@ -132,39 +134,106 @@ hydra cluster render -f hydra.yaml -o out/    # to out/<name>.yaml
 
 The output contains the HydraCluster, Cluster, KubeadmControlPlane (with kube-vip holding the API
 endpoint), a MachineHealthCheck, a MachineDeployment for each node pool, and a
-**ClusterResourceSet that installs Cilium** once the cluster's API is up.
+**HelmChartProxy that installs Cilium** once the cluster's API is up.
 
-Cilium is configured from [`hack/cilium-values.yaml`](hack/cilium-values.yaml), the canonical
-values for every Hydra cluster. It is a template: the settings every cluster shares are cluster-pool
-IPAM, a VXLAN tunnel, kube-proxy kept, and Hubble certificates issued in the cluster by a CronJob.
-Four values are sentinels filled in per cluster: the cluster name (`metadata.name`), the pod CIDR
-(`podCIDR`), the MTU (`mtu`), and the operator's replicas, which are 2 when the cluster always has
-at least two nodes (control plane plus each pool's fixed size or autoscaling minimum) and 1
-otherwise. To install Cilium another way (with `cni: external`), copy the shared settings and set
-those four from the cluster's hydra.yaml, so a later hand-over changes nothing. Never pass the file
-to Helm unchanged: it would install the sentinels.
+Cilium is configured from [`internal/addons/cilium-values.yaml`](internal/addons/cilium-values.yaml),
+the canonical values for every Hydra cluster. It is a template: the settings every cluster shares
+are cluster-pool IPAM, a VXLAN tunnel, kube-proxy kept, and Hubble certificates issued in the
+cluster by a CronJob. Four values are sentinels filled in per cluster: the cluster name
+(`metadata.name`), the pod CIDR (`podCIDR`), the MTU (`mtu`), and the operator's replicas, which are
+2 when the cluster always has at least two nodes (control plane plus each pool's fixed size or
+autoscaling minimum) and 1 otherwise. To install Cilium another way (with `cni: external`), copy the
+shared settings and set those four from the cluster's hydra.yaml, so a later hand-over changes
+nothing. Never pass the file to Helm unchanged: it would install the sentinels.
+
+### Cilium: `cni: hydra`
+
+`cni: hydra` (the default) renders the HelmChartProxy `<cluster>-cilium`, which
+[Cluster API Add-on Provider Helm](https://github.com/kubernetes-sigs/cluster-api-addon-provider-helm)
+(CAAPH) installs on the cluster and keeps at `spec.network.ciliumVersion` (ADR-002). So the
+management cluster needs CAAPH: `hydra bootstrap` installs it, and `create` refuses without it.
+
+- **The proxy selects the Cluster by its `cni.hydra.io/cilium` label**, valued with the cluster's
+  name. hydra sets the label and never removes it, because **removing it uninstalls Cilium from the
+  running cluster**, and nodes still read Ready afterwards. Do not remove it by hand.
+- **Upgrading Cilium is a hydra.yaml change:** set `ciliumVersion` and run `apply` (`plan` shows the
+  change first). CAAPH upgrades the same release in place. The allowed versions are in the
+  catalogue (`internal/addons`); `hack/check-cilium.sh` renders the chart with hydra's values at
+  each of them, weekly and on every change.
+- `create`, `apply` and the pivot wait for CAAPH to report Cilium installed at the version asked for;
+  `status` shows `CNI installing` with CAAPH's reason until then, and `CNI uninstalled` if the
+  Cluster lost its label. A pivot refuses to start, or to finish, on a cluster without its CNI.
+- **Pin `ciliumVersion`.** Without it a cluster takes the catalogue's default, so a hydra release
+  that moves the default upgrades Cilium on your next `apply` (`plan` shows it first), and `upgrade`
+  refuses until that has been applied.
+- **hydra's Cilium is never put on a running cluster without your say-so.** For a cluster that
+  already runs, `create` and `apply` refuse `cni: hydra` unless hydra's proxy installed its CNI:
+  when the Cluster lacks the label, or carries it but hydra's proxy never installed anything (built
+  or adopted with the label, or an older hydra's ClusterResourceSet removed). Check what runs there,
+  then rerun with **`--adopt-cni`**: hydra's Cilium is installed over it, taking over Cilium objects
+  that have no Helm release. `plan --adopt-cni` previews it. A new cluster, or one whose API has not
+  come up yet, needs no flag.
+- The proxy sets `takeOwnership`, so CAAPH adopts Cilium objects that exist without a Helm release
+  (a cluster whose Cilium was installed another way) instead of failing. CAAPH applies options only
+  when it first installs, so this is set from the first render.
+- **The CNI is never removed**: not by `apply`, not with `--allow-remove`, and `create`, `apply` and
+  `upgrade` refuse to switch a cluster whose Cilium this proxy installs to `cni: external`, since
+  the switch drops the label. `plan` shows the refusal.
+
+#### Leaving hydra's Cilium
+
+Handing Cilium to another tool without uninstalling it is a break-glass procedure, proven in kind
+(PET-97) and not automated: with CAAPH running, deleting the proxy or the label uninstalls Cilium
+even if its finalizers are removed first. On the management cluster:
+
+1. Scale CAAPH to 0 (`kubectl -n caaph-system scale deployment caaph-controller-manager --replicas 0`).
+2. Set every webhook in `caaph-validating-webhook-configuration` and
+   `caaph-mutating-webhook-configuration` to `failurePolicy: Ignore`; with CAAPH down they would
+   otherwise block the next step.
+3. Remove the finalizers from the cluster's Cilium HelmReleaseProxy and HelmChartProxy, delete
+   both, and remove the Cluster's `cni.hydra.io/cilium` label.
+4. Restore the webhooks to `Fail` and scale CAAPH back to 1.
+5. Set `cni: external` in hydra.yaml. Cilium keeps running, with its Helm release, for the new owner
+   to adopt.
+
+#### Clusters on the old ClusterResourceSet
+
+hydra v0.5 and earlier installed Cilium through a ClusterResourceSet (`<cluster>-cilium`), which
+left no Helm release on the cluster. On such a cluster this hydra refuses `create`, `apply`,
+`upgrade` and the pivot with `cni: hydra`, and never switches it over on its own. To keep its
+Cilium as it is, set `cni: external`. To move it under CAAPH:
+
+1. Check that the running Cilium matches the canonical values above at the version you will set in
+   `ciliumVersion`, so the takeover changes nothing.
+2. Delete the old ClusterResourceSet and its ConfigMap on the management cluster
+   (`kubectl -n <ns> delete clusterresourceset,configmap <cluster>-cilium`). This leaves Cilium
+   running: a ClusterResourceSet never deletes what it applied.
+3. `hydra cluster plan --adopt-cni`, then `hydra cluster apply --adopt-cni`. CAAPH takes the
+   existing objects over (`takeOwnership`), and any value that differs is set right at CAAPH's next
+   resync (up to 10 minutes).
+
+This takeover was proven in kind for a Cilium without a Helm release (PET-97), not yet for one
+applied by a ClusterResourceSet on hardware.
 
 ### A CNI managed elsewhere: `cni: external`
 
-With `spec.network.cni: external`, the output has no Cilium ConfigMap, no ClusterResourceSet, and
-no `cni.hydra.io/cilium` label on the Cluster; nothing else changes. Use it when Argo CD, Helm or a
+With `spec.network.cni: external`, the output has no Cilium HelmChartProxy and no
+`cni.hydra.io/cilium` label on the Cluster; nothing else changes. Use it when Argo CD, Helm or a
 person owns the CNI, including a cluster built before hydra managed it.
 
 - The external CNI must use `podCIDR` as its pod address pool: kubeadm is given that CIDR either way.
 - Nodes stay NotReady until the CNI is installed, so `create` keeps waiting until it is. Install it
   while `create` waits, or pass `--wait=false` and follow with `status`.
 - `create` refuses `cni: hydra` for an existing Cluster that lacks the CNI label (or carries it with
-  a value other than the cluster's name, which no hydra set of this cluster selects), because
-  hydra's ClusterResourceSet would then install Cilium on top of the CNI already there. `plan` warns
-  about the same case.
-- Switching a hydra-installed cluster to `external` leaves Cilium running: the ClusterResourceSet
-  applied it once and never removes it. Whatever takes the CNI over must adopt that Cilium or
-  replace it deliberately; installing a second CNI next to it breaks pod networking. `plan` and
-  `create` list the ConfigMap and ClusterResourceSet as no longer rendered, and leave them in place.
-  Server-side apply drops the Cluster's `cni.hydra.io/cilium` label only when hydra's field manager
-  is its sole owner. A label that stays keeps the old ClusterResourceSet selecting the cluster, so
-  `create` fails after applying (rerunning is safe), `upgrade` refuses before rolling any machine,
-  and `plan` warns when its dry-run keeps the label; all three print the `kubectl label` command that removes it, aimed at the management cluster.
+  a value other than the cluster's name), because hydra's Cilium would then be installed on top of
+  the CNI already there, unless `--adopt-cni` says to (see above). `plan` warns about the same case.
+- A cluster whose Cilium hydra installs through CAAPH cannot be switched to `external` (see above).
+  For one still on the old ClusterResourceSet, `external` leaves Cilium running: the set applied it
+  once and never removes it. Server-side apply drops the Cluster's `cni.hydra.io/cilium` label only
+  when hydra's field manager is its sole owner. A label that stays keeps the old set selecting the
+  cluster, so `create` fails after applying (rerunning is safe), `upgrade` refuses before rolling
+  any machine, and `plan` warns when its dry-run keeps the label; all three print the
+  `kubectl label` command that removes it, aimed at the management cluster.
 
 ### Platform addons: `spec.addons`
 
@@ -200,7 +269,8 @@ installs CAAPH; `create` refuses a hydra.yaml with addons on a management cluste
   each one, and the reason when it is not Ready. A pivot waits for every addon to be Ready on the
   target before it deletes the bootstrap cluster.
 - **Removing an addon from hydra.yaml and running `apply` uninstalls it**; `create` leaves its
-  `HelmChartProxy` in place. Protected addons need `--allow-remove=<addon>` (see below). Deleting a
+  `HelmChartProxy` in place. Protected addons need `--allow-remove=<addon>` (see below); the CNI is
+  never removed. Deleting a
   `HelmChartProxy` by hand, or removing the Cluster's `hydra.io/cluster` label, also uninstalls the
   addon within seconds, and CAAPH has no way to keep it.
 
@@ -290,7 +360,8 @@ current kubectl context is never used.
   | Any other proxy labelled for the cluster (a duplicate, one made by hand) | refuses unless named as `--allow-remove=proxy/<name>`: a duplicate shares the release of the addon hydra.yaml still lists |
   | A superseded machine or bootstrap template | deletes it once no machine, MachineSet or control plane uses it (a later apply removes one still in use) |
   | A node pool (`MachineDeployment`) | keeps it unless named with `--prune-pools=<pool>`, because deleting it deletes its machines and VMs; a value that names more than one removed pool (a pool name can equal another pool's MachineDeployment name) refuses, and `plan` prints a value that names each alone |
-  | The control plane, `HydraCluster`, health check, CNI objects | never |
+  | The CNI's `HelmChartProxy` (`<cluster>-cilium`), or any proxy labelled for the CNI | refuses, even with `--allow-remove`: removing it uninstalls Cilium from the running cluster |
+  | The control plane, `HydraCluster`, health check, the old CNI ClusterResourceSet and ConfigMap | never |
 
   `plan` takes `--prune-pools` and `--allow-remove` too, to show exactly what `apply` with them would
   do. Like `create`, `apply` refuses a Kubernetes version change (use `upgrade`). An object that

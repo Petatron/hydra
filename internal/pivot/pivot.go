@@ -49,7 +49,7 @@ var (
 	clusterGVK      = schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: capiVersion, Kind: "Cluster"}
 	hydraMachineGVK = schema.GroupVersionKind{Group: infraGroup, Version: infraVersion, Kind: "HydraMachine"}
 	hydraClusterGVK = schema.GroupVersionKind{Group: infraGroup, Version: infraVersion, Kind: "HydraCluster"}
-	crsGVK          = schema.GroupVersionKind{Group: "addons.cluster.x-k8s.io", Version: capiVersion, Kind: "ClusterResourceSet"}
+	crsGVK          = schema.GroupVersionKind{Group: addonsGroup, Version: capiVersion, Kind: "ClusterResourceSet"}
 	crsBindingGVK   = schema.GroupVersionKind{Group: crsGVK.Group, Version: capiVersion, Kind: crsGVK.Kind + "Binding"}
 	hydraCRDs       = []string{
 		"hydraclusters.infrastructure.cluster.x-k8s.io",
@@ -107,8 +107,9 @@ type Pivot struct {
 	FinishSplit bool
 	// Rerun names the command to run again in messages; default "pivot".
 	Rerun string
-	// allowUnsettled skips preflight's Available-and-rolled-out check: set
-	// by Teardown, which must be able to remove a degraded cluster.
+	// allowUnsettled skips preflight's Available-and-rolled-out check and its
+	// CNI check: set by Teardown, which must be able to remove a degraded
+	// cluster and never waits for its CNI in kind.
 	allowUnsettled bool
 	// credentialsSecret is read from the live HydraCluster by preflight.
 	credentialsSecret string
@@ -322,7 +323,7 @@ var movableKinds = []schema.GroupVersionKind{
 	crsBindingGVK,
 	// CAAPH's objects move too (PET-97); without the CRDs they hold nothing.
 	{Group: crsGVK.Group, Version: caaphAPIVersion, Kind: render.KindHelmChartProxy},
-	{Group: crsGVK.Group, Version: caaphAPIVersion, Kind: "HelmReleaseProxy"},
+	{Group: crsGVK.Group, Version: caaphAPIVersion, Kind: kindHelmReleaseProxy},
 }
 
 // addonNames lists the cluster's HelmChartProxies by name; none when CAAPH
@@ -346,6 +347,13 @@ func (p *Pivot) addonNames(ctx context.Context, c client.Client) ([]string, erro
 
 // caaphAPIVersion is the API version of CAAPH's objects.
 const caaphAPIVersion = "v1alpha1"
+
+// addonsGroup is the API group of ClusterResourceSets and CAAPH's objects;
+// kindHelmReleaseProxy is CAAPH's per-cluster release object.
+const (
+	addonsGroup          = "addons.cluster.x-k8s.io"
+	kindHelmReleaseProxy = "HelmReleaseProxy"
+)
 
 // strangers lists the objects in the namespace a move could carry that are
 // not this cluster's. A kind whose CRD is not installed holds nothing.
@@ -473,6 +481,11 @@ func (p *Pivot) preflight(ctx context.Context) error {
 	}
 
 	var problems []string
+	if msg, err := p.legacyCNI(ctx, src, st); err != nil {
+		return err
+	} else if msg != "" {
+		problems = append(problems, msg)
+	}
 	// clusterctl moves the whole namespace.
 	others, err := otherClusters(ctx, p.Source.C, p.Namespace, p.Name)
 	if err != nil {
@@ -554,6 +567,42 @@ func (p *Pivot) preflight(ctx context.Context) error {
 		return fmt.Errorf("clusterctl move dry run: %w", err)
 	}
 	return nil
+}
+
+// legacyCNI explains why the cluster's CNI rules out a pivot, or returns "":
+// Cilium from the ClusterResourceSet hydra v0.5 and earlier rendered would
+// never verify on the target, where this hydra waits for CAAPH to report it
+// installed; a cluster that lost its CNI label has had Cilium uninstalled;
+// and Cilium CAAPH does not report installed may still be upgrading or
+// failing. Teardown skips it.
+func (p *Pivot) legacyCNI(ctx context.Context, src *cluster.Manager, st cluster.Summary) (string, error) {
+	if p.allowUnsettled {
+		return "", nil
+	}
+	if st.CNILabelMissing {
+		return fmt.Sprintf("the Cluster lost its %s label, so Cluster API Add-on Provider Helm has uninstalled Cilium from it; restore the label (or run `hydra cluster apply --adopt-cni`) and let Cilium come back before moving it", render.CNILabelKey), nil
+	}
+	if st.CNIExternal {
+		return "", nil
+	}
+	cs, err := src.State(ctx, p.Namespace, p.Name)
+	if err != nil {
+		return "", err
+	}
+	if cs.LegacyCNI {
+		return fmt.Sprintf("its Cilium comes from the ClusterResourceSet %s that hydra v0.5 and earlier rendered; migrate it to the CNI HelmChartProxy first (README, \"Clusters on the old ClusterResourceSet\"), so the target can verify it", render.CNIName(p.Name)), nil
+	}
+	// Available and rolled out follow the machines, not Cilium: a cluster
+	// can be settled while Cilium upgrades or fails. Move only once CAAPH
+	// reports it installed, rather than find out on the target.
+	if !st.CNIApplied {
+		why := ""
+		if st.CNIWhy != "" {
+			why = " (" + st.CNIWhy + ")"
+		}
+		return fmt.Sprintf("Cluster API Add-on Provider Helm does not report hydra's Cilium installed%s; wait until `hydra cluster status` says CNI ready, then rerun", why), nil
+	}
+	return "", nil
 }
 
 // crdsLabelled checks the Hydra CRDs carry the label clusterctl move looks
@@ -640,9 +689,10 @@ func (p *Pivot) verifyOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// Being deleted, or a CNI only present as the moved ClusterResourceSet
-	// without its binding applied, is no management path to leave the
-	// cluster on: the bootstrap cluster is deleted once this passes.
+	// Being deleted, or a CNI that CAAPH on the target does not report
+	// installed (its HelmReleaseProxy is replaced after a move, PET-97), is no
+	// management path to leave the cluster on: the bootstrap cluster is
+	// deleted once this passes.
 	if !st.Exists || st.Terminating || st.Available != cluster.ConditionTrue || !st.RolledOut || !st.CNIReady() {
 		return fmt.Errorf("the Cluster on %s: %s", p.Target.Name, st.Line())
 	}
@@ -682,14 +732,6 @@ func (p *Pivot) verifyOnce(ctx context.Context) error {
 		if !conditionTrue(&m, "Ready") {
 			return fmt.Errorf("HydraMachine %s is not Ready", m.GetName())
 		}
-	}
-	if st.CNIExternal {
-		return nil // no hydra ClusterResourceSet to carry
-	}
-	crs := &unstructured.Unstructured{}
-	crs.SetGroupVersionKind(crsGVK)
-	if err := p.Target.C.Get(ctx, client.ObjectKey{Namespace: p.Namespace, Name: render.CNIName(p.Name)}, crs); err != nil {
-		return fmt.Errorf("the CNI ClusterResourceSet did not arrive on %s: %w", p.Target.Name, err)
 	}
 	return nil
 }

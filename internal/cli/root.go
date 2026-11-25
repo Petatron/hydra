@@ -6,9 +6,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 
+	"github.com/Petatron/hydra/internal/addons"
 	"github.com/Petatron/hydra/internal/bootstrap"
 	"github.com/Petatron/hydra/internal/config"
 	"github.com/Petatron/hydra/internal/render"
@@ -45,10 +47,11 @@ func newVersionCommand() *cobra.Command {
 		Short: "Print the CLI version and the component versions it pins",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			cilium, _ := addons.Lookup(addons.Cilium)
 			_, err := fmt.Fprintf(cmd.OutOrStdout(),
-				"hydra %s\n  kubernetes (default) %s\n  cilium %s\n  kube-vip %s\n"+
+				"hydra %s\n  kubernetes (default) %s\n  cilium %s (default; allowed %s)\n  kube-vip %s\n"+
 					"  bootstrap: kind node %s\n  bootstrap: cert-manager %s, cluster-api %s, hydra provider %s, addon provider helm %s\n",
-				Version, config.DefaultKubernetesVersion, render.CiliumVersion, render.KubeVIPImage,
+				Version, config.DefaultKubernetesVersion, cilium.DefaultVersion, strings.Join(cilium.Versions, ", "), render.KubeVIPImage,
 				bootstrap.NodeImage, bootstrap.CertManagerVersion, bootstrap.CAPIVersion, bootstrap.HydraVersion, bootstrap.CAAPHVersion)
 			return err
 		},

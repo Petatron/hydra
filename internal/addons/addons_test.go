@@ -8,7 +8,7 @@ import (
 
 func TestCatalogueEntriesAreComplete(t *testing.T) {
 	for _, a := range catalogue {
-		if a.Name == "" || a.RepoURL == "" || a.Chart == "" || a.ReleaseName == "" || a.Namespace == "" || a.Values == nil {
+		if a.Name == "" || a.RepoURL == "" || a.Chart == "" || a.ReleaseName == "" || a.Namespace == "" || (a.Values == nil) != a.CNI {
 			t.Errorf("%q: incomplete entry", a.Name)
 		}
 		if !slices.Contains(a.Versions, a.DefaultVersion) {
@@ -87,5 +87,36 @@ func TestMetricsServerValues(t *testing.T) {
 	off, _ := a.Resolve(map[string]any{"kubeletInsecureTLS": false})
 	if len(a.Values(off)) != 0 {
 		t.Errorf("kubeletInsecureTLS false: %v", a.Values(off))
+	}
+}
+
+// The CNI is protected, never offered in spec.addons, and its values are the
+// embedded canonical set: a template with every sentinel present, and nothing
+// CAAPH's valuesTemplate templating would expand.
+func TestCilium(t *testing.T) {
+	a, ok := Lookup(Cilium)
+	if !ok || !a.CNI || !a.Protected {
+		t.Fatalf("cilium: %+v", a)
+	}
+	if slices.Contains(Names(), Cilium) {
+		t.Errorf("Names lists the CNI: %v", Names())
+	}
+	cnis := 0
+	for _, e := range catalogue {
+		if e.CNI {
+			cnis++
+		}
+	}
+	if cnis != 1 {
+		t.Errorf("%d CNI entries, want 1", cnis)
+	}
+	v := string(CiliumValues)
+	for _, s := range []string{"name: hydra-sentinel-cluster", "- 10.255.254.0/24", "MTU: 65000", "replicas: 1"} {
+		if !strings.Contains(v, s) {
+			t.Errorf("canonical values lack the sentinel %q", s)
+		}
+	}
+	if strings.Contains(v, "{{") {
+		t.Error("canonical values contain {{, which CAAPH would template")
 	}
 }
