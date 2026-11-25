@@ -1,6 +1,8 @@
 // Command cilium-values writes the Cilium values hydra renders for each
-// cni: hydra example, and the chart versions hydra allows, for
-// hack/check-cilium.sh to render against the real chart.
+// cni: hydra example (<name>.values.yaml), what the chart must make of them
+// (<name>.expect: cluster name, pod CIDR, MTU, operator replicas, one per
+// line), and the chart versions hydra allows, for hack/check-cilium.sh to
+// render against the real chart.
 //
 //	go run ./hack/cilium-values <out-dir> <hydra.yaml>...
 package main
@@ -49,8 +51,12 @@ func run(args []string) error {
 		if err != nil {
 			return fmt.Errorf("%s: %w", f, err)
 		}
-		name := strings.TrimSuffix(filepath.Base(f), filepath.Ext(f)) + ".values.yaml"
-		if err := os.WriteFile(filepath.Join(out, name), []byte(v), 0o600); err != nil {
+		base := strings.TrimSuffix(filepath.Base(f), filepath.Ext(f))
+		if err := os.WriteFile(filepath.Join(out, base+".values.yaml"), []byte(v), 0o600); err != nil {
+			return err
+		}
+		expect := fmt.Sprintf("%s\n%s\n%d\n%d\n", c.Metadata.Name, c.Spec.Network.PodCIDR, c.Spec.Network.MTU, render.OperatorReplicas(c))
+		if err := os.WriteFile(filepath.Join(out, base+".expect"), []byte(expect), 0o600); err != nil {
 			return err
 		}
 		n++

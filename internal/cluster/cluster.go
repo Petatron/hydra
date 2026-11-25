@@ -556,7 +556,7 @@ func (m *Manager) Status(ctx context.Context, namespace, name string) (Summary, 
 	if s.CNIExternal {
 		// No label, but hydra's proxy for it: the label was removed, and
 		// CAAPH uninstalled Cilium. That is no external CNI.
-		proxy, err := m.labelledExists(ctx, hcpGVK, namespace, render.CNIName(name), name)
+		proxy, err := m.cniProxyExists(ctx, namespace, name)
 		if err != nil {
 			return s, fmt.Errorf("reading the CNI HelmChartProxy: %w", err)
 		}

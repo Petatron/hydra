@@ -658,20 +658,23 @@ func TestCNIConflict(t *testing.T) {
 	ctx := context.Background()
 	labelled := obj(clusterGVK, "ns", "c", nil)
 	labelled.SetLabels(map[string]string{render.CNILabelKey: "c"})
-	handBuilt := obj(clusterGVK, "ns", "h", nil)
-	stale := obj(clusterGVK, "ns", "s", nil)
+	up := map[string]any{"status": map[string]any{"initialization": map[string]any{"controlPlaneInitialized": true}}}
+	handBuilt := obj(clusterGVK, "ns", "h", up)
+	stale := obj(clusterGVK, "ns", "s", up)
 	stale.SetLabels(map[string]string{render.CNILabelKey: "other"})
-	m := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(labelled, handBuilt, stale).Build()}
+	starting := obj(clusterGVK, "ns", "starting", nil) // its API is not up: no CNI can run there yet
+	m := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(labelled, handBuilt, stale, starting).Build()}
 	for _, tc := range []struct {
 		name     string
 		hydraCNI bool
 		conflict bool
 	}{
-		{"s", true, true},       // the label selects some other set: hydra's would be retargeted here
-		{"c", true, false},      // hydra installed its CNI: rerunning create is fine
-		{"h", true, true},       // CNI from elsewhere: hydra's would land on top
-		{"h", false, false},     // cni: external says so
-		{"absent", true, false}, // a new cluster
+		{"s", true, true},         // the label selects some other set: hydra's would be retargeted here
+		{"c", true, false},        // hydra installed its CNI: rerunning create is fine
+		{"h", true, true},         // CNI from elsewhere: hydra's would land on top
+		{"h", false, false},       // cni: external says so
+		{"absent", true, false},   // a new cluster
+		{"starting", true, false}, // unlabelled, but its API has not come up
 	} {
 		st, err := m.State(ctx, "ns", tc.name)
 		if err != nil {
@@ -681,7 +684,9 @@ func TestCNIConflict(t *testing.T) {
 		if (msg != "") != tc.conflict {
 			t.Errorf("%s hydraCNI=%v: got %q", tc.name, tc.hydraCNI, msg)
 		}
-		if tc.conflict && (!strings.Contains(msg, "spec.network.cni: external") || !strings.Contains(msg, "kubectl --kubeconfig m.yaml label --overwrite cluster -n ns "+tc.name+" cni.hydra.io/cilium="+tc.name)) {
+		// Setting the label by hand would only reach the next refusal on a
+		// running cluster hydra's proxy never installed: not offered.
+		if tc.conflict && (!strings.Contains(msg, "spec.network.cni: external") || !strings.Contains(msg, "--adopt-cni") || strings.Contains(msg, "label --overwrite")) {
 			t.Errorf("message does not name both fixes: %q", msg)
 		}
 		if tc.name == "s" && !strings.Contains(msg, `with value "other", not "s"`) {
@@ -716,6 +721,9 @@ func TestCNIConflictWithCAAPH(t *testing.T) {
 		running(cl("foreign")), labelledFor(hcpGVK, "foreign-cilium", "someone-else"),
 		cl("fresh"),
 		unlabelled, labelledFor(hcpGVK, "lost-cilium", "lost"),
+		// A proxy by the CNI name without hydra's label still owns the
+		// release: CAAPH selects by the CNI label.
+		running(cl("bare")), obj(hcpGVK, "ns", "bare-cilium", nil),
 	}
 	m := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(objs...).Build()}
 	for _, tc := range []struct {
@@ -736,7 +744,9 @@ func TestCNIConflictWithCAAPH(t *testing.T) {
 		{"foreign", true, true, false, false, ""},
 		{"foreign", false, false, false, false, ""},
 		{"fresh", true, false, false, false, ""}, // nothing runs yet: an interrupted create resumes
-		{"lost", true, false, true, false, "CAAPH has uninstalled Cilium"},
+		{"lost", true, false, true, false, "put the label back and CAAPH installs hydra's Cilium again (kubectl label --overwrite cluster -n ns lost cni.hydra.io/cilium=lost)"},
+		{"bare", false, false, true, false, "would uninstall Cilium from the running cluster"},
+		{"bare", true, false, true, false, ""},
 		{"lost", true, true, true, false, ""},
 	} {
 		st, err := m.State(ctx, "ns", tc.name)

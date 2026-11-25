@@ -881,6 +881,8 @@ func TestCluCreateRefusesHydraCNIOnAForeignCNI(t *testing.T) {
 	foreign := func() *unstructured.Unstructured {
 		cl := capiCluster("default", "hydra-mgmt", "", 0)
 		cl.SetLabels(map[string]string{"hydra.io/cluster": "hydra-mgmt"})
+		// Running: its API is up, so some CNI may be there.
+		_ = unstructured.SetNestedField(cl.Object, true, "status", "initialization", "controlPlaneInitialized")
 		return cl
 	}
 	cfg, objs := cluLoad(t, "../../examples/hydra-mgmt.yaml")
@@ -947,7 +949,7 @@ func TestCluCreateRefusesHydraCNIOnAForeignCNI(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out, "! cni: create refuses this: cluster default/hydra-mgmt exists without the cni.hydra.io/cilium label") ||
-		!strings.Contains(out, "kubectl --kubeconfig /x label --overwrite cluster -n default hydra-mgmt cni.hydra.io/cilium=hydra-mgmt") {
+		!strings.Contains(out, "rerun with --adopt-cni") {
 		t.Errorf("plan does not warn with a runnable fix:\n%s", out)
 	}
 }

@@ -572,8 +572,9 @@ func (p *Pivot) preflight(ctx context.Context) error {
 // legacyCNI explains why the cluster's CNI rules out a pivot, or returns "":
 // Cilium from the ClusterResourceSet hydra v0.5 and earlier rendered would
 // never verify on the target, where this hydra waits for CAAPH to report it
-// installed; and a cluster that lost its CNI label has had Cilium
-// uninstalled. Teardown skips it.
+// installed; a cluster that lost its CNI label has had Cilium uninstalled;
+// and Cilium CAAPH does not report installed may still be upgrading or
+// failing. Teardown skips it.
 func (p *Pivot) legacyCNI(ctx context.Context, src *cluster.Manager, st cluster.Summary) (string, error) {
 	if p.allowUnsettled {
 		return "", nil
@@ -585,10 +586,23 @@ func (p *Pivot) legacyCNI(ctx context.Context, src *cluster.Manager, st cluster.
 		return "", nil
 	}
 	cs, err := src.State(ctx, p.Namespace, p.Name)
-	if err != nil || !cs.LegacyCNI {
+	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("its Cilium comes from the ClusterResourceSet %s that hydra v0.5 and earlier rendered; migrate it to the CNI HelmChartProxy first (README, \"Clusters on the old ClusterResourceSet\"), so the target can verify it", render.CNIName(p.Name)), nil
+	if cs.LegacyCNI {
+		return fmt.Sprintf("its Cilium comes from the ClusterResourceSet %s that hydra v0.5 and earlier rendered; migrate it to the CNI HelmChartProxy first (README, \"Clusters on the old ClusterResourceSet\"), so the target can verify it", render.CNIName(p.Name)), nil
+	}
+	// Available and rolled out follow the machines, not Cilium: a cluster
+	// can be settled while Cilium upgrades or fails. Move only once CAAPH
+	// reports it installed, rather than find out on the target.
+	if !st.CNIApplied {
+		why := ""
+		if st.CNIWhy != "" {
+			why = " (" + st.CNIWhy + ")"
+		}
+		return fmt.Sprintf("Cluster API Add-on Provider Helm does not report hydra's Cilium installed%s; wait until `hydra cluster status` says CNI ready, then rerun", why), nil
+	}
+	return "", nil
 }
 
 // crdsLabelled checks the Hydra CRDs carry the label clusterctl move looks
