@@ -733,6 +733,11 @@ func TestCNIConflictWithCAAPH(t *testing.T) {
 		// A proxy by the CNI name without hydra's label still owns the
 		// release: CAAPH selects by the CNI label.
 		running(cl("bare")), obj(hcpGVK, "ns", "bare-cilium", nil),
+		// A renamed copy that selects the cluster by its CNI label: removing
+		// the label would uninstall its release too.
+		running(cl("copy")), obj(hcpGVK, "ns", "cilium-for-copy", map[string]any{"spec": map[string]any{
+			"clusterSelector": map[string]any{"matchLabels": map[string]any{render.CNILabelKey: "copy"}},
+		}}),
 	}
 	m := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(objs...).Build()}
 	for _, tc := range []struct {
@@ -756,6 +761,7 @@ func TestCNIConflictWithCAAPH(t *testing.T) {
 		{"lost", true, false, true, false, "put the label back and CAAPH installs hydra's Cilium again (kubectl label --overwrite cluster -n ns lost cni.hydra.io/cilium=lost)"},
 		{"bare", false, false, true, false, "would uninstall Cilium from the running cluster"},
 		{"bare", true, false, true, false, ""},
+		{"copy", false, false, true, false, "would uninstall Cilium from the running cluster"},
 		{"lost", true, true, true, false, ""},
 	} {
 		st, err := m.State(ctx, "ns", tc.name)

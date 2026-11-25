@@ -439,12 +439,10 @@ func (m *Manager) exists(ctx context.Context, gvk schema.GroupVersionKind, names
 	return true, nil
 }
 
-// cniProxyExists reports whether hydra's CNI HelmChartProxy for the cluster
-// (<cluster>-cilium) exists. CAAPH selects by the CNI label, not by hydra's
-// cluster label, so a proxy by that name owns the cluster's Cilium release
-// whether hydra's label is on it or not; only one labelled for another
-// cluster is someone else's.
-func (m *Manager) cniProxyExists(ctx context.Context, namespace, cluster string) (bool, error) {
+// hydraCNIProxy reports whether hydra's own CNI proxy, <cluster>-cilium,
+// exists and is not labelled for another cluster. CAAPH selects by the CNI
+// label, so it owns the cluster's release with or without hydra's label.
+func (m *Manager) hydraCNIProxy(ctx context.Context, namespace, cluster string) (bool, error) {
 	o := &unstructured.Unstructured{}
 	o.SetGroupVersionKind(hcpGVK)
 	err := m.C.Get(ctx, client.ObjectKey{Namespace: namespace, Name: render.CNIName(cluster)}, o)
@@ -456,4 +454,32 @@ func (m *Manager) cniProxyExists(ctx context.Context, namespace, cluster string)
 	}
 	l := o.GetLabels()[render.ClusterLabelKey]
 	return l == "" || l == cluster, nil
+}
+
+// cniProxyExists reports whether a HelmChartProxy installs the cluster's
+// CNI through its CNI label, so removing that label would make CAAPH
+// uninstall it. That is hydra's own (<cluster>-cilium, unless labelled for
+// another cluster: CAAPH selects by the CNI label, so it owns the release
+// with or without hydra's label), and any other proxy in the namespace whose
+// selector requires the CNI label with this cluster's name, such as a copy
+// or a renamed one.
+func (m *Manager) cniProxyExists(ctx context.Context, namespace, cluster string) (bool, error) {
+	if own, err := m.hydraCNIProxy(ctx, namespace, cluster); err != nil || own {
+		return own, err
+	}
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(hcpGVK.GroupVersion().WithKind(hcpGVK.Kind + "List"))
+	if err := m.C.List(ctx, list, client.InNamespace(namespace)); err != nil {
+		if meta.IsNoMatchError(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("listing HelmChartProxies: %w", err)
+	}
+	for i := range list.Items {
+		sel, _, _ := unstructured.NestedStringMap(list.Items[i].Object, "spec", "clusterSelector", "matchLabels")
+		if sel[render.CNILabelKey] == cluster {
+			return true, nil
+		}
+	}
+	return false, nil
 }
