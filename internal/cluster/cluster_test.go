@@ -100,6 +100,14 @@ func cniRelease(cluster, ready string, observed int64) *unstructured.Unstructure
 	return h
 }
 
+// deleting marks o as being deleted, held by a finalizer.
+func deleting(o *unstructured.Unstructured) *unstructured.Unstructured {
+	now := metav1.Now()
+	o.SetDeletionTimestamp(&now)
+	o.SetFinalizers([]string{"addons.cluster.x-k8s.io"})
+	return o
+}
+
 // The CNI counts as applied only when CAAPH reports the release Ready for
 // the proxy's current version and its latest generation.
 func TestCNIStatus(t *testing.T) {
@@ -117,6 +125,7 @@ func TestCNIStatus(t *testing.T) {
 		{"Ready from an older generation", []client.Object{cniProxy("1.19.1"), cniRelease("c", "True", 0)}, false, true, ""},
 		{"failing", []client.Object{cniProxy("1.19.1"), cniRelease("c", "False", 1)}, false, true, "InstallFailed: chart not found"},
 		{"another cluster's release", []client.Object{cniProxy("1.19.1"), cniRelease("other", "True", 1)}, false, false, ""},
+		{"proxy being deleted", []client.Object{deleting(cniProxy("1.19.1")), cniRelease("c", "True", 1)}, false, true, "its HelmChartProxy is being deleted, which uninstalls Cilium"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(tc.objs...).Build()

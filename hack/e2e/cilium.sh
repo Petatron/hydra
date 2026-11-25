@@ -46,7 +46,11 @@ cleanup() {
     # Delete the workload cluster through Cluster API first, so CAPD removes
     # its containers; then the management cluster.
     kubectl --kubeconfig "$work/mgmt.kubeconfig" delete cluster "$wl" --wait --timeout=3m >/dev/null 2>&1 || true
-    docker ps -aq --filter "label=io.x-k8s.kind.cluster=$wl" | xargs -r docker rm -f >/dev/null 2>&1 || true
+    leftover=$(docker ps -aq --filter "label=io.x-k8s.kind.cluster=$wl" 2>/dev/null || true)
+    if [ -n "$leftover" ]; then
+      # shellcheck disable=SC2086 # one container ID per word
+      docker rm -f $leftover >/dev/null 2>&1 || true
+    fi
     kind delete cluster --name "$mgmt" >/dev/null 2>&1 || true
   fi
   rm -r -- "${work:?}"

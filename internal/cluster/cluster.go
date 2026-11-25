@@ -586,6 +586,12 @@ func (m *Manager) cniStatus(ctx context.Context, namespace, name string, s *Summ
 	case err != nil:
 		return fmt.Errorf("reading the CNI HelmChartProxy: %w", err)
 	}
+	if hcp.GetDeletionTimestamp() != nil {
+		// CAAPH uninstalls the release while it cleans the proxy up; the
+		// HelmReleaseProxy may still say Ready until it is gone.
+		s.CNIProxyPresent, s.CNIWhy = true, "its HelmChartProxy is being deleted, which uninstalls Cilium"
+		return nil
+	}
 	want, _, _ := unstructured.NestedString(hcp.Object, "spec", "version")
 	hrps := &unstructured.UnstructuredList{}
 	hrps.SetGroupVersionKind(hrpGVK.GroupVersion().WithKind(hrpGVK.Kind + "List"))
