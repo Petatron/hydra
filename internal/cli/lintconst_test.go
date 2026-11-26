@@ -9,4 +9,8 @@ const (
 	lcUpgrade   = "upgrade"
 	lcDocker    = "docker"
 	lcValidate  = "validate"
+	lcPlan      = "plan"
+	lcApply     = "apply"
+	lcDelete    = "delete"
+	lcCluster   = "cluster"
 )

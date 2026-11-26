@@ -54,6 +54,7 @@ the target. --dry-run prints the next stage and its changes.`,
 			if err != nil {
 				return err
 			}
+			defer t.Close()
 			ctx, stop := interruptible(cmd)
 			defer stop()
 			u := &upgrade.Upgrader{
@@ -71,6 +72,7 @@ the target. --dry-run prints the next stage and its changes.`,
 	}
 	c.Flags().StringVarP(&file, "file", "f", "hydra.yaml", "path to hydra.yaml")
 	c.Flags().StringVar(&mgmt, "management-kubeconfig", "", "kubeconfig of the management cluster (default: the cluster's bootstrap kind cluster)")
+	addBastionFlag(c)
 	c.Flags().StringVar(&to, "to", "", "the Kubernetes version to upgrade to, e.g. v1.36.6")
 	c.Flags().DurationVar(&timeout, "timeout", 45*time.Minute, "how long to wait for each stage's rollout; it ends the wait, not the rollout")
 	c.Flags().BoolVar(&dryRun, "dry-run", false, "print the next stage and what it would change, and change nothing")
