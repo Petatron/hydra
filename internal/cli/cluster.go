@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -80,6 +81,9 @@ type target struct {
 	out io.Writer
 	// stopSignals ends the tunnel's signal watch.
 	stopSignals func()
+	// reported is set once ssh's reason for a dropped tunnel was shown, so it
+	// is shown once.
+	reported atomic.Bool
 }
 
 // tunnel is what the CLI needs of a bastion.Tunnel; tests fake it.
@@ -97,11 +101,11 @@ func (t *target) Close() {
 	if t == nil || t.tunnel == nil {
 		return
 	}
-	if d := t.tunnel.Diagnose(); d != "" && t.out != nil {
-		_, _ = fmt.Fprintf(t.out, "bastion: %s\n", d)
-	}
 	if t.stopSignals != nil {
 		t.stopSignals()
+	}
+	if d := t.tunnel.Diagnose(); d != "" && t.out != nil && t.reported.CompareAndSwap(false, true) {
+		_, _ = fmt.Fprintf(t.out, "bastion: %s\n", d)
 	}
 	_ = t.tunnel.Close()
 }
@@ -110,12 +114,16 @@ func (t *target) Close() {
 // still needs it, and stops ssh if hydra is terminated or loses its terminal
 // (SIGTERM, SIGHUP), which would otherwise skip the deferred Close and leave
 // ssh forwarding. Ctrl-C is left to the commands: ssh shares the terminal's
-// process group and gets it too. It returns the function that ends the watch.
-func watchTunnel(tun tunnel, out io.Writer) func() {
+// process group and gets it too. Once the tunnel is gone the signals are
+// released at once, so they terminate hydra the usual way. reported is set
+// when the drop was shown. out must be safe for concurrent writes. It returns
+// the function that ends the watch.
+func watchTunnel(tun tunnel, out io.Writer, reported *atomic.Bool) func() {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGTERM, syscall.SIGHUP)
 	stop := make(chan struct{})
 	go func() {
+		defer signal.Stop(sig)
 		select {
 		case s := <-sig:
 			_ = tun.Close()
@@ -125,7 +133,12 @@ func watchTunnel(tun tunnel, out io.Writer) func() {
 			}
 			os.Exit(code)
 		case <-tun.Done():
-			if d := tun.Diagnose(); d != "" {
+			select {
+			case <-stop: // Close ended the watch, then stopped ssh: not a drop
+				return
+			default:
+			}
+			if d := tun.Diagnose(); d != "" && reported.CompareAndSwap(false, true) {
 				_, _ = fmt.Fprintf(out, "bastion: %s; the management cluster is unreachable until hydra is run again\n", d)
 			}
 		case <-stop:
@@ -133,6 +146,18 @@ func watchTunnel(tun tunnel, out io.Writer) func() {
 	}()
 	var once sync.Once
 	return func() { once.Do(func() { signal.Stop(sig); close(stop) }) }
+}
+
+// lockedWriter serializes writes to w.
+type lockedWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
 }
 
 // bastionFlag is --bastion: the management API through an SSH jump host.
@@ -205,11 +230,16 @@ func manager(cmd *cobra.Command, kubeconfigPath, clusterName string) (*target, e
 		}
 		return nil, fmt.Errorf("connecting to %s: %w", source, err)
 	}
+	if tun != nil {
+		// The tunnel's watch writes from its own goroutine: serialize every
+		// write to the command's stderr.
+		cmd.SetErr(&lockedWriter{w: cmd.ErrOrStderr()})
+	}
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "management cluster: %s (%s%s)\n", source, server, via)
 	t := &target{m: &cluster.Manager{C: c, Out: cmd.ErrOrStderr()}, source: source, server: server,
 		bootstrapKind: kubeconfigPath == "", kubeconfig: kc, path: kubeconfigPath, tunnel: tun, out: cmd.ErrOrStderr()}
 	if tun != nil {
-		t.stopSignals = watchTunnel(tun, cmd.ErrOrStderr())
+		t.stopSignals = watchTunnel(tun, cmd.ErrOrStderr(), &t.reported)
 	}
 	return t, nil
 }

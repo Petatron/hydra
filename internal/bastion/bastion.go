@@ -57,11 +57,13 @@ func SplitDest(dest string) (host, port string, err error) {
 	if dest == "" || strings.HasPrefix(dest, "-") || strings.ContainsAny(dest, " \t\n") {
 		return "", "", fmt.Errorf("--bastion %q: want user@host or user@host:port", dest)
 	}
+	bad := fmt.Errorf("--bastion %q: want user@host or user@host:port (an IPv6 host as [addr] or [addr]:port)", dest)
 	user, rest := "", dest
-	if i := strings.LastIndex(dest, "@"); i >= 0 {
+	if i := strings.LastIndex(dest, "@"); i == 0 {
+		return "", "", bad // "@host": an empty user
+	} else if i > 0 {
 		user, rest = dest[:i+1], dest[i+1:]
 	}
-	bad := fmt.Errorf("--bastion %q: want user@host or user@host:port (an IPv6 host as [addr] or [addr]:port)", dest)
 	if rest == "" || strings.HasPrefix(rest, ":") || strings.Contains(rest, "/") {
 		return "", "", bad
 	}
@@ -128,6 +130,23 @@ func Open(ctx context.Context, dest string, kubeconfig []byte, timeout time.Dura
 	}
 	target := net.JoinHostPort(server.Hostname(), targetPort)
 
+	sshOpts := []string{
+		"-o", "ExitOnForwardFailure=yes",
+		"-o", "BatchMode=yes", // never prompt: a CI job, or a caller with no agent, fails fast
+		// Never share a connection: a ControlMaster would own the forward
+		// and keep it open after hydra stops this ssh.
+		"-o", "ControlMaster=no",
+		"-o", "ControlPath=none",
+		// A tunnel needs no agent on the bastion (ProxyJump authenticates
+		// each hop with the local agent).
+		"-o", "ForwardAgent=no",
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=3",
+	}
+	if err := refuseConfigForwards(ctx, dest, sshHost, sshPort, sshOpts); err != nil {
+		return nil, nil, err
+	}
+
 	var lastErr error
 	for range 3 { // a freed port can be taken before ssh binds it
 		local, err := freePort()
@@ -135,18 +154,7 @@ func Open(ctx context.Context, dest string, kubeconfig []byte, timeout time.Dura
 			return nil, nil, err
 		}
 		t := &Tunnel{Dest: dest, Target: target, Local: local, stderr: &lockedBuffer{}, done: make(chan struct{})}
-		args := []string{
-			"-N",
-			"-o", "ExitOnForwardFailure=yes",
-			"-o", "BatchMode=yes", // never prompt: a CI job, or a caller with no agent, fails fast
-			// Never share a connection: a ControlMaster would own the forward
-			// and keep it open after hydra stops this ssh.
-			"-o", "ControlMaster=no",
-			"-o", "ControlPath=none",
-			"-o", "ServerAliveInterval=15",
-			"-o", "ServerAliveCountMax=3",
-			"-L", local + ":" + target,
-		}
+		args := append(append([]string{"-N"}, sshOpts...), "-L", local+":"+target)
 		if sshPort != "" {
 			args = append(args, "-p", sshPort)
 		}
@@ -179,6 +187,38 @@ func Open(ctx context.Context, dest string, kubeconfig []byte, timeout time.Dura
 		return t, rewritten, nil
 	}
 	return nil, nil, lastErr
+}
+
+// refuseConfigForwards refuses a bastion whose ssh configuration opens
+// forwards of its own (LocalForward, RemoteForward, DynamicForward). They would
+// open beside hydra's for as long as the command runs, and a RemoteForward lets
+// the bastion reach back into this machine. ssh's ClearAllForwardings would
+// also clear hydra's own -L, so the configuration is checked instead.
+func refuseConfigForwards(ctx context.Context, dest, host, port string, opts []string) error {
+	args := append([]string{"-G"}, opts...)
+	if port != "" {
+		args = append(args, "-p", port)
+	}
+	args = append(args, "--", host)
+	cmd := exec.CommandContext(ctx, sshBinary, args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("reading the ssh configuration for bastion %s (ssh -G): %v: %s", dest, err, strings.TrimSpace(stderr.String()))
+	}
+	var forwards []string
+	for line := range strings.SplitSeq(string(out), "\n") {
+		key, _, _ := strings.Cut(strings.TrimSpace(line), " ")
+		switch strings.ToLower(key) {
+		case "localforward", "remoteforward", "dynamicforward":
+			forwards = append(forwards, strings.TrimSpace(line))
+		}
+	}
+	if len(forwards) > 0 {
+		return fmt.Errorf("the ssh configuration for bastion %s opens forwards of its own (%s); they would stay open beside hydra's tunnel. Use a Host entry without them for --bastion", dest, strings.Join(forwards, "; "))
+	}
+	return nil
 }
 
 // waitListening returns once the local end accepts connections, or the
@@ -308,23 +348,35 @@ func freePort() (string, error) {
 	return addr, l.Close()
 }
 
-// lockedBuffer collects ssh's stderr while it runs.
+// stderrKeep is how much of ssh's stderr is kept: the end of it, where the
+// reason ssh exited is.
+const stderrKeep = 64 << 10
+
+// lockedBuffer keeps the last stderrKeep bytes of ssh's stderr while it runs.
+// A ProxyCommand may log for the whole session; the line that says why ssh
+// exited comes last.
 type lockedBuffer struct {
 	mu  sync.Mutex
-	buf bytes.Buffer
+	buf []byte
 }
 
 func (b *lockedBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.buf.Len() > 64<<10 {
-		return len(p), nil
+	b.buf = append(b.buf, p...)
+	if over := len(b.buf) - stderrKeep; over > 0 {
+		cut := over
+		// Start at a line, so the tail never opens with half of one.
+		if i := bytes.IndexByte(b.buf[over:], '\n'); i >= 0 && i < len(b.buf)-over-1 {
+			cut = over + i + 1
+		}
+		b.buf = append([]byte(nil), b.buf[cut:]...)
 	}
-	return b.buf.Write(p)
+	return len(p), nil
 }
 
 func (b *lockedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.buf.String()
+	return string(b.buf)
 }

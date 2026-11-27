@@ -360,7 +360,10 @@ and needs `--management-kubeconfig`. It does the following:
 - hydra starts the system `ssh -N -L` to the API server in the kubeconfig's current context, talks to
   the API through a local port, and stops ssh when the command ends, or when hydra gets SIGTERM or
   SIGHUP (on Linux, also if hydra is killed outright). ssh's connection sharing (`ControlMaster`) is
-  turned off for the tunnel, so no shared master keeps the forward open afterwards;
+  turned off for the tunnel, so no shared master keeps the forward open afterwards. Your agent is
+  never forwarded to the bastion (`ForwardAgent=no`), and a bastion whose `~/.ssh/config` entry has
+  a `LocalForward`, `RemoteForward` or `DynamicForward` is refused, since those would stay open
+  beside the tunnel; give `--bastion` a `Host` entry without them;
 - TLS is still verified against the API server's own name (the kubeconfig's `tls-server-name`, or
   else the server's host), so the jump host only relays encrypted traffic. A kubeconfig with
   `insecure-skip-tls-verify` or `proxy-url` is refused;

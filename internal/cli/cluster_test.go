@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -1244,29 +1243,45 @@ func withFakeManagementConn(t *testing.T) *[]byte {
 	return &got
 }
 
-type writerFunc func([]byte) (int, error)
-
-func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
-
-// A tunnel that drops mid-command is reported as it happens, with ssh's reason.
+// A tunnel that drops mid-command is reported as it happens, with ssh's
+// reason, once (Close does not repeat it), and the signal watch ends with it.
 func TestCluBastionTunnelDropIsReported(t *testing.T) {
 	dying := &fakeTunnel{done: make(chan struct{}), said: "the ssh tunnel exited: Timeout, server cp not responding."}
 	var out strings.Builder
-	var mu sync.Mutex
-	stop := watchTunnel(dying, writerFunc(func(p []byte) (int, error) { mu.Lock(); defer mu.Unlock(); return out.Write(p) }))
-	defer stop()
+	w := &lockedWriter{w: &out}
+	read := func() string { w.mu.Lock(); defer w.mu.Unlock(); return out.String() }
+	tg := &target{tunnel: dying, out: w}
+	tg.stopSignals = watchTunnel(dying, w, &tg.reported)
 	close(dying.done)
 	deadline := time.Now().Add(2 * time.Second)
-	for {
-		mu.Lock()
-		got := out.String()
-		mu.Unlock()
-		if strings.Contains(got, "server cp not responding") && strings.Contains(got, "unreachable until hydra is run again") {
-			break
-		}
+	for !strings.Contains(read(), "unreachable until hydra is run again") {
 		if time.Now().After(deadline) {
-			t.Fatalf("reported %q", got)
+			t.Fatalf("reported %q", read())
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+	tg.Close()
+	if got := read(); strings.Count(got, "server cp not responding") != 1 {
+		t.Errorf("reported %q", got)
+	}
+}
+
+// Close after a normal command shows what ssh said, and the watch does not
+// mistake the stop for a drop.
+func TestCluBastionCloseIsNotADrop(t *testing.T) {
+	for range 50 {
+		tun := &fakeTunnel{done: make(chan struct{}), said: "ssh to bastion cp said: Warning: added host key"}
+		var out strings.Builder
+		w := &lockedWriter{w: &out}
+		tg := &target{tunnel: tun, out: w}
+		tg.stopSignals = watchTunnel(tun, w, &tg.reported)
+		tg.Close()
+		time.Sleep(time.Millisecond) // let a wrongly woken watch write
+		w.mu.Lock()
+		got := out.String()
+		w.mu.Unlock()
+		if strings.Count(got, "added host key") != 1 || strings.Contains(got, "unreachable") {
+			t.Fatalf("reported %q", got)
+		}
 	}
 }

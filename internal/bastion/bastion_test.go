@@ -38,6 +38,14 @@ func TestMain(m *testing.M) {
 
 func fakeSSH(mode string) {
 	args := os.Args[1:]
+	if len(args) > 0 && args[0] == "-G" { // the configuration check
+		if f := os.Getenv("HYDRA_FAKE_SSH_G_ARGS"); f != "" {
+			_ = os.WriteFile(f, []byte(strings.Join(args, "\n")), 0o600)
+		}
+		fmt.Println("hostname bastion")
+		fmt.Print(os.Getenv("HYDRA_FAKE_SSH_CONFIG")) // HYDRA_FAKE_SSH_CONFIG: extra ssh -G lines
+		os.Exit(0)
+	}
 	if f := os.Getenv("HYDRA_FAKE_SSH_ARGS"); f != "" {
 		_ = os.WriteFile(f, []byte(strings.Join(args, "\n")), 0o600)
 	}
@@ -140,6 +148,7 @@ func TestSplitDest(t *testing.T) {
 		{"cp:22:33", "", "", true},
 		{"ci@", "", "", true},
 		{"ci@:22", "", "", true},
+		{"@cp", "", "", true}, // an empty user
 		{"[]", "", "", true},
 		{"ssh://cp", "", "", true},
 	} {
@@ -430,5 +439,61 @@ func TestOpenDisablesConnectionSharing(t *testing.T) {
 	j := strings.ReplaceAll(string(raw), "\n", " ")
 	if !strings.Contains(j, "-o ControlMaster=no") || !strings.Contains(j, "-o ControlPath=none") {
 		t.Errorf("args %s", j)
+	}
+}
+
+// No agent goes to the bastion, and a bastion whose configuration opens
+// forwards of its own is refused before ssh connects.
+func TestOpenRefusesConfigForwards(t *testing.T) {
+	args := useFakeSSH(t, "forward")
+	gArgs := t.TempDir() + "/g"
+	t.Setenv("HYDRA_FAKE_SSH_G_ARGS", gArgs)
+	api := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer api.Close()
+	kc := kubeconfig(t, api.URL, nil, "")
+
+	tun, _, err := Open(context.Background(), "ci@cp:2222", kc, 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = tun.Close()
+	raw, _ := os.ReadFile(args)
+	if j := strings.ReplaceAll(string(raw), "\n", " "); !strings.Contains(j, "-o ForwardAgent=no") {
+		t.Errorf("args %s", j)
+	}
+	raw, _ = os.ReadFile(gArgs)
+	if j := strings.ReplaceAll(string(raw), "\n", " "); !strings.HasPrefix(j, "-G ") ||
+		!strings.HasSuffix(j, "-p 2222 -- ci@cp") || strings.Contains(j, "-L") {
+		t.Errorf("ssh -G args %s", j)
+	}
+
+	for _, line := range []string{"remoteforward 9000 [localhost]:22", "localforward 5432 [db]:5432", "dynamicforward 1080"} {
+		t.Setenv("HYDRA_FAKE_SSH_CONFIG", line+"\n")
+		_ = os.Remove(args)
+		if _, _, err := Open(context.Background(), "cp", kc, 10*time.Second); err == nil ||
+			!strings.Contains(err.Error(), "opens forwards of its own") || !strings.Contains(err.Error(), line) {
+			t.Errorf("%s: %v", line, err)
+		}
+		if _, err := os.Stat(args); err == nil {
+			t.Errorf("%s: ssh -N ran after the configuration was refused", line)
+		}
+	}
+}
+
+// The end of ssh's stderr is kept, where the reason it exited is, however
+// much a ProxyCommand logged before.
+func TestStderrKeepsTheEnd(t *testing.T) {
+	var b lockedBuffer
+	line := strings.Repeat("x", 99) + "\n"
+	for range 2 * stderrKeep / len(line) {
+		_, _ = b.Write([]byte(line))
+	}
+	_, _ = b.Write([]byte("Connection closed by remote host\n"))
+	s := b.String()
+	if len(s) > stderrKeep || !strings.HasSuffix(s, "Connection closed by remote host\n") || !strings.HasPrefix(s, "xxx") {
+		t.Errorf("kept %d bytes, ends %q", len(s), s[len(s)-40:])
+	}
+	if !strings.HasPrefix(s, line) {
+		t.Errorf("kept a partial line first: %q", s[:20])
 	}
 }
