@@ -497,3 +497,14 @@ func TestStderrKeepsTheEnd(t *testing.T) {
 		t.Errorf("kept a partial line first: %q", s[:20])
 	}
 }
+
+// A cluster entry that is present but nil is missing, not a panic.
+func TestCurrentClusterRefusesANilCluster(t *testing.T) {
+	cfg := clientcmdapi.NewConfig()
+	cfg.CurrentContext = "c"
+	cfg.Contexts["c"] = &clientcmdapi.Context{Cluster: "x"}
+	cfg.Clusters["x"] = nil
+	if _, err := currentCluster(cfg); err == nil || !strings.Contains(err.Error(), "names no cluster") {
+		t.Errorf("got %v", err)
+	}
+}

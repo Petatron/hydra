@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1251,7 +1252,7 @@ func TestCluBastionTunnelDropIsReported(t *testing.T) {
 	w := &lockedWriter{w: &out}
 	read := func() string { w.mu.Lock(); defer w.mu.Unlock(); return out.String() }
 	tg := &target{tunnel: dying, out: w}
-	tg.stopSignals = watchTunnel(dying, w, &tg.reported)
+	tg.stopSignals = watchTunnel(dying, w, &tg.reported, notifyTermination())
 	close(dying.done)
 	deadline := time.Now().Add(2 * time.Second)
 	for !strings.Contains(read(), "unreachable until hydra is run again") {
@@ -1274,7 +1275,7 @@ func TestCluBastionCloseIsNotADrop(t *testing.T) {
 		var out strings.Builder
 		w := &lockedWriter{w: &out}
 		tg := &target{tunnel: tun, out: w}
-		tg.stopSignals = watchTunnel(tun, w, &tg.reported)
+		tg.stopSignals = watchTunnel(tun, w, &tg.reported, notifyTermination())
 		tg.Close()
 		time.Sleep(time.Millisecond) // let a wrongly woken watch write
 		w.mu.Lock()
@@ -1283,5 +1284,36 @@ func TestCluBastionCloseIsNotADrop(t *testing.T) {
 		if strings.Count(got, "added host key") != 1 || strings.Contains(got, "unreachable") {
 			t.Fatalf("reported %q", got)
 		}
+	}
+}
+
+// SIGTERM while the tunnel is still opening cancels the open, which stops
+// ssh, instead of ending hydra with ssh left running (outside Linux nothing
+// else would stop it).
+func TestCluBastionSignalDuringOpen(t *testing.T) {
+	sig := make(chan os.Signal, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var openErr error
+	caught := openGuarded(sig, cancel, func() {
+		sig <- syscall.SIGTERM
+		select { // an Open that waits for the forward until its ssh is stopped
+		case <-ctx.Done():
+			openErr = ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
+	})
+	if caught != syscall.SIGTERM || openErr == nil {
+		t.Fatalf("caught %v, open returned %v", caught, openErr)
+	}
+	if signalExitCode(caught) != 143 || signalExitCode(syscall.SIGHUP) != 129 {
+		t.Errorf("exit codes %d %d", signalExitCode(caught), signalExitCode(syscall.SIGHUP))
+	}
+	// Without a signal, the open runs to the end and the context lives on:
+	// ssh runs under it for the whole command.
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	if got := openGuarded(make(chan os.Signal, 1), cancel2, func() {}); got != nil || ctx2.Err() != nil {
+		t.Errorf("caught %v, context %v", got, ctx2.Err())
 	}
 }

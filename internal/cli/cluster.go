@@ -81,6 +81,10 @@ type target struct {
 	out io.Writer
 	// stopSignals ends the tunnel's signal watch.
 	stopSignals func()
+	// cancelOpen cancels the context the tunnel's ssh was started with; Close
+	// calls it after stopping ssh (cancelling first would kill ssh, and the
+	// kill would read as a drop).
+	cancelOpen context.CancelFunc
 	// reported is set once ssh's reason for a dropped tunnel was shown, so it
 	// is shown once.
 	reported atomic.Bool
@@ -108,6 +112,9 @@ func (t *target) Close() {
 		_, _ = fmt.Fprintf(t.out, "bastion: %s\n", d)
 	}
 	_ = t.tunnel.Close()
+	if t.cancelOpen != nil {
+		t.cancelOpen()
+	}
 }
 
 // watchTunnel reports, as it happens, a tunnel that ends while the command
@@ -117,21 +124,16 @@ func (t *target) Close() {
 // process group and gets it too. Once the tunnel is gone the signals are
 // released at once, so they terminate hydra the usual way. reported is set
 // when the drop was shown. out must be safe for concurrent writes. It returns
-// the function that ends the watch.
-func watchTunnel(tun tunnel, out io.Writer, reported *atomic.Bool) func() {
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGTERM, syscall.SIGHUP)
+// the function that ends the watch. sig is notifyTermination's channel, set
+// up before the tunnel was opened.
+func watchTunnel(tun tunnel, out io.Writer, reported *atomic.Bool, sig chan os.Signal) func() {
 	stop := make(chan struct{})
 	go func() {
 		defer signal.Stop(sig)
 		select {
 		case s := <-sig:
 			_ = tun.Close()
-			code := 128 + 15
-			if s == syscall.SIGHUP {
-				code = 128 + 1
-			}
-			os.Exit(code)
+			os.Exit(signalExitCode(s))
 		case <-tun.Done():
 			select {
 			case <-stop: // Close ended the watch, then stopped ssh: not a drop
@@ -158,6 +160,42 @@ func (l *lockedWriter) Write(p []byte) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.w.Write(p)
+}
+
+// notifyTermination starts catching SIGTERM and SIGHUP, before the tunnel is
+// opened, so that no moment exists where they would end hydra and leave ssh
+// running (outside Linux, nothing else stops it).
+func notifyTermination() chan os.Signal {
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGTERM, syscall.SIGHUP)
+	return sig
+}
+
+// openGuarded runs open, cancelling its context if hydra gets SIGTERM or
+// SIGHUP meanwhile; ssh, started with that context, is then stopped. It
+// returns the signal caught, if any, once open has returned.
+func openGuarded(sig chan os.Signal, cancel context.CancelFunc, open func()) os.Signal {
+	opened, guarded := make(chan struct{}), make(chan struct{})
+	var caught os.Signal
+	go func() {
+		defer close(guarded)
+		select {
+		case caught = <-sig:
+			cancel()
+		case <-opened:
+		}
+	}()
+	open()
+	close(opened)
+	<-guarded
+	return caught
+}
+
+func signalExitCode(s os.Signal) int {
+	if s == syscall.SIGHUP {
+		return 128 + 1
+	}
+	return 128 + 15
 }
 
 // bastionFlag is --bastion: the management API through an SSH jump host.
@@ -203,6 +241,8 @@ func manager(cmd *cobra.Command, kubeconfigPath, clusterName string) (*target, e
 		server = rc.Host
 	}
 	var tun tunnel
+	var sig chan os.Signal
+	cancelOpen := context.CancelFunc(func() {})
 	via, connectWith := "", kc
 	if bastionSet(cmd) {
 		dest := cmd.Flags().Lookup(bastionFlag).Value.String()
@@ -213,8 +253,21 @@ func manager(cmd *cobra.Command, kubeconfigPath, clusterName string) (*target, e
 			return nil, fmt.Errorf("--bastion needs --management-kubeconfig: the bootstrap kind cluster is local")
 		}
 		var local string
-		tun, local, connectWith, err = openBastion(contextOf(cmd), dest, kc, bastionTimeout)
+		sig = notifyTermination()
+		var openCtx context.Context
+		openCtx, cancelOpen = context.WithCancel(contextOf(cmd))
+		caught := openGuarded(sig, cancelOpen, func() {
+			tun, local, connectWith, err = openBastion(openCtx, dest, kc, bastionTimeout)
+		})
+		if caught != nil {
+			if tun != nil {
+				_ = tun.Close()
+			}
+			os.Exit(signalExitCode(caught))
+		}
 		if err != nil {
+			signal.Stop(sig)
+			cancelOpen()
 			return nil, err
 		}
 		via = fmt.Sprintf(" via bastion %s, tunnel %s", dest, local)
@@ -222,8 +275,10 @@ func manager(cmd *cobra.Command, kubeconfigPath, clusterName string) (*target, e
 	c, err := connectManagement(connectWith)
 	if err != nil {
 		if tun != nil {
+			signal.Stop(sig)
 			d := tun.Diagnose()
 			_ = tun.Close()
+			cancelOpen()
 			if d != "" {
 				return nil, fmt.Errorf("connecting to %s: %w (bastion: %s)", source, err, d)
 			}
@@ -239,7 +294,8 @@ func manager(cmd *cobra.Command, kubeconfigPath, clusterName string) (*target, e
 	t := &target{m: &cluster.Manager{C: c, Out: cmd.ErrOrStderr()}, source: source, server: server,
 		bootstrapKind: kubeconfigPath == "", kubeconfig: kc, path: kubeconfigPath, tunnel: tun, out: cmd.ErrOrStderr()}
 	if tun != nil {
-		t.stopSignals = watchTunnel(tun, cmd.ErrOrStderr(), &t.reported)
+		t.stopSignals = watchTunnel(tun, cmd.ErrOrStderr(), &t.reported, sig)
+		t.cancelOpen = cancelOpen
 	}
 	return t, nil
 }

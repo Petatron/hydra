@@ -318,7 +318,7 @@ func currentCluster(cfg *clientcmdapi.Config) (string, error) {
 	if !ok || c == nil {
 		return "", fmt.Errorf("the management kubeconfig has no current context %q", ctxName)
 	}
-	if _, ok := cfg.Clusters[c.Cluster]; !ok {
+	if cl, ok := cfg.Clusters[c.Cluster]; !ok || cl == nil {
 		return "", fmt.Errorf("the management kubeconfig's context %q names no cluster %q", ctxName, c.Cluster)
 	}
 	return c.Cluster, nil
