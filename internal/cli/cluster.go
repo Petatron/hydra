@@ -118,14 +118,17 @@ func (t *target) Close() {
 }
 
 // watchTunnel reports, as it happens, a tunnel that ends while the command
-// still needs it, and stops ssh if hydra is terminated or loses its terminal
-// (SIGTERM, SIGHUP), which would otherwise skip the deferred Close and leave
-// ssh forwarding. Ctrl-C is left to the commands: ssh shares the terminal's
-// process group and gets it too. Once the tunnel is gone the signals are
-// released at once, so they terminate hydra the usual way. reported is set
-// when the drop was shown. out must be safe for concurrent writes. It returns
-// the function that ends the watch. sig is notifyTermination's channel, set
-// up before the tunnel was opened.
+// still needs it, and stops ssh if hydra is terminated, loses its terminal or
+// is interrupted (SIGTERM, SIGHUP, SIGINT), which would otherwise skip the
+// deferred Close and leave ssh forwarding: a signal sent to hydra alone, by a
+// supervisor rather than a terminal, never reaches ssh. On SIGTERM or SIGHUP
+// hydra exits at once. On SIGINT it stops ssh and lets a command that handles
+// the interrupt finish (its Close ends the watch); one that does not fails as
+// the API goes, and hydra exits after interruptGrace regardless. Once the
+// tunnel is gone the signals are released at once, so they act the usual way.
+// reported is set when the drop was shown. out must be safe for concurrent
+// writes. It returns the function that ends the watch. sig is
+// notifyTermination's channel, set up before the tunnel was opened.
 func watchTunnel(tun tunnel, out io.Writer, reported *atomic.Bool, sig chan os.Signal) func() {
 	stop := make(chan struct{})
 	go func() {
@@ -133,7 +136,14 @@ func watchTunnel(tun tunnel, out io.Writer, reported *atomic.Bool, sig chan os.S
 		select {
 		case s := <-sig:
 			_ = tun.Close()
-			os.Exit(signalExitCode(s))
+			if s == os.Interrupt {
+				select {
+				case <-stop:
+					return
+				case <-time.After(interruptGrace):
+				}
+			}
+			exitProcess(signalExitCode(s))
 		case <-tun.Done():
 			select {
 			case <-stop: // Close ended the watch, then stopped ssh: not a drop
@@ -162,17 +172,24 @@ func (l *lockedWriter) Write(p []byte) (int, error) {
 	return l.w.Write(p)
 }
 
-// notifyTermination starts catching SIGTERM and SIGHUP, before the tunnel is
-// opened, so that no moment exists where they would end hydra and leave ssh
-// running (outside Linux, nothing else stops it).
+// notifyTermination starts catching SIGTERM, SIGHUP and SIGINT, before the
+// tunnel is opened, so that no moment exists where they would end hydra and
+// leave ssh running (outside Linux, nothing else stops it).
 func notifyTermination() chan os.Signal {
 	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGTERM, syscall.SIGHUP)
+	signal.Notify(sig, syscall.SIGTERM, syscall.SIGHUP, os.Interrupt)
 	return sig
 }
 
-// openGuarded runs open, cancelling its context if hydra gets SIGTERM or
-// SIGHUP meanwhile; ssh, started with that context, is then stopped. It
+// interruptGrace is how long hydra waits, after SIGINT has stopped the
+// tunnel, for the command to finish before exiting.
+var interruptGrace = 10 * time.Second
+
+// exitProcess is os.Exit; tests replace it.
+var exitProcess = os.Exit
+
+// openGuarded runs open, cancelling its context if hydra gets SIGTERM, SIGHUP
+// or SIGINT meanwhile; ssh, started with that context, is then stopped. It
 // returns the signal caught, if any, once open has returned.
 func openGuarded(sig chan os.Signal, cancel context.CancelFunc, open func()) os.Signal {
 	opened, guarded := make(chan struct{}), make(chan struct{})
@@ -192,8 +209,11 @@ func openGuarded(sig chan os.Signal, cancel context.CancelFunc, open func()) os.
 }
 
 func signalExitCode(s os.Signal) int {
-	if s == syscall.SIGHUP {
+	switch s {
+	case syscall.SIGHUP:
 		return 128 + 1
+	case os.Interrupt:
+		return 128 + 2
 	}
 	return 128 + 15
 }
@@ -263,7 +283,7 @@ func manager(cmd *cobra.Command, kubeconfigPath, clusterName string) (*target, e
 			if tun != nil {
 				_ = tun.Close()
 			}
-			os.Exit(signalExitCode(caught))
+			exitProcess(signalExitCode(caught))
 		}
 		if err != nil {
 			signal.Stop(sig)

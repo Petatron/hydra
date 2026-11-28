@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -1306,8 +1307,8 @@ func TestCluBastionSignalDuringOpen(t *testing.T) {
 	if caught != syscall.SIGTERM || openErr == nil {
 		t.Fatalf("caught %v, open returned %v", caught, openErr)
 	}
-	if signalExitCode(caught) != 143 || signalExitCode(syscall.SIGHUP) != 129 {
-		t.Errorf("exit codes %d %d", signalExitCode(caught), signalExitCode(syscall.SIGHUP))
+	if signalExitCode(caught) != 143 || signalExitCode(syscall.SIGHUP) != 129 || signalExitCode(os.Interrupt) != 130 {
+		t.Errorf("exit codes %d %d %d", signalExitCode(caught), signalExitCode(syscall.SIGHUP), signalExitCode(os.Interrupt))
 	}
 	// Without a signal, the open runs to the end and the context lives on:
 	// ssh runs under it for the whole command.
@@ -1315,5 +1316,49 @@ func TestCluBastionSignalDuringOpen(t *testing.T) {
 	defer cancel2()
 	if got := openGuarded(make(chan os.Signal, 1), cancel2, func() {}); got != nil || ctx2.Err() != nil {
 		t.Errorf("caught %v, context %v", got, ctx2.Err())
+	}
+}
+
+// SIGINT sent to hydra alone stops ssh. A command that handles the interrupt
+// then finishes and closes the target, which ends the watch without exiting;
+// one that does not is ended after the grace period.
+func TestCluBastionInterruptStopsTheTunnel(t *testing.T) {
+	origExit, origGrace := exitProcess, interruptGrace
+	t.Cleanup(func() { exitProcess, interruptGrace = origExit, origGrace })
+	exited := make(chan int, 1)
+	exitProcess = func(code int) { exited <- code }
+	interruptGrace = 200 * time.Millisecond
+
+	// A command that handles it: Close comes before the grace runs out.
+	tun := &fakeTunnel{done: make(chan struct{})}
+	tg := &target{tunnel: tun, out: io.Discard}
+	sig := make(chan os.Signal, 1)
+	tg.stopSignals = watchTunnel(tun, io.Discard, &tg.reported, sig)
+	sig <- os.Interrupt
+	select {
+	case <-tun.done: // ssh stopped
+	case <-time.After(2 * time.Second):
+		t.Fatal("SIGINT did not stop ssh")
+	}
+	tg.Close()
+	select {
+	case code := <-exited:
+		t.Fatalf("exited %d although the command finished", code)
+	case <-time.After(400 * time.Millisecond):
+	}
+
+	// A command that does not: hydra exits 130 after the grace.
+	tun2 := &fakeTunnel{done: make(chan struct{})}
+	sig2 := make(chan os.Signal, 1)
+	stop := watchTunnel(tun2, io.Discard, new(atomic.Bool), sig2)
+	defer stop()
+	sig2 <- os.Interrupt
+	select {
+	case code := <-exited:
+		if code != 130 {
+			t.Errorf("exit %d", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no exit after the grace period")
 	}
 }
