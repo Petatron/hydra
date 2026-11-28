@@ -20,7 +20,7 @@ The CLI is a **stateless orchestrator**: every cluster's desired and actual stat
 Kubernetes, never on your machine. There is no local database, cache or inventory, and an
 interrupted command can always be re-run.
 
-> **Status:** early, latest release v0.6.0. `validate`, `render`, `bootstrap`,
+> **Status:** early, latest release v0.7.0. `validate`, `render`, `bootstrap`,
 > `cluster create/apply/plan/status/delete`, platform addons (`spec.addons`), Cilium through CAAPH
 > (`cni: hydra`, `spec.network.ciliumVersion`), the self-hosting pivot
 > and self-hosted teardown work today.
