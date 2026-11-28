@@ -311,7 +311,9 @@ func manager(cmd *cobra.Command, kubeconfigPath, clusterName string) (*target, e
 		cmd.SetErr(&lockedWriter{w: cmd.ErrOrStderr()})
 	}
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "management cluster: %s (%s%s)\n", source, server, via)
-	t := &target{m: &cluster.Manager{C: c, Out: cmd.ErrOrStderr()}, source: source, server: server,
+	// The workload cluster's own API is read for its CNI's rollout; a
+	// self-hosted cluster is read through this connection (and its tunnel).
+	t := &target{m: &cluster.Manager{C: c, Out: cmd.ErrOrStderr(), Workload: cluster.ReachVia(kc, c)}, source: source, server: server,
 		bootstrapKind: kubeconfigPath == "", kubeconfig: kc, path: kubeconfigPath, tunnel: tun, out: cmd.ErrOrStderr()}
 	if tun != nil {
 		t.stopSignals = watchTunnel(tun, cmd.ErrOrStderr(), &t.reported, sig)
@@ -564,7 +566,7 @@ func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.C
 	if err := checkPruneRefusals(ctx, m, objs, ns, name, o.prune); err != nil {
 		return "", err
 	}
-	if err := m.Apply(ctx, objs, name, forceConflicts); err != nil {
+	if err := applyNotingCNIChange(ctx, m, cfg, objs, forceConflicts); err != nil {
 		return "", err
 	}
 	if !render.HydraCNI(cfg) {
@@ -590,7 +592,7 @@ func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.C
 	}
 	start := time.Now()
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "waiting up to %s for cluster %s/%s to be Available\n", timeout, ns, name)
-	if err := m.WaitAvailable(ctx, ns, name, timeout); err != nil {
+	if err := waitAvailable(ctx, cmd, m, ns, name, timeout); err != nil {
 		return "", err
 	}
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "cluster %s/%s is Available after %s\n", ns, name, time.Since(start).Round(time.Second))
@@ -621,6 +623,39 @@ func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.C
 		return path, err
 	}
 	return path, nil
+}
+
+// applyNotingCNIChange applies objs and records on m whether that changed the
+// CNI, which decides how its rollout is waited for (PET-103): the CNI
+// proxy's generation moves when it is created or its spec changes. A
+// generation that cannot be read counts as changed: the strict wait is the
+// safe one.
+func applyNotingCNIChange(ctx context.Context, m *cluster.Manager, cfg *config.ClusterConfig, objs []*unstructured.Unstructured, forceConflicts bool) error {
+	ns, name := cfg.Metadata.Namespace, cfg.Metadata.Name
+	before, beforeErr := m.CNIProxyGeneration(ctx, ns, name)
+	if err := m.Apply(ctx, objs, name, forceConflicts); err != nil {
+		return err
+	}
+	if render.HydraCNI(cfg) {
+		after, err := m.CNIProxyGeneration(ctx, ns, name)
+		m.RequireCNIRollout = beforeErr != nil || err != nil || before != after
+	}
+	return nil
+}
+
+// waitAvailable is m.WaitAvailable, saying first when the CNI's rollout is
+// required, and after when it was counted ready without being read.
+func waitAvailable(ctx context.Context, cmd *cobra.Command, m *cluster.Manager, ns, name string, timeout time.Duration) error {
+	if m.RequireCNIRollout {
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "this run changes the CNI: waiting for Cilium's agents and operator to roll out, read through the cluster's own API")
+	}
+	if err := m.WaitAvailable(ctx, ns, name, timeout); err != nil {
+		return err
+	}
+	if s, err := m.Status(ctx, ns, name); err == nil && s.CNIRolloutUnverified() {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "note: the CNI is counted ready on its release alone; its rollout could not be read (%s). This run did not change it\n", s.CNIWhy)
+	}
+	return nil
 }
 
 // checkPruneRefusals refuses an apply, before anything is written, when it

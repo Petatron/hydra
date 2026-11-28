@@ -106,7 +106,8 @@ func (u *Upgrader) poolObjName(pool string) string { return u.name() + "-" + poo
 func ReadLive(ctx context.Context, c client.Client, cfg *config.ClusterConfig) (Live, error) {
 	ns, name := cfg.Metadata.Namespace, cfg.Metadata.Name
 	var l Live
-	m := &cluster.Manager{C: c, Out: io.Discard}
+	// Upgrade does not use the CNI's readiness: no workload cluster read.
+	m := &cluster.Manager{C: c, Out: io.Discard, SkipCNIRollout: true}
 	s, err := m.Status(ctx, ns, name)
 	if err != nil {
 		return l, err

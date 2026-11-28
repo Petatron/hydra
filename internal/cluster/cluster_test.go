@@ -128,9 +128,9 @@ func TestCNIStatus(t *testing.T) {
 		{"proxy being deleted", []client.Object{deleting(cniProxy("1.19.1")), cniRelease("c", "True", 1)}, false, true, "its HelmChartProxy is being deleted, which uninstalls Cilium"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(tc.objs...).Build()
+			c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(append(tc.objs, rolledOutWorkload(t, "c", "1.19.1")...)...).Build()
 			var s Summary
-			if err := (&Manager{C: c}).cniStatus(context.Background(), "ns", "c", &s); err != nil {
+			if err := (&Manager{C: c, Workload: sameClient(c)}).cniStatus(context.Background(), "ns", "c", &s); err != nil {
 				t.Fatal(err)
 			}
 			if s.CNIApplied != tc.applied || s.CNIProxyPresent != tc.present || s.CNIWhy != tc.why {
@@ -151,8 +151,9 @@ func TestStatusReadsControllers(t *testing.T) {
 	m1.SetLabels(map[string]string{"cluster.x-k8s.io/cluster-name": "c"})
 	other := obj(machineGVK, "ns", "other-1", map[string]any{"status": map[string]any{"phase": "Running"}})
 	other.SetLabels(map[string]string{"cluster.x-k8s.io/cluster-name": "other"})
-	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cl, kcp, m1, other, cniProxy("1.19.1"), cniRelease("c", "True", 1)).Build()
-	s, err := (&Manager{C: c}).Status(ctx, "ns", "c")
+	objs := append([]client.Object{cl, kcp, m1, other, cniProxy("1.19.1"), cniRelease("c", "True", 1)}, rolledOutWorkload(t, "c", "1.19.1")...)
+	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(objs...).Build()
+	s, err := (&Manager{C: c, Workload: sameClient(c)}).Status(ctx, "ns", "c")
 	if err != nil {
 		t.Fatal(err)
 	}

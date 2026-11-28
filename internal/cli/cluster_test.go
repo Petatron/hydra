@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -318,7 +319,10 @@ func cluTarget(t *testing.T, mgmt bool, ap *cluApplies, funcs interceptor.Funcs,
 		b = b.WithRESTMapper(cluMapper())
 	}
 	var log bytes.Buffer
-	return &target{m: &cluster.Manager{C: b.Build(), Out: &log, Poll: time.Millisecond}, source: "test-mgmt", bootstrapKind: true}, &log
+	c := b.Build()
+	// The workload cluster's own API, for the CNI's rollout, is the same fake.
+	workload := func([]byte) (client.Client, error) { return c, nil }
+	return &target{m: &cluster.Manager{C: c, Out: &log, Poll: time.Millisecond, Workload: workload}, source: "test-mgmt", bootstrapKind: true}, &log
 }
 
 func cluLoad(t *testing.T, path string) (*config.ClusterConfig, []*unstructured.Unstructured) {
@@ -362,7 +366,9 @@ func cluAvailable(version string, kc []byte) []client.Object {
 }
 
 // cniInstalled is cluster ns/name's CNI HelmChartProxy at the default Cilium
-// version, and the HelmReleaseProxy CAAPH made from it, Ready.
+// version, the HelmReleaseProxy CAAPH made from it, Ready, and Cilium's
+// agents and operator rolled out at that version in kube-system (as the
+// workload cluster holds them).
 func cniInstalled(ns, name string) []client.Object {
 	hcp := &unstructured.Unstructured{Object: map[string]any{}}
 	hcp.SetAPIVersion("addons.cluster.x-k8s.io/v1alpha1")
@@ -379,7 +385,17 @@ func cniInstalled(ns, name string) []client.Object {
 	hrp.SetLabels(map[string]string{"cluster.x-k8s.io/cluster-name": name, "helmreleaseproxy.addons.cluster.x-k8s.io/helmchartproxy-name": name + "-cilium"})
 	_ = unstructured.SetNestedField(hrp.Object, "1.19.1", "spec", "version")
 	_ = unstructured.SetNestedSlice(hrp.Object, []any{map[string]any{"type": "Ready", lcStatus: "True", "observedGeneration": int64(1)}}, lcStatus, "conditions")
-	return []client.Object{hcp, hrp}
+	pod := func(container string) corev1.PodTemplateSpec {
+		return corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: container, Image: "quay.io/cilium/x:v1.19.1"}}}}
+	}
+	one := int32(1)
+	ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "cilium"},
+		Spec:   appsv1.DaemonSetSpec{Template: pod("cilium-agent")},
+		Status: appsv1.DaemonSetStatus{DesiredNumberScheduled: 1, UpdatedNumberScheduled: 1, NumberAvailable: 1}}
+	op := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "cilium-operator"},
+		Spec:   appsv1.DeploymentSpec{Replicas: &one, Template: pod("cilium-operator")},
+		Status: appsv1.DeploymentStatus{Replicas: 1, UpdatedReplicas: 1, AvailableReplicas: 1}}
+	return []client.Object{hcp, hrp, ds, op}
 }
 
 func TestCluRunCreateRefusesBeforeApplying(t *testing.T) {
@@ -562,11 +578,16 @@ func TestCluRunCreateWaitsAndWritesKubeconfig(t *testing.T) {
 		}
 	})
 	t.Run("no kubeconfig Secret", func(t *testing.T) {
+		// This run did not change the CNI, so its rollout is not required:
+		// the wait passes on the release, and the kubeconfig write fails.
 		live := cluAvailable(cfg.Spec.KubernetesVersion, nil)
 		tg, _ := cluTarget(t, true, &cluApplies{}, interceptor.Funcs{}, append(live[:2:2], live[3:]...)...)
-		cmd, _ := cluCmd()
+		cmd, errOut := cluCmd()
 		if _, err := runCreate(t.Context(), cmd, tg, cfg, objs, createOptions{wait: true, timeout: 5 * time.Second}); err == nil || !strings.Contains(err.Error(), "hydra-mgmt-kubeconfig") {
 			t.Fatalf("got %v", err)
+		}
+		if !strings.Contains(errOut.String(), "note: the CNI is counted ready on its release alone") {
+			t.Errorf("an unverified rollout must be reported:\n%s", errOut.String())
 		}
 	})
 	t.Run("timeout", func(t *testing.T) {
@@ -1360,5 +1381,41 @@ func TestCluBastionInterruptStopsTheTunnel(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("no exit after the grace period")
+	}
+}
+
+// A run that changes the CNI (its proxy's generation moved across the
+// apply) requires the rollout: an unreadable workload cluster fails the
+// wait quickly. One that does not change it passes, unverified.
+func TestCluRunCreateCNIChangeDecidesTheRolloutWait(t *testing.T) {
+	cfg, objs := cluLoad(t, "../../examples/hydra-mgmt.yaml")
+	for _, changed := range []bool{true, false} {
+		applied := false
+		bump := interceptor.Funcs{Apply: func(context.Context, client.WithWatch, runtime.ApplyConfiguration, ...client.ApplyOption) error {
+			applied = true
+			return nil
+		}, Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, o client.Object, opts ...client.GetOption) error {
+			if err := c.Get(ctx, key, o, opts...); err != nil {
+				return err
+			}
+			if u, ok := o.(*unstructured.Unstructured); ok && u.GetKind() == "HelmChartProxy" && key.Name == "hydra-mgmt-cilium" {
+				if changed && applied {
+					u.SetGeneration(2)
+				}
+			}
+			return nil
+		}}
+		tg, log := cluTarget(t, true, &cluApplies{}, bump, cluAvailable(cfg.Spec.KubernetesVersion, []byte("admin"))...)
+		tg.m.Workload = func([]byte) (client.Client, error) { return nil, errors.New("connection refused") }
+		tg.m.UnreadableGrace = 10 * time.Millisecond
+		cmd, errOut := cluCmd()
+		_, err := runCreate(t.Context(), cmd, tg, cfg, objs, createOptions{kubeconfigOut: filepath.Join(t.TempDir(), "k"), wait: true, timeout: 5 * time.Second})
+		if changed {
+			if !errors.Is(err, cluster.ErrCNIRolloutUnknown) || !strings.Contains(errOut.String(), "this run changes the CNI") || !strings.Contains(log.String(), "CNI rollout unknown") {
+				t.Errorf("changed: got %v\n%s\n%s", err, errOut.String(), log.String())
+			}
+		} else if err != nil || !strings.Contains(log.String(), "CNI ready (rollout unverified: connecting to the workload cluster: connection refused)") {
+			t.Errorf("unchanged: got %v\n%s", err, log.String())
+		}
 	}
 }

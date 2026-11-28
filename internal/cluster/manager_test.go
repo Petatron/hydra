@@ -336,7 +336,10 @@ func TestSummaryLineStates(t *testing.T) {
 	}{
 		{Summary{Exists: true, Terminating: true}, "Cluster is being deleted"},
 		{Summary{Exists: true, Terminating: true, DeletingMessage: "waiting for\n  2 machines"}, "Cluster is being deleted: waiting for 2 machines"},
-		{Summary{Exists: true, Available: "True", CNIApplied: true}, "Available=True · rolling out · control plane - · machines: none · CNI ready"},
+		{Summary{Exists: true, Available: "True", CNIApplied: true, CNIRolledOut: true}, "Available=True · rolling out · control plane - · machines: none · CNI ready"},
+		{Summary{Exists: true, CNIApplied: true, CNIWhy: "1/3"}, "Available=- · control plane - · machines: none · CNI rolling out (1/3)"},
+		{Summary{Exists: true, CNIApplied: true, CNIRolloutUnreadable: true, CNIWhy: "connecting to the workload cluster: refused"}, "Available=- · control plane - · machines: none · CNI ready (rollout unverified: connecting to the workload cluster: refused)"},
+		{Summary{Exists: true, CNIApplied: true, CNIRolloutUnreadable: true, CNIRolloutRequired: true, CNIWhy: "connecting to the workload cluster: refused"}, "Available=- · control plane - · machines: none · CNI rollout unknown: connecting to the workload cluster: refused"},
 		{Summary{Exists: true, CNIProxyPresent: true, CNIWhy: "moving to 1.19.11"}, "Available=- · control plane - · machines: none · CNI installing (moving to 1.19.11)"},
 		{Summary{Exists: true, RolledOut: true}, "Available=- · control plane - · machines: none · CNI waiting for the API"},
 	} {

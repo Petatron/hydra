@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -376,5 +377,23 @@ func TestOtherClustersListError(t *testing.T) {
 	c := faulty(t, newClient(t), &fault{verb: "list", kind: lcCluster, err: errBoom})
 	if _, err := otherClusters(context.Background(), c, ns, name); !errors.Is(err, errBoom) {
 		t.Fatalf("got %v", err)
+	}
+}
+
+// A release CAAPH reports Ready is not enough to move: the agents must have
+// rolled out too (PET-103). The cluster's own API is read through the side
+// that trusts its CA, the target here.
+func TestPivotPreflightWaitsForTheCNIRollout(t *testing.T) {
+	ds, op := ciliumRolledOut("1.19.1")[0].(*appsv1.DaemonSet), ciliumRolledOut("1.19.1")[1]
+	ds.Status.UpdatedNumberScheduled, ds.Status.DesiredNumberScheduled = 0, 1
+	src := newClient(t, append(clusterObjects("src", true), labelledCRDs()...)...)
+	tgt := newClient(t, append(labelledCRDs(), ds, op)...)
+	rec := &recorder{takeOver: true}
+	err := pivotFor(t, src, tgt, rec).Run(context.Background(), time.Second)
+	if err == nil || !strings.Contains(err.Error(), "hydra's Cilium is installed but its agents and operator have not rolled out (0/1)") {
+		t.Fatalf("got %v", err)
+	}
+	if len(rec.moves) != 0 {
+		t.Errorf("nothing may move: %v", rec.moves)
 	}
 }

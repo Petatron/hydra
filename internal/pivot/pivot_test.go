@@ -13,6 +13,8 @@ import (
 
 	"github.com/Petatron/hydra/internal/render"
 
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -90,7 +92,29 @@ func clusterObjects(uidSuffix string, identityRecorded bool) []client.Object {
 	for _, o := range []*unstructured.Unstructured{kcp, hc} {
 		o.SetLabels(map[string]string{"hydra.io/cluster": name}) // as rendered
 	}
-	return []client.Object{cl, kcp, hm, sec, hcp, hrp, hc}
+	// Its own kubeconfig, trusting the CA tgtKubeconfig does: the CNI's
+	// rollout is read through whichever side is the cluster.
+	kcs := u(secGVK, ns, name+"-kubeconfig", map[string]any{"data": map[string]any{
+		"value": base64.StdEncoding.EncodeToString(tgtKubeconfig),
+	}})
+	kcs.SetLabels(map[string]string{clusterNameLabel: name})
+	return []client.Object{cl, kcp, hm, sec, hcp, hrp, hc, kcs}
+}
+
+// ciliumRolledOut are Cilium's agents and operator at version, rolled out.
+func ciliumRolledOut(version string) []client.Object {
+	pod := func(container string) corev1.PodTemplateSpec {
+		return corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: container, Image: "quay.io/cilium/x:v" + version + "@sha256:0"}}}}
+	}
+	one := int32(1)
+	return []client.Object{
+		&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "cilium"},
+			Spec:   appsv1.DaemonSetSpec{Template: pod("cilium-agent")},
+			Status: appsv1.DaemonSetStatus{DesiredNumberScheduled: 1, UpdatedNumberScheduled: 1, NumberAvailable: 1}},
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "cilium-operator"},
+			Spec:   appsv1.DeploymentSpec{Replicas: &one, Template: pod("cilium-operator")},
+			Status: appsv1.DeploymentStatus{Replicas: 1, UpdatedReplicas: 1, AvailableReplicas: 1}},
+	}
 }
 
 func labelledCRDs() []client.Object {
@@ -103,11 +127,22 @@ func labelledCRDs() []client.Object {
 	return out
 }
 
+// newClient is a fake cluster. Every one runs Cilium 1.19.1, rolled out
+// (cniObjects' version), unless objs bring their own.
 func newClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
 	s := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(s); err != nil {
 		t.Fatal(err)
+	}
+	has := false
+	for _, o := range objs {
+		if o.GetNamespace() == "kube-system" && o.GetName() == "cilium" {
+			has = true
+		}
+	}
+	if !has {
+		objs = append(objs, ciliumRolledOut("1.19.1")...)
 	}
 	return fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).Build()
 }
@@ -676,6 +711,16 @@ func TestPivotVerifyNeedsALiveTargetWithCNI(t *testing.T) {
 			_ = unstructured.SetNestedSlice(h.Object, []any{map[string]any{"type": "Ready", "status": "False", "reason": "HelmReleasePending"}}, "status", "conditions")
 			return tgt.Update(ctx, h)
 		}, "CNI installing"},
+		// CAAPH reports the release Ready, but the agents are still rolling
+		// out (PET-103): not verified yet.
+		{"CNI agents still rolling out", func(ctx context.Context, tgt client.Client) error {
+			ds := &appsv1.DaemonSet{}
+			if err := tgt.Get(ctx, client.ObjectKey{Namespace: "kube-system", Name: "cilium"}, ds); err != nil {
+				return err
+			}
+			ds.Status.DesiredNumberScheduled = 3
+			return tgt.Status().Update(ctx, ds)
+		}, "CNI rolling out (1/3)"},
 		{"target Cluster being deleted", func(ctx context.Context, tgt client.Client) error {
 			cl := &unstructured.Unstructured{}
 			cl.SetGroupVersionKind(clusterGVK)
@@ -796,10 +841,11 @@ func TestSplitSourceRefusesAmbiguousEvidence(t *testing.T) {
 	}
 }
 
-// Delete order in fakeMove is the reverse of movedKinds' listing: after 5
-// deletions the source keeps only its Cluster and control plane, no
-// HydraMachines, while the target is complete and still paused.
-const deletionsLeavingClusterAndKCP = 5
+// Delete order in fakeMove is the reverse of movedKinds' listing: after 6
+// deletions (the cluster has two Secrets) the source keeps only its Cluster
+// and control plane, no HydraMachines, while the target is complete and
+// still paused.
+const deletionsLeavingClusterAndKCP = 6
 
 func TestPivotFinishesASplitInterruptedWhileDeleting(t *testing.T) {
 	ctx := context.Background()
