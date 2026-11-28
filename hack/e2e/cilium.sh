@@ -9,7 +9,10 @@
 #      applied, and the nodes must go Ready from CAAPH-installed Cilium, with
 #      hydra's own status reading it as installed;
 #   4. raising spec.network.ciliumVersion must upgrade the same release;
-#   5. both clusters are deleted, whatever happened.
+#   5. changing only Cilium's values (the MTU) must restart the agents and the
+#      operator (rollOutCiliumPods, PET-105), with hydra holding CNI ready
+#      until they are back;
+#   6. both clusters are deleted, whatever happened.
 #
 # In 3 and 4 hydra's status is polled every few seconds, and whenever it says
 # "CNI ready" the cilium DaemonSet must already have rolled out at the
@@ -168,8 +171,9 @@ if wlk get nodes -o 'jsonpath={.items[*].status.conditions[?(@.type=="Ready")].s
   fail "a node is Ready before any CNI is installed"
 fi
 
-# A hydra.yaml for the same cluster name, namespace and pod CIDR: only its
-# CNI HelmChartProxy is used. Its machine settings are never applied.
+# render_cni VERSION [MTU]: a hydra.yaml for the same cluster name, namespace
+# and pod CIDR: only its CNI HelmChartProxy is used. Its machine settings are
+# never applied.
 render_cni() {
   cat >"$work/hydra.yaml" <<EOF
 apiVersion: hydra.io/v1alpha1
@@ -188,6 +192,7 @@ spec:
     bridges: [br0]
     podCIDR: $pods
     ciliumVersion: $1
+${2:+    mtu: $2}
   controlPlane:
     replicas: 1
 EOF
@@ -294,5 +299,16 @@ echo "--- raising ciliumVersion to $TO_VERSION upgrades the same release"
 render_cni "$TO_VERSION"
 kubectl apply --server-side --field-manager=hydra-e2e -f "$work/cni.yaml"
 wait_cilium "$TO_VERSION" 2 1
+
+echo "--- changing only the MTU restarts the agents and the operator, and hydra waits for them"
+ds_gen=$(wlk -n kube-system get daemonset cilium -o 'jsonpath={.metadata.generation}')
+op_gen=$(wlk -n kube-system get deployment cilium-operator -o 'jsonpath={.metadata.generation}')
+render_cni "$TO_VERSION" 1400
+kubectl apply --server-side --field-manager=hydra-e2e -f "$work/cni.yaml"
+wait_cilium "$TO_VERSION" 3 1
+[ "$(wlk -n kube-system get configmap cilium-config -o 'jsonpath={.data.mtu}')" = 1400 ] || fail "cilium-config does not carry the new MTU"
+[ "$(wlk -n kube-system get daemonset cilium -o 'jsonpath={.metadata.generation}')" -gt "$ds_gen" ] || fail "the MTU change did not change the agents' pod template"
+[ "$(wlk -n kube-system get deployment cilium-operator -o 'jsonpath={.metadata.generation}')" -gt "$op_gen" ] || fail "the MTU change did not change the operator's pod template"
+echo "    the agents and the operator restarted with the new config"
 
 echo "--- cilium e2e passed"
