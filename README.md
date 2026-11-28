@@ -358,8 +358,8 @@ hydra cluster plan -f hydra.yaml --management-kubeconfig ./mgmt.kubeconfig --bas
 and needs `--management-kubeconfig`. It does the following:
 
 - hydra starts the system `ssh -N -L` to the API server in the kubeconfig's current context, talks to
-  the API through a local port, and stops ssh when the command ends, or when hydra gets SIGTERM or
-  SIGHUP (on Linux, also if hydra is killed outright). ssh's connection sharing (`ControlMaster`) is
+  the API through a local port, and stops ssh when the command ends, or when hydra gets SIGTERM,
+  SIGHUP or SIGINT, even one sent to hydra alone (on Linux, also if hydra is killed outright). ssh's connection sharing (`ControlMaster`) is
   turned off for the tunnel, so no shared master keeps the forward open afterwards. Your agent is
   never forwarded to the bastion (`ForwardAgent=no`), and a bastion whose `~/.ssh/config` entry has
   a `LocalForward`, `RemoteForward` or `DynamicForward` is refused, since those would stay open
