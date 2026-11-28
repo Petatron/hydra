@@ -1457,3 +1457,54 @@ func TestCluRunCreateCNIChangeDecidesTheRolloutWait(t *testing.T) {
 		t.Errorf("nothing changed, nothing recorded: %q", got)
 	}
 }
+
+// A CNI change that cannot be recorded on its proxy is fine when this run's
+// own wait sees the rollout; otherwise the run fails, saying the record is
+// missing, so later runs' leniency is never a surprise (review, PR #36).
+func TestCluRunCreateUnrecordedCNIChange(t *testing.T) {
+	cfg, objs := cluLoad(t, "../../examples/hydra-mgmt.yaml")
+	applied := false
+	funcs := interceptor.Funcs{Apply: func(context.Context, client.WithWatch, runtime.ApplyConfiguration, ...client.ApplyOption) error {
+		applied = true
+		return nil
+	}, Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, o client.Object, opts ...client.GetOption) error {
+		if err := c.Get(ctx, key, o, opts...); err != nil {
+			return err
+		}
+		if u, ok := o.(*unstructured.Unstructured); ok && u.GetKind() == "HelmChartProxy" && key.Name == "hydra-mgmt-cilium" && applied {
+			u.SetGeneration(2)
+			_ = unstructured.SetNestedField(u.Object, int64(2), lcStatus, "observedGeneration")
+			_ = unstructured.SetNestedSlice(u.Object, []any{map[string]any{"type": "HelmReleaseProxySpecsUpToDate", lcStatus: "True", "observedGeneration": int64(2)}}, lcStatus, "conditions")
+		}
+		return nil
+	}, Patch: func(context.Context, client.WithWatch, client.Object, client.Patch, ...client.PatchOption) error {
+		return errors.New("forbidden")
+	}}
+	for _, tc := range []struct {
+		name     string
+		readable bool
+		wait     bool
+		want     string // "" for success
+	}{
+		{"wait sees the rollout", true, true, ""},
+		{"wait cannot read it", false, true, "the CNI change could not be recorded: annotating the CNI HelmChartProxy default/hydra-mgmt-cilium: forbidden, so later runs will not require the rollout"},
+		{"not waiting", true, false, "applied, but the CNI change could not be recorded: annotating the CNI HelmChartProxy default/hydra-mgmt-cilium: forbidden; not waiting (--wait=false)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			applied = false
+			tg, _ := cluTarget(t, true, &cluApplies{}, funcs, cluAvailable(cfg.Spec.KubernetesVersion, []byte("admin"))...)
+			if !tc.readable {
+				tg.m.Workload = func([]byte) (client.Client, error) { return nil, errors.New("connection refused") }
+			}
+			tg.m.UnreadableGrace = 10 * time.Millisecond
+			cmd, _ := cluCmd()
+			_, err := runCreate(t.Context(), cmd, tg, cfg, objs, createOptions{kubeconfigOut: filepath.Join(t.TempDir(), "k"), wait: tc.wait, timeout: 5 * time.Second})
+			switch {
+			case tc.want == "" && err != nil:
+				t.Fatalf("a rollout this run saw needs no record: %v", err)
+			case tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)):
+				t.Fatalf("want %q, got %v", tc.want, err)
+			}
+		})
+	}
+}

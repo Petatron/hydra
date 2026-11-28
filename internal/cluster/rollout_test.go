@@ -94,6 +94,10 @@ func TestCiliumRolledOut(t *testing.T) {
 		{"operator's old pod not gone", func(_ *appsv1.DaemonSet, op *appsv1.Deployment) {
 			op.Status.Replicas = 3
 		}, "3/3, operator 2/2, 1 old operator pod(s) not yet replaced"},
+		{"operator surge pod updated, not yet available", func(_ *appsv1.DaemonSet, op *appsv1.Deployment) {
+			// kubectl rollout status waits for every updated pod (review, PR #36).
+			op.Status.Replicas, op.Status.UpdatedReplicas = 3, 3
+		}, "3/3, operator 2/2"},
 		{"operator at the old version", func(_ *appsv1.DaemonSet, op *appsv1.Deployment) {
 			op.Spec.Template.Spec.Containers[1].Image = "quay.io/cilium/operator-generic:v1.19.1"
 		}, "3/3, operator at v1.19.1, want v1.19.11"},

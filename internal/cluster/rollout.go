@@ -246,7 +246,10 @@ func CiliumRolledOut(ds *appsv1.DaemonSet, op *appsv1.Deployment, version string
 			return Rollout{Why: opProgress + " (" + progressDeadlineExceeded + ")"}
 		}
 	}
-	if replicas == 0 || op.Status.UpdatedReplicas < replicas || op.Status.Replicas > op.Status.UpdatedReplicas || op.Status.AvailableReplicas < replicas {
+	// As `kubectl rollout status`: every updated pod available, not only as
+	// many as desired (a surge can leave more updated pods than replicas).
+	if replicas == 0 || op.Status.UpdatedReplicas < replicas || op.Status.Replicas > op.Status.UpdatedReplicas ||
+		op.Status.AvailableReplicas < max(replicas, op.Status.UpdatedReplicas) {
 		return Rollout{Why: opProgress}
 	}
 	return Rollout{Done: true}
