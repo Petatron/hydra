@@ -459,9 +459,28 @@ func (p *Pivot) getCluster(ctx context.Context, c client.Client) (*unstructured.
 	return cl, c.Get(ctx, client.ObjectKey{Namespace: p.Namespace, Name: p.Name}, cl)
 }
 
+// manager reads the cluster through c. The cluster's own API, which its CNI
+// rollout is read from, is whichever side trusts the cluster's certificate
+// authority (the side it manages itself from), else its kubeconfig Secret's.
+// The rollout is required: a pivot is run by hand, from where the cluster's
+// API is reachable, and must not move or leave a cluster mid-rollout.
+func (p *Pivot) manager(c client.Client) *cluster.Manager {
+	return &cluster.Manager{C: c, Out: io.Discard, RequireCNIRollout: true, Workload: func(workload []byte) (client.Client, error) {
+		for _, side := range []Side{p.Source, p.Target} {
+			if same, err := cluster.SameCA(side.Kubeconfig, workload); err == nil && same {
+				return side.C, nil
+			}
+		}
+		return cluster.ConnectWorkload(workload)
+	}}
+}
+
 // preflight is docs/moving.md's checklist, run before anything moves.
 func (p *Pivot) preflight(ctx context.Context) error {
-	src := &cluster.Manager{C: p.Source.C, Out: io.Discard}
+	src := p.manager(p.Source.C)
+	// Teardown moves a cluster however unsettled, and checks nothing of its
+	// CNI: do not read it.
+	src.SkipCNIRollout = p.allowUnsettled
 	st, err := src.Status(ctx, p.Namespace, p.Name)
 	if err != nil {
 		return err
@@ -594,13 +613,17 @@ func (p *Pivot) legacyCNI(ctx context.Context, src *cluster.Manager, st cluster.
 	}
 	// Available and rolled out follow the machines, not Cilium: a cluster
 	// can be settled while Cilium upgrades or fails. Move only once CAAPH
-	// reports it installed, rather than find out on the target.
+	// reports it installed and its agents and operator have rolled out
+	// (PET-103), rather than find out on the target.
+	why := ""
+	if st.CNIWhy != "" {
+		why = " (" + st.CNIWhy + ")"
+	}
 	if !st.CNIApplied {
-		why := ""
-		if st.CNIWhy != "" {
-			why = " (" + st.CNIWhy + ")"
-		}
 		return fmt.Sprintf("Cluster API Add-on Provider Helm does not report hydra's Cilium installed%s; wait until `hydra cluster status` says CNI ready, then rerun", why), nil
+	}
+	if !st.CNIRolledOut {
+		return fmt.Sprintf("hydra's Cilium is installed but its agents and operator have not rolled out%s; wait until `hydra cluster status` says CNI ready, then rerun", why), nil
 	}
 	return "", nil
 }
@@ -684,7 +707,7 @@ func (p *Pivot) verifyOnce(ctx context.Context) error {
 	if onSource {
 		return fmt.Errorf("the %s still holds the Cluster", p.Source.Name)
 	}
-	tgt := &cluster.Manager{C: p.Target.C, Out: io.Discard}
+	tgt := p.manager(p.Target.C)
 	st, err := tgt.Status(ctx, p.Namespace, p.Name)
 	if err != nil {
 		return err

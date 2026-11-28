@@ -11,6 +11,14 @@
 #   4. raising spec.network.ciliumVersion must upgrade the same release;
 #   5. both clusters are deleted, whatever happened.
 #
+# In 3 and 4 hydra's status is polled every few seconds, and whenever it says
+# "CNI ready" the cilium DaemonSet must already have rolled out at the
+# version (PET-103): CAAPH reports the release Ready once Helm has applied
+# it, before the agents restart. hydra reads that rollout through the
+# workload cluster's own API, at the address in its kubeconfig Secret: an
+# address on kind's Docker network, so hydra runs in a container on that
+# network (Docker Desktop's host cannot reach it).
+#
 # CAPD stands in for the Hydra provider, which needs libvirt: CAAPH only uses
 # the Cluster object and its kubeconfig Secret, so what it does does not
 # depend on the infrastructure provider. hydra's bootstrap cluster cannot host
@@ -86,6 +94,13 @@ diagnose() {
 
 echo "--- building hydra"
 (cd "$root" && go build -o "$hydra" ./cmd/hydra)
+# The same hydra for Linux, run on kind's network by hydra_cni.
+case $(docker info --format '{{.Architecture}}') in
+  x86_64 | amd64) docker_arch=amd64 ;;
+  aarch64 | arm64) docker_arch=arm64 ;;
+  *) fail "unsupported Docker architecture $(docker info --format '{{.Architecture}}')" ;;
+esac
+(cd "$root" && CGO_ENABLED=0 GOOS=linux GOARCH=$docker_arch go build -o "$work/hydra-linux" ./cmd/hydra)
 "$hydra" version >"$work/version"
 grep -q "cilium $FROM_VERSION (default; allowed .*$TO_VERSION" "$work/version" || fail "hydra no longer allows $FROM_VERSION -> $TO_VERSION: $(cat "$work/version")"
 
@@ -114,6 +129,8 @@ EOF
 created=1
 kind create cluster --name "$mgmt" --image "$NODE_IMAGE" --config "$work/kind.yaml" --kubeconfig "$work/mgmt.kubeconfig" --wait 2m
 export KUBECONFIG="$work/mgmt.kubeconfig"
+# The management API as a container on kind's network reaches it.
+kind get kubeconfig --internal --name "$mgmt" >"$work/mgmt-internal.kubeconfig"
 
 echo "--- clusterctl init: Cluster API $CAPI_VERSION, CAPD, CAAPH $CAAPH_VERSION"
 CLUSTER_TOPOLOGY=true "$clusterctl" init --wait-providers \
@@ -179,27 +196,85 @@ EOF
   grep -q '^kind: HelmChartProxy$' "$work/cni.yaml" || fail "render emitted no CNI HelmChartProxy"
 }
 
-# hydra's own reading of the CNI, through the real CAAPH objects.
+# hydra's own reading of the CNI, through the real CAAPH objects and the
+# workload cluster's API, from a container on kind's network (the node image
+# is already here; hydra is static).
 hydra_cni() {
-  "$hydra" cluster status -f "$work/hydra.yaml" --management-kubeconfig "$work/mgmt.kubeconfig" >"$work/status" 2>&1 || true
+  docker run --rm --network kind -v "$work:/work" --entrypoint /work/hydra-linux "$NODE_IMAGE" \
+    cluster status -f /work/hydra.yaml --management-kubeconfig /work/mgmt-internal.kubeconfig >"$work/status" 2>&1 || true
   cat "$work/status"
 }
 
-# wait_cilium VERSION REVISION: the release is at VERSION, Ready for the
-# current generation, at REVISION, and every node is Ready.
-wait_cilium() {
+# release_ready VERSION REVISION: CAAPH reports the release at VERSION and
+# REVISION Ready, which is all hydra's "CNI ready" meant before PET-103.
+release_ready() {
   sel="cluster.x-k8s.io/cluster-name=$wl,helmreleaseproxy.addons.cluster.x-k8s.io/helmchartproxy-name=$wl-cilium"
-  i=0
-  until [ "$(kubectl get helmreleaseproxy -l "$sel" -o 'jsonpath={range .items[*]}{.spec.version} {.status.revision} {.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}')" = "$1 $2 True" ] &&
-    hydra_cni | grep -q "CNI ready"; do
-    i=$((i + 1))
-    if [ "$i" -ge 60 ]; then
-      kubectl get helmreleaseproxy -l "$sel" -o yaml >&2 || true
-      cat "$work/status" >&2
-      fail "Cilium $1 (revision $2) was not reported Ready within 10m"
-    fi
-    sleep 10
+  [ "$(kubectl get helmreleaseproxy -l "$sel" -o 'jsonpath={range .items[*]}{.spec.version} {.status.revision} {.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}')" = "$1 $2 True" ]
+}
+
+# rolled_out VERSION: the cilium DaemonSet and the cilium-operator
+# Deployment run VERSION's images and have finished rolling out, as `kubectl
+# rollout status` reads them: each controller observed the latest spec, and
+# every desired pod is updated and available, with no old operator pod left.
+# Read just after hydra spoke, so a rollout that completes in between can
+# pass; agents take tens of seconds to restart, far longer than that read.
+rolled_out() {
+  ds=$(wlk -n kube-system get daemonset cilium -o 'jsonpath={.metadata.generation} {.status.observedGeneration} {.status.desiredNumberScheduled} {.status.updatedNumberScheduled} {.status.numberAvailable}|{.spec.template.spec.containers[?(@.name=="cilium-agent")].image}' 2>/dev/null) || return 1
+  op=$(wlk -n kube-system get deployment cilium-operator -o 'jsonpath={.metadata.generation} {.status.observedGeneration} {.spec.replicas} {.status.updatedReplicas} {.status.availableReplicas} {.status.replicas}|{.spec.template.spec.containers[?(@.name=="cilium-operator")].image}' 2>/dev/null) || return 1
+  for image in "${ds#*|}" "${op#*|}"; do
+    case $image in *":v$1@"* | *":v$1") ;; *) return 1 ;; esac
   done
+  # shellcheck disable=SC2086 # five numbers; an absent one is read as 0
+  set -- ${ds%%|*}
+  [ "${2:-0}" -ge "${1:-1}" ] && [ "${3:-0}" -gt 0 ] && [ "${4:-0}" -ge "$3" ] && [ "${5:-0}" -ge "$3" ] || return 1
+  # shellcheck disable=SC2086 # six numbers; an absent one is read as 0
+  set -- ${op%%|*}
+  [ "${2:-0}" -ge "${1:-1}" ] && [ "${3:-0}" -gt 0 ] && [ "${4:-0}" -ge "$3" ] && [ "${5:-0}" -ge "$3" ] && [ "${6:-0}" -le "${4:-0}" ]
+}
+
+# wait_cilium VERSION REVISION [MIN_GAP]: the release is at VERSION, Ready
+# for the current generation, at REVISION, hydra says CNI ready, and every
+# node is Ready. hydra must never say CNI ready while the agents or the
+# operator are still rolling out; gap counts the polls where CAAPH already
+# reported the release Ready but they had not rolled out, and hydra rightly
+# did not say ready. At least MIN_GAP such polls are required: on an upgrade
+# the agents restart for tens of seconds after Helm applies the chart, so a
+# zero gap means the test never saw the window it exists to check.
+wait_cilium() {
+  i=0 gap=0
+  while :; do
+    hydra_cni >/dev/null
+    # Counted ready without reading the rollout proves nothing here: hydra
+    # runs where the workload API is reachable.
+    if grep -q "rollout unverified" "$work/status"; then
+      cat "$work/status" >&2
+      fail "hydra could not read the workload cluster's API"
+    fi
+    if grep -q "CNI ready" "$work/status"; then
+      rolled_out "$1" || {
+        cat "$work/status" >&2
+        wlk -n kube-system get daemonset cilium -o wide >&2 || true
+        wlk -n kube-system get deployment cilium-operator -o wide >&2 || true
+        fail "hydra reported CNI ready before Cilium's agents and operator rolled out at $1"
+      }
+      release_ready "$1" "$2" || fail "hydra reported CNI ready but the release is not Ready at $1 (revision $2)"
+      break
+    fi
+    if release_ready "$1" "$2" && ! rolled_out "$1"; then
+      gap=$((gap + 1))
+      echo "    release Ready, Cilium still rolling out; hydra: $(grep -o 'CNI [^·]*' "$work/status" | head -1)"
+    fi
+    i=$((i + 1))
+    if [ "$i" -ge 200 ]; then
+      kubectl get helmreleaseproxy -A -o yaml >&2 || true
+      cat "$work/status" >&2
+      fail "Cilium $1 (revision $2) was not reported ready within ~10m"
+    fi
+    sleep 2
+  done
+  echo "    hydra said CNI ready only after Cilium rolled out ($gap polls with the release Ready while it was still rolling)"
+  [ "$gap" -ge "${3:-0}" ] || fail "only $gap polls saw the release Ready before Cilium rolled out, want at least ${3:-0}: the check never saw the window"
+  sel="cluster.x-k8s.io/cluster-name=$wl,helmreleaseproxy.addons.cluster.x-k8s.io/helmchartproxy-name=$wl-cilium"
   [ "$(kubectl get helmreleaseproxy -l "$sel" --no-headers | wc -l | tr -d ' ')" = 1 ] || fail "not exactly one HelmReleaseProxy for $wl-cilium"
   kubectl --kubeconfig "$work/wl.kubeconfig" wait nodes --all --for=condition=Ready --timeout=5m || fail "the nodes did not go Ready on Cilium $1"
   kubectl --kubeconfig "$work/wl.kubeconfig" -n kube-system rollout status daemonset/cilium --timeout=5m || fail "the cilium DaemonSet did not roll out at $1"
@@ -218,6 +293,6 @@ hydra_cni | sed 's/^/    /'
 echo "--- raising ciliumVersion to $TO_VERSION upgrades the same release"
 render_cni "$TO_VERSION"
 kubectl apply --server-side --field-manager=hydra-e2e -f "$work/cni.yaml"
-wait_cilium "$TO_VERSION" 2
+wait_cilium "$TO_VERSION" 2 1
 
 echo "--- cilium e2e passed"

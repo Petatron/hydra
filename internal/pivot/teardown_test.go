@@ -16,17 +16,13 @@ import (
 )
 
 // selfObjects is a self-hosted cluster as it holds itself: the cluster's
-// objects, labelled as hydra renders them, plus its own kubeconfig Secret
-// trusting the same CA as tgtKubeconfig (the cluster's kubeconfig).
+// objects, labelled as hydra renders them, with its own kubeconfig Secret
+// (clusterObjects) trusting the same CA as tgtKubeconfig.
 func selfObjects(t *testing.T) []client.Object {
 	t.Helper()
 	objs := clusterObjects("self", true)
 	objs[0].SetLabels(map[string]string{"hydra.io/cluster": name})
-	kcs := u(secGVK, ns, name+"-kubeconfig", map[string]any{"data": map[string]any{
-		"value": base64.StdEncoding.EncodeToString(tgtKubeconfig),
-	}})
-	kcs.SetLabels(map[string]string{clusterNameLabel: name})
-	return append(append(objs, kcs), labelledCRDs()...)
+	return append(objs, labelledCRDs()...)
 }
 
 // tdRecorder records what a teardown did.

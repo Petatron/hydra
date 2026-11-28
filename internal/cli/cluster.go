@@ -311,7 +311,9 @@ func manager(cmd *cobra.Command, kubeconfigPath, clusterName string) (*target, e
 		cmd.SetErr(&lockedWriter{w: cmd.ErrOrStderr()})
 	}
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "management cluster: %s (%s%s)\n", source, server, via)
-	t := &target{m: &cluster.Manager{C: c, Out: cmd.ErrOrStderr()}, source: source, server: server,
+	// The workload cluster's own API is read for its CNI's rollout; a
+	// self-hosted cluster is read through this connection (and its tunnel).
+	t := &target{m: &cluster.Manager{C: c, Out: cmd.ErrOrStderr(), Workload: cluster.ReachVia(kc, c)}, source: source, server: server,
 		bootstrapKind: kubeconfigPath == "", kubeconfig: kc, path: kubeconfigPath, tunnel: tun, out: cmd.ErrOrStderr()}
 	if tun != nil {
 		t.stopSignals = watchTunnel(tun, cmd.ErrOrStderr(), &t.reported, sig)
@@ -564,7 +566,8 @@ func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.C
 	if err := checkPruneRefusals(ctx, m, objs, ns, name, o.prune); err != nil {
 		return "", err
 	}
-	if err := m.Apply(ctx, objs, name, forceConflicts); err != nil {
+	unrecorded, err := applyNotingCNIChange(ctx, m, cfg, objs, forceConflicts)
+	if err != nil {
 		return "", err
 	}
 	if !render.HydraCNI(cfg) {
@@ -581,6 +584,11 @@ func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.C
 		}
 	}
 	if !wait {
+		// A CNI change that is neither waited for nor recorded would go
+		// unverified for good: fail, before pruning, rather than report it.
+		if unrecorded != nil {
+			return "", fmt.Errorf("applied, but %w; not waiting (--wait=false), so nothing will require its rollout. Rerun without --wait=false from where the cluster's API is reachable", unrecorded)
+		}
 		// Asked not to wait: prune now, as the last step.
 		if err := pruneOrReport(ctx, cmd, m, objs, ns, name, o.prune); err != nil {
 			return "", err
@@ -590,17 +598,16 @@ func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.C
 	}
 	start := time.Now()
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "waiting up to %s for cluster %s/%s to be Available\n", timeout, ns, name)
-	if err := m.WaitAvailable(ctx, ns, name, timeout); err != nil {
+	s, err := waitAvailable(ctx, cmd, m, ns, name, timeout, unrecorded)
+	if err != nil {
 		return "", err
 	}
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "cluster %s/%s is Available after %s\n", ns, name, time.Since(start).Round(time.Second))
 	if len(cfg.Spec.Addons) > 0 {
 		// Addons settle on their own, after the cluster; create does not wait,
 		// but says plainly which addons are not there yet and why.
-		if s, err := m.Status(ctx, ns, name); err == nil {
-			for _, line := range addonNotes(s) {
-				_, _ = fmt.Fprintln(cmd.ErrOrStderr(), line)
-			}
+		for _, line := range addonNotes(s) {
+			_, _ = fmt.Fprintln(cmd.ErrOrStderr(), line)
 		}
 	}
 	kc, err := m.Kubeconfig(ctx, ns, name)
@@ -621,6 +628,56 @@ func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.C
 		return path, err
 	}
 	return path, nil
+}
+
+// applyNotingCNIChange applies objs and records on m whether that changed the
+// CNI, which decides how its rollout is waited for (PET-103): the CNI
+// proxy's generation moves when it is created or its spec changes. A
+// generation that cannot be read counts as changed: the strict wait is the
+// safe one. A change is also recorded on the proxy
+// (cluster.CNIRolloutPendingAnnotation), so later runs require the rollout
+// until one sees it. unrecorded says why a change this run treats as one was
+// not recorded: then only this run's own wait can verify it.
+func applyNotingCNIChange(ctx context.Context, m *cluster.Manager, cfg *config.ClusterConfig, objs []*unstructured.Unstructured, forceConflicts bool) (unrecorded, err error) {
+	ns, name := cfg.Metadata.Namespace, cfg.Metadata.Name
+	before, beforeErr := m.CNIProxyGeneration(ctx, ns, name)
+	if err := m.Apply(ctx, objs, name, forceConflicts); err != nil {
+		return nil, err
+	}
+	if !render.HydraCNI(cfg) {
+		return nil, nil
+	}
+	after, afterErr := m.CNIProxyGeneration(ctx, ns, name)
+	m.RequireCNIRollout = beforeErr != nil || afterErr != nil || before != after
+	switch {
+	case !m.RequireCNIRollout:
+		return nil, nil
+	case beforeErr != nil || afterErr != nil:
+		return fmt.Errorf("the CNI change could not be recorded: %w", errors.Join(beforeErr, afterErr)), nil
+	}
+	if err := m.MarkCNIRolloutPending(ctx, ns, name, after); err != nil {
+		return fmt.Errorf("the CNI change could not be recorded: %w", err), nil
+	}
+	return nil, nil
+}
+
+// waitAvailable is m.WaitAvailable, saying first when this run's CNI change
+// requires the rollout, and after when the CNI was counted ready without it.
+// unrecorded is why this run's CNI change is not recorded on the cluster, if
+// it is not: a failed wait then says so, since the record exists for exactly
+// that case.
+func waitAvailable(ctx context.Context, cmd *cobra.Command, m *cluster.Manager, ns, name string, timeout time.Duration, unrecorded error) (cluster.Summary, error) {
+	if m.RequireCNIRollout {
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "this run changes the CNI: waiting for Cilium's agents and operator to roll out, read through the cluster's own API")
+	}
+	s, err := m.WaitAvailable(ctx, ns, name, timeout)
+	if err != nil && unrecorded != nil {
+		return s, fmt.Errorf("%w. Also, %w, so later runs will not require the rollout: verify it from where the cluster's API is reachable", err, unrecorded)
+	}
+	if err == nil && s.CNIRolloutUnverified() {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "note: the CNI is counted ready on its release alone; its rollout could not be read (%s). No unverified change to it is recorded\n", s.CNIWhy)
+	}
+	return s, err
 }
 
 // checkPruneRefusals refuses an apply, before anything is written, when it

@@ -32,6 +32,7 @@ Commands, in delivery order (Linear project *Hydra — Reliability & Productizat
 | `hydra cluster apply` (create + scoped pruning) | PET-99 | implemented, kind e2e (hardware proof pending) |
 | `cni: hydra` through CAAPH (`spec.network.ciliumVersion`) | PET-100 | implemented, kind and CAPD e2e (hardware proof pending) |
 | `--bastion` (management API through an SSH jump host) | PET-102 | implemented; tunnel and TLS proven on hardware through `cp` |
+| `CNI ready` waits for Cilium's agents and operator to roll out (read through the workload kubeconfig) | PET-103 | implemented, CAPD e2e (hardware proof pending) |
 
 ## Layout
 
@@ -83,7 +84,7 @@ make lint          # golangci-lint, built with the pinned toolchain (see below)
 make verify        # go.mod tidy + gofmt
 make cilium-check  # render the Cilium chart with hydra's values at every allowed version (needs helm)
 make e2e           # kind management cluster via `hydra bootstrap`, dry-run every example, apply + prune (needs Docker)
-make e2e-cilium    # CAPD cluster on kind: hydra's Cilium proxy installs Cilium (nodes Ready), then upgrades it (needs Docker)
+make e2e-cilium    # CAPD cluster on kind: hydra's Cilium proxy installs Cilium (nodes Ready), then upgrades it; hydra never says CNI ready before the agents roll out (needs Docker)
 make vuln          # govulncheck
 make actionlint    # lint .github/workflows
 make dist          # release binaries + checksums into dist/

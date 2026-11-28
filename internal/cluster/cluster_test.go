@@ -83,7 +83,15 @@ func TestSummaryLine(t *testing.T) {
 // cniProxy and cniRelease are the CNI HelmChartProxy for cluster c at
 // version want, and a HelmReleaseProxy CAAPH made from it.
 func cniProxy(want string) *unstructured.Unstructured {
-	return obj(hcpGVK, "ns", "c-cilium", map[string]any{"spec": map[string]any{"version": want}})
+	h := obj(hcpGVK, "ns", "c-cilium", map[string]any{
+		"spec": map[string]any{"version": want},
+		// CAAPH has carried generation 2 into its releases.
+		"status": map[string]any{"observedGeneration": int64(2), "conditions": []any{map[string]any{
+			"type": "HelmReleaseProxySpecsUpToDate", "status": "True", "observedGeneration": int64(2),
+		}}},
+	})
+	h.SetGeneration(2)
+	return h
 }
 
 // cniRelease is always at 1.19.1; tests vary the proxy's version instead.
@@ -128,9 +136,9 @@ func TestCNIStatus(t *testing.T) {
 		{"proxy being deleted", []client.Object{deleting(cniProxy("1.19.1")), cniRelease("c", "True", 1)}, false, true, "its HelmChartProxy is being deleted, which uninstalls Cilium"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(tc.objs...).Build()
+			c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(append(tc.objs, rolledOutWorkload(t)...)...).Build()
 			var s Summary
-			if err := (&Manager{C: c}).cniStatus(context.Background(), "ns", "c", &s); err != nil {
+			if err := (&Manager{C: c, Workload: sameClient(c)}).cniStatus(context.Background(), "ns", "c", &s); err != nil {
 				t.Fatal(err)
 			}
 			if s.CNIApplied != tc.applied || s.CNIProxyPresent != tc.present || s.CNIWhy != tc.why {
@@ -151,8 +159,9 @@ func TestStatusReadsControllers(t *testing.T) {
 	m1.SetLabels(map[string]string{"cluster.x-k8s.io/cluster-name": "c"})
 	other := obj(machineGVK, "ns", "other-1", map[string]any{"status": map[string]any{"phase": "Running"}})
 	other.SetLabels(map[string]string{"cluster.x-k8s.io/cluster-name": "other"})
-	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cl, kcp, m1, other, cniProxy("1.19.1"), cniRelease("c", "True", 1)).Build()
-	s, err := (&Manager{C: c}).Status(ctx, "ns", "c")
+	objs := append([]client.Object{cl, kcp, m1, other, cniProxy("1.19.1"), cniRelease("c", "True", 1)}, rolledOutWorkload(t)...)
+	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(objs...).Build()
+	s, err := (&Manager{C: c, Workload: sameClient(c)}).Status(ctx, "ns", "c")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +176,7 @@ func TestWaitTimesOutWithoutFailingTheCluster(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cl).Build()
 	var out bytes.Buffer
 	m := &Manager{C: c, Out: &out, Poll: 10 * time.Millisecond}
-	err := m.WaitAvailable(context.Background(), "ns", "c", 50*time.Millisecond)
+	_, err := m.WaitAvailable(context.Background(), "ns", "c", 50*time.Millisecond)
 	if !errors.Is(err, ErrTimeout) {
 		t.Fatalf("want ErrTimeout, got %v", err)
 	}
@@ -649,7 +658,7 @@ func TestStatusAndWaitWithExternalCNI(t *testing.T) {
 	if want := "Available=True (Available) · control plane 1/1 ready · machines: none · CNI external (not installed by hydra)"; s.Line() != want {
 		t.Errorf("got  %q\nwant %q", s.Line(), want)
 	}
-	if err := m.WaitAvailable(ctx, "ns", "c", 5*time.Second); err != nil {
+	if _, err := m.WaitAvailable(ctx, "ns", "c", 5*time.Second); err != nil {
 		t.Errorf("wait: %v", err)
 	}
 	// A label whose value is not the cluster's name selects none of hydra's
@@ -888,7 +897,7 @@ func TestExternalCNIWaitHoldsUntilMachinesReady(t *testing.T) {
 	}}})
 	kcp := obj(kcpGVK, "ns", "c-cp", map[string]any{"spec": map[string]any{"replicas": int64(1)}, "status": map[string]any{"replicas": int64(1), "readyReplicas": int64(0), "upToDateReplicas": int64(1)}})
 	m := &Manager{C: fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(cl, kcp).Build(), Out: io.Discard, Poll: time.Millisecond}
-	if err := m.WaitAvailable(context.Background(), "ns", "c", 50*time.Millisecond); !errors.Is(err, ErrTimeout) {
+	if _, err := m.WaitAvailable(context.Background(), "ns", "c", 50*time.Millisecond); !errors.Is(err, ErrTimeout) {
 		t.Fatalf("want a timeout while machines are not Ready, got %v", err)
 	}
 }

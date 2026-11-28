@@ -71,6 +71,25 @@ type Manager struct {
 	Out io.Writer
 	// Poll is the interval between status reads while waiting.
 	Poll time.Duration
+	// Workload connects to a workload cluster from the kubeconfig in its
+	// Secret, to read its CNI's rollout. Nil dials that kubeconfig
+	// (ConnectWorkload); ReachVia reads a self-hosted cluster through C.
+	Workload func(kubeconfig []byte) (client.Client, error)
+	// SkipCNIRollout makes Status leave the workload cluster alone, for
+	// callers that do not use the CNI's readiness: CNIRolledOut stays false.
+	SkipCNIRollout bool
+	// RequireCNIRollout makes a workload cluster that cannot be read hold the
+	// CNI not ready: set when this run changed the CNI, and by the pivot. A
+	// CNI proxy carrying CNIRolloutPendingAnnotation requires it too.
+	// Otherwise the CNI is ready once its release is, with the rollout
+	// reported unverified (PET-103).
+	RequireCNIRollout bool
+	// UnreadableGrace is how long WaitAvailable, requiring the rollout, keeps
+	// retrying a workload cluster it cannot read once nothing else is left to
+	// wait for, before failing (default DefaultUnreadableGrace).
+	UnreadableGrace time.Duration
+
+	workload workloadClients
 }
 
 func (m *Manager) logf(format string, args ...any) {
@@ -291,6 +310,12 @@ func (m *Manager) Plan(ctx context.Context, objs []*unstructured.Unstructured, c
 func comparable(o *unstructured.Unstructured) string {
 	c := o.DeepCopy()
 	unstructured.RemoveNestedField(c.Object, "status")
+	// hydra's own record of an unverified CNI change (PET-103) comes and goes
+	// with waits, not with hydra.yaml: never a difference worth showing.
+	unstructured.RemoveNestedField(c.Object, "metadata", "annotations", CNIRolloutPendingAnnotation)
+	if len(c.GetAnnotations()) == 0 {
+		unstructured.RemoveNestedField(c.Object, "metadata", "annotations")
+	}
 	for _, f := range []string{"managedFields", "resourceVersion", "generation", "uid", "creationTimestamp", "ownerReferences", "finalizers"} {
 		unstructured.RemoveNestedField(c.Object, "metadata", f)
 	}
@@ -328,10 +353,23 @@ type Summary struct {
 	Machines         map[string]int
 	// CNIApplied: CAAPH reports hydra's Cilium installed at the version the
 	// proxy asks for. CNIProxyPresent: CAAPH has a HelmReleaseProxy for it,
-	// installed or not; CNIWhy is why it is not Ready yet.
-	CNIApplied      bool
-	CNIProxyPresent bool
-	CNIWhy          string
+	// installed or not. CNIRolledOut: once applied, the agents' DaemonSet and
+	// the operator's Deployment in the workload cluster have rolled out at
+	// that version (CAAPH's Ready does not wait for pods, PET-103).
+	// CNIRolloutUnreadable: the workload cluster could not be read, so the
+	// rollout is unknown; CNIRolloutRequired: that holds the CNI not ready
+	// (Manager.RequireCNIRollout). CNIWhy is why it is not ready yet: the
+	// release's reason, the rollout's progress ("n/m" agents first), or why
+	// the workload cluster could not be read.
+	CNIApplied           bool
+	CNIProxyPresent      bool
+	CNIRolledOut         bool
+	CNIRolloutUnreadable bool
+	CNIRolloutRequired   bool
+	CNIWhy               string
+	// CNIRolloutPending is the CNI proxy's CNIRolloutPendingAnnotation, ""
+	// when it has none: a change no one has seen roll out yet.
+	CNIRolloutPending string
 	// CNIExternal is true when the Cluster carries no CNI label, so hydra's
 	// Cilium proxy does not select it (cni: external): something else
 	// installs the CNI, and the other CNI fields say nothing.
@@ -355,10 +393,20 @@ type Summary struct {
 }
 
 // CNIReady reports whether the CNI no longer holds the cluster up as far as
-// hydra can tell: CAAPH installed hydra's Cilium, or hydra does not install
-// it. An external CNI that is missing shows as Machines that never
-// become Ready, which RolledOut already waits for.
-func (s Summary) CNIReady() bool { return s.CNIExternal || s.CNIApplied }
+// hydra can tell: CAAPH installed hydra's Cilium and its agents and operator
+// have rolled out at that version (or, not required, their rollout could not
+// be read), or hydra does not install it. An external CNI that is missing
+// shows as Machines that never become Ready, which RolledOut already waits
+// for.
+func (s Summary) CNIReady() bool {
+	return s.CNIExternal || (s.CNIApplied && (s.CNIRolledOut || s.CNIRolloutUnverified()))
+}
+
+// CNIRolloutUnverified reports a CNI counted ready on its release alone: the
+// workload cluster could not be read, and the rollout was not required.
+func (s Summary) CNIRolloutUnverified() bool {
+	return s.CNIApplied && !s.CNIRolledOut && s.CNIRolloutUnreadable && !s.CNIRolloutRequired
+}
 
 // Line is the summary as one line, printed whenever it changes.
 func (s Summary) Line() string {
@@ -393,8 +441,16 @@ func (s Summary) Line() string {
 		parts = append(parts, "CNI uninstalled: the Cluster lost its "+render.CNILabelKey+" label")
 	case s.CNIExternal:
 		parts = append(parts, "CNI external (not installed by hydra)")
-	case s.CNIApplied:
+	case s.CNIApplied && s.CNIRolledOut:
 		parts = append(parts, "CNI ready")
+	case s.CNIRolloutUnverified():
+		parts = append(parts, "CNI ready (rollout unverified: "+s.CNIWhy+")")
+	case s.CNIApplied && s.CNIRolloutUnreadable && s.CNIRolloutPending != "":
+		parts = append(parts, "CNI rollout unknown, change pending verification since generation "+s.CNIRolloutPending+": "+s.CNIWhy)
+	case s.CNIApplied && s.CNIRolloutUnreadable:
+		parts = append(parts, "CNI rollout unknown: "+s.CNIWhy)
+	case s.CNIApplied:
+		parts = append(parts, "CNI rolling out ("+orDash(s.CNIWhy)+")")
 	case s.CNIProxyPresent && s.CNIWhy != "":
 		parts = append(parts, "CNI installing ("+s.CNIWhy+")")
 	case s.CNIProxyPresent:
@@ -481,7 +537,7 @@ func orDash(s string) string {
 
 // Status reads the cluster's progress.
 func (m *Manager) Status(ctx context.Context, namespace, name string) (Summary, error) {
-	s := Summary{Machines: map[string]int{}}
+	s := Summary{Machines: map[string]int{}, CNIRolloutRequired: m.RequireCNIRollout}
 	cl := &unstructured.Unstructured{}
 	cl.SetGroupVersionKind(clusterGVK)
 	err := m.C.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, cl)
@@ -575,7 +631,9 @@ func (m *Manager) Status(ctx context.Context, namespace, name string) (Summary, 
 // HelmReleaseProxy it made for the cluster from the CNI proxy. Applied means
 // Ready for the proxy's current version and the generation CAAPH last
 // reconciled, so a version change is not reported done by the old release.
-// A read that fails is an error, never "installed".
+// Once applied, the rollout is read from the workload cluster (cniRollout).
+// A read that fails is an error, never "installed"; a workload cluster that
+// cannot be read is a reason, so status still reports the rest.
 func (m *Manager) cniStatus(ctx context.Context, namespace, name string, s *Summary) error {
 	proxy := render.CNIName(name)
 	hcp := &unstructured.Unstructured{}
@@ -593,6 +651,16 @@ func (m *Manager) cniStatus(ctx context.Context, namespace, name string, s *Summ
 		return nil
 	}
 	want, _, _ := unstructured.NestedString(hcp.Object, "spec", "version")
+	if v := hcp.GetAnnotations()[CNIRolloutPendingAnnotation]; v != "" {
+		s.CNIRolloutPending, s.CNIRolloutRequired = v, true
+	}
+	// A release is only evidence for the proxy's spec once CAAPH has carried
+	// that spec into it: a change to the values alone keeps the version, and
+	// the old release would read Ready and current.
+	if why := proxyBehind(hcp); why != "" {
+		s.CNIProxyPresent, s.CNIWhy = true, why
+		return nil
+	}
 	hrps := &unstructured.UnstructuredList{}
 	hrps.SetGroupVersionKind(hrpGVK.GroupVersion().WithKind(hrpGVK.Kind + "List"))
 	err := m.C.List(ctx, hrps, client.InNamespace(namespace), client.MatchingLabels{clusterNameLabel: name, hcpNameLabel: proxy})
@@ -617,6 +685,10 @@ func (m *Manager) cniStatus(ctx context.Context, namespace, name string, s *Summ
 		case c["status"] == ConditionTrue && observedCurrent(h, c):
 			s.CNIApplied = true
 			s.CNIWhy = ""
+			// A cluster being deleted is not read: its API is going away.
+			if !m.SkipCNIRollout && !s.Terminating {
+				return m.cniRollout(ctx, namespace, name, want, s)
+			}
 			return nil
 		case c["status"] == ConditionTrue:
 			// Ready for an older generation: CAAPH has not caught up yet.
@@ -628,6 +700,30 @@ func (m *Manager) cniStatus(ctx context.Context, namespace, name string, s *Summ
 		}
 	}
 	return nil
+}
+
+// proxyNotReconciled is proxyBehind's reason while CAAPH has not observed
+// the proxy's spec.
+const proxyNotReconciled = "Cluster API Add-on Provider Helm has not reconciled the HelmChartProxy's latest change yet"
+
+// proxyBehind says why CAAPH has not yet carried a HelmChartProxy's current
+// spec into its HelmReleaseProxies, or "" when it has: it observed the
+// proxy's generation, and its HelmReleaseProxySpecsUpToDate condition is
+// True for that generation. CAAPH sets the condition False whenever updating
+// a release fails, and True only after every release is updated.
+func proxyBehind(hcp *unstructured.Unstructured) string {
+	const upToDate = "HelmReleaseProxySpecsUpToDate"
+	observed, _, _ := unstructured.NestedInt64(hcp.Object, "status", "observedGeneration")
+	c := condition(hcp, upToDate)
+	switch {
+	case observed < hcp.GetGeneration(), c == nil, !observedCurrent(hcp, c):
+		return proxyNotReconciled
+	case c["status"] != ConditionTrue:
+		reason, _ := c["reason"].(string)
+		msg, _ := c["message"].(string)
+		return strings.TrimSuffix(strings.TrimSpace(reason+": "+strings.Join(strings.Fields(msg), " ")), ":")
+	}
+	return ""
 }
 
 // observedCurrent reports whether a condition was set for the object's
@@ -690,41 +786,89 @@ var ErrTimeout = errors.New("timed out waiting; the controllers keep working, so
 // it ends only the wait: the management cluster carries on.
 var ErrInterrupted = errors.New("interrupted; the operation continues in the management cluster, so run `hydra cluster status` or the same command again")
 
+// DefaultUnreadableGrace is Manager.UnreadableGrace's default: long enough
+// to ride out a blip, far shorter than any wait.
+const DefaultUnreadableGrace = 2 * time.Minute
+
+// ErrCNIRolloutUnknown is returned by WaitAvailable, requiring the CNI's
+// rollout, when everything else is done but the workload cluster could not
+// be read for UnreadableGrace.
+var ErrCNIRolloutUnknown = errors.New("cannot verify the CNI's rollout")
+
 // WaitAvailable polls until the Cluster is Available, rolled out and its CNI
-// applied (or not hydra's to apply), printing the summary whenever it changes.
-func (m *Manager) WaitAvailable(ctx context.Context, namespace, name string, timeout time.Duration) error {
-	return m.wait(ctx, namespace, name, timeout, func(s Summary) bool {
-		return s.Exists && !s.Terminating && s.Available == ConditionTrue && s.CNIReady() && s.RolledOut
+// ready (or not hydra's to apply), printing the summary whenever it changes,
+// and returns the summary that ended the wait. With the rollout required, a
+// workload cluster that stays unreadable once nothing else is left fails the
+// wait after UnreadableGrace rather than at the timeout: it is not a rollout
+// in progress. A rollout seen complete clears CNIRolloutPendingAnnotation.
+func (m *Manager) WaitAvailable(ctx context.Context, namespace, name string, timeout time.Duration) (Summary, error) {
+	grace := m.UnreadableGrace
+	if grace <= 0 {
+		grace = DefaultUnreadableGrace
+	}
+	var since time.Time
+	s, err := m.wait(ctx, namespace, name, timeout, func(s Summary) (bool, error) {
+		settled := s.Exists && !s.Terminating && s.Available == ConditionTrue && s.RolledOut
+		if settled && s.CNIReady() {
+			return true, nil
+		}
+		if !settled || !s.CNIApplied || !s.CNIRolloutUnreadable {
+			since = time.Time{}
+			return false, nil
+		}
+		if since.IsZero() {
+			since = time.Now()
+		} else if time.Since(since) >= grace {
+			return false, fmt.Errorf("%w: the CNI changed and its release is applied, and the cluster is Available, but the workload cluster could not be read for %s: %s. Cilium may well be rolling out. Its HelmChartProxy keeps the %s annotation, so every create, apply and pivot requires the rollout, until one of them, run from where the cluster's API is reachable, sees it complete: rerun this command there", ErrCNIRolloutUnknown, grace, s.CNIWhy, CNIRolloutPendingAnnotation)
+		}
+		return false, nil
 	})
+	if err == nil && s.CNIRolledOut && s.CNIRolloutPending != "" {
+		if cerr := m.clearCNIRolloutPending(ctx, namespace, name, s.CNIRolloutPending); cerr != nil {
+			// Left in place, it only keeps the next wait strict.
+			m.logf("  note: the CNI rolled out, but %v; the next create or apply will require the rollout again", cerr)
+		}
+	}
+	return s, err
 }
 
-func (m *Manager) wait(ctx context.Context, namespace, name string, timeout time.Duration, done func(Summary) bool) error {
+func (m *Manager) wait(ctx context.Context, namespace, name string, timeout time.Duration, done func(Summary) (bool, error)) (Summary, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	last := ""
 	for {
 		s, err := m.Status(ctx, namespace, name)
 		line := ""
-		if err != nil {
+		switch {
+		case err != nil && ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)):
+			// The wait itself ended mid-read: not a status to show.
+			line = last
+		case err != nil:
 			// Shown, not swallowed: an expired credential or a refused
 			// connection must not look like slow progress for 30 minutes.
 			line = "cannot read status: " + err.Error()
-		} else {
+		default:
 			line = s.Line()
 		}
 		if line != last {
 			m.logf("  %s", line)
 			last = line
 		}
-		if err == nil && done(s) {
-			return nil
+		if err == nil {
+			ok, derr := done(s)
+			if derr != nil {
+				return s, derr
+			}
+			if ok {
+				return s, nil
+			}
 		}
 		select {
 		case <-ctx.Done():
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				return ErrTimeout
+				return s, ErrTimeout
 			}
-			return ErrInterrupted
+			return s, ErrInterrupted
 		case <-time.After(m.poll()):
 		}
 	}
@@ -775,7 +919,7 @@ func (m *Manager) Delete(ctx context.Context, namespace, name string, timeout ti
 			return err
 		}
 		m.logf("deleting Cluster %s/%s; waiting for its machines and infrastructure to be removed", namespace, name)
-		if err := m.wait(ctx, namespace, name, time.Until(deadline), func(s Summary) bool { return !s.Exists }); err != nil {
+		if _, err := m.wait(ctx, namespace, name, time.Until(deadline), func(s Summary) (bool, error) { return !s.Exists, nil }); err != nil {
 			return err
 		}
 	}

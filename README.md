@@ -160,9 +160,35 @@ management cluster needs CAAPH: `hydra bootstrap` installs it, and `create` refu
   change first). CAAPH upgrades the same release in place. The allowed versions are in the
   catalogue (`internal/addons`); `hack/check-cilium.sh` renders the chart with hydra's values at
   each of them, weekly and on every change.
-- `create`, `apply` and the pivot wait for CAAPH to report Cilium installed at the version asked for;
-  `status` shows `CNI installing` with CAAPH's reason until then, and `CNI uninstalled` if the
-  Cluster lost its label. A pivot refuses to start, or to finish, on a cluster without its CNI.
+- `create`, `apply` and the pivot wait for CAAPH to report Cilium installed at the version asked for,
+  **and then for its agents and operator to roll out at that version.** CAAPH reports the release
+  Ready once Helm has applied it, before any agent restarts, so hydra reads the `kube-system/cilium`
+  DaemonSet and `cilium-operator` Deployment through the cluster's kubeconfig Secret.
+  `status` shows `CNI installing` with CAAPH's reason, then `CNI rolling out (n/m)` (agents updated
+  and available, of those desired), then `CNI ready`; `CNI uninstalled` if the Cluster lost its
+  label. A pivot refuses to start, or to finish, on a cluster without its CNI rolled out.
+- **Reading the rollout needs the workload cluster's API**, at the address in its kubeconfig Secret
+  (a self-hosted cluster is read through the management connection, `--bastion` included). Where
+  hydra cannot reach it:
+  - a `create` or `apply` that **changed the CNI** (created its proxy, or changed `ciliumVersion`
+    or its values) fails after a short retry with `CNI rollout unknown`, once everything else is
+    done: hydra cannot prove Cilium rolled out. The change itself is applied. hydra records it on
+    the proxy (annotation `hydra.io/cni-rollout-pending`), so **every later `create`, `apply`,
+    pivot and `status` stays strict**, unrelated changes included, until a `create` or `apply`
+    run from where the API is reachable sees the rollout complete and removes the record
+    (`status` only reads it, and shows `CNI rollout unknown, change pending verification since
+    generation N`). `--bastion` forwards only the management API, so for a cluster that does
+    not manage itself that apply must run on a host that routes to the API address in the
+    cluster's kubeconfig Secret. Someone who has checked the rollout another way can remove the
+    record by hand on the management cluster:
+    `kubectl -n <namespace> annotate helmchartproxy <cluster>-cilium hydra.io/cni-rollout-pending-`. An apply
+    interrupted between writing the proxy and recording the change leaves no record;
+  - any other `create` or `apply`, and `status`, count the CNI ready on its release alone and say
+    so: `CNI ready (rollout unverified: <error>)`;
+  - a pivot refuses: it is run by hand, from where the cluster is reachable.
+- hydra trusts the release only once CAAPH has carried the proxy's latest spec into it (the proxy's
+  `observedGeneration` and its `HelmReleaseProxySpecsUpToDate` condition), so a change to Cilium's
+  values alone is not reported done by the old release.
 - **Pin `ciliumVersion`.** Without it a cluster takes the catalogue's default, so a hydra release
   that moves the default upgrades Cilium on your next `apply` (`plan` shows it first), and `upgrade`
   refuses until that has been applied.
