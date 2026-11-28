@@ -478,6 +478,9 @@ func (p *Pivot) manager(c client.Client) *cluster.Manager {
 // preflight is docs/moving.md's checklist, run before anything moves.
 func (p *Pivot) preflight(ctx context.Context) error {
 	src := p.manager(p.Source.C)
+	// Teardown moves a cluster however unsettled, and checks nothing of its
+	// CNI: do not read it.
+	src.SkipCNIRollout = p.allowUnsettled
 	st, err := src.Status(ctx, p.Namespace, p.Name)
 	if err != nil {
 		return err

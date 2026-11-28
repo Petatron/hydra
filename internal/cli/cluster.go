@@ -566,7 +566,7 @@ func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.C
 	if err := checkPruneRefusals(ctx, m, objs, ns, name, o.prune); err != nil {
 		return "", err
 	}
-	if err := applyNotingCNIChange(ctx, m, cfg, objs, forceConflicts); err != nil {
+	if err := applyNotingCNIChange(ctx, cmd.ErrOrStderr(), m, cfg, objs, forceConflicts); err != nil {
 		return "", err
 	}
 	if !render.HydraCNI(cfg) {
@@ -592,17 +592,16 @@ func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.C
 	}
 	start := time.Now()
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "waiting up to %s for cluster %s/%s to be Available\n", timeout, ns, name)
-	if err := waitAvailable(ctx, cmd, m, ns, name, timeout); err != nil {
+	s, err := waitAvailable(ctx, cmd, m, ns, name, timeout)
+	if err != nil {
 		return "", err
 	}
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "cluster %s/%s is Available after %s\n", ns, name, time.Since(start).Round(time.Second))
 	if len(cfg.Spec.Addons) > 0 {
 		// Addons settle on their own, after the cluster; create does not wait,
 		// but says plainly which addons are not there yet and why.
-		if s, err := m.Status(ctx, ns, name); err == nil {
-			for _, line := range addonNotes(s) {
-				_, _ = fmt.Fprintln(cmd.ErrOrStderr(), line)
-			}
+		for _, line := range addonNotes(s) {
+			_, _ = fmt.Fprintln(cmd.ErrOrStderr(), line)
 		}
 	}
 	kc, err := m.Kubeconfig(ctx, ns, name)
@@ -630,32 +629,39 @@ func runCreate(ctx context.Context, cmd *cobra.Command, t *target, cfg *config.C
 // proxy's generation moves when it is created or its spec changes. A
 // generation that cannot be read counts as changed: the strict wait is the
 // safe one.
-func applyNotingCNIChange(ctx context.Context, m *cluster.Manager, cfg *config.ClusterConfig, objs []*unstructured.Unstructured, forceConflicts bool) error {
+func applyNotingCNIChange(ctx context.Context, out io.Writer, m *cluster.Manager, cfg *config.ClusterConfig, objs []*unstructured.Unstructured, forceConflicts bool) error {
 	ns, name := cfg.Metadata.Namespace, cfg.Metadata.Name
 	before, beforeErr := m.CNIProxyGeneration(ctx, ns, name)
 	if err := m.Apply(ctx, objs, name, forceConflicts); err != nil {
 		return err
 	}
-	if render.HydraCNI(cfg) {
-		after, err := m.CNIProxyGeneration(ctx, ns, name)
-		m.RequireCNIRollout = beforeErr != nil || err != nil || before != after
+	if !render.HydraCNI(cfg) {
+		return nil
+	}
+	after, err := m.CNIProxyGeneration(ctx, ns, name)
+	m.RequireCNIRollout = beforeErr != nil || err != nil || before != after
+	if err == nil && after != 0 && before != after {
+		// On the cluster, so a rerun from anywhere requires the rollout too
+		// until someone sees it complete. Failing to mark it only leaves this
+		// run strict, which it is already.
+		if err := m.MarkCNIRolloutPending(ctx, ns, name, after); err != nil {
+			_, _ = fmt.Fprintf(out, "note: %v; only this run will require the CNI's rollout\n", err)
+		}
 	}
 	return nil
 }
 
-// waitAvailable is m.WaitAvailable, saying first when the CNI's rollout is
-// required, and after when it was counted ready without being read.
-func waitAvailable(ctx context.Context, cmd *cobra.Command, m *cluster.Manager, ns, name string, timeout time.Duration) error {
+// waitAvailable is m.WaitAvailable, saying first when this run's CNI change
+// requires the rollout, and after when the CNI was counted ready without it.
+func waitAvailable(ctx context.Context, cmd *cobra.Command, m *cluster.Manager, ns, name string, timeout time.Duration) (cluster.Summary, error) {
 	if m.RequireCNIRollout {
 		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "this run changes the CNI: waiting for Cilium's agents and operator to roll out, read through the cluster's own API")
 	}
-	if err := m.WaitAvailable(ctx, ns, name, timeout); err != nil {
-		return err
+	s, err := m.WaitAvailable(ctx, ns, name, timeout)
+	if err == nil && s.CNIRolloutUnverified() {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "note: the CNI is counted ready on its release alone; its rollout could not be read (%s). No unverified change to it is recorded\n", s.CNIWhy)
 	}
-	if s, err := m.Status(ctx, ns, name); err == nil && s.CNIRolloutUnverified() {
-		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "note: the CNI is counted ready on its release alone; its rollout could not be read (%s). This run did not change it\n", s.CNIWhy)
-	}
-	return nil
+	return s, err
 }
 
 // checkPruneRefusals refuses an apply, before anything is written, when it

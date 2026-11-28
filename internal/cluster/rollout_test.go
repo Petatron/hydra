@@ -11,6 +11,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -40,20 +41,20 @@ func ciliumAt(version string) (*appsv1.DaemonSet, *appsv1.Deployment) {
 	return ds, op
 }
 
-// workloadOf is cluster's kubeconfig Secret in ns, and the given workload
+// workloadOf is cluster c's kubeconfig Secret in ns, and the given workload
 // objects (one fake stands for both clusters, through sameClient).
-func workloadOf(t *testing.T, cluster string, ds *appsv1.DaemonSet, op *appsv1.Deployment) []client.Object {
+func workloadOf(t *testing.T, ds *appsv1.DaemonSet, op *appsv1.Deployment) []client.Object {
 	t.Helper()
-	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: cluster + "-kubeconfig"},
+	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "c-kubeconfig"},
 		Data: map[string][]byte{"value": kubeconfigFor("https://10.0.0.5:6443", "workload-ca")}}
 	return []client.Object{sec, ds, op}
 }
 
-// rolledOutWorkload is workloadOf with Cilium rolled out at version.
-func rolledOutWorkload(t *testing.T, cluster, version string) []client.Object {
+// rolledOutWorkload is cluster c's workloadOf with Cilium 1.19.1 rolled out.
+func rolledOutWorkload(t *testing.T) []client.Object {
 	t.Helper()
-	ds, op := ciliumAt(version)
-	return workloadOf(t, cluster, ds, op)
+	ds, op := ciliumAt("1.19.1")
+	return workloadOf(t, ds, op)
 }
 
 func sameClient(c client.Client) func([]byte) (client.Client, error) {
@@ -89,10 +90,10 @@ func TestCiliumRolledOut(t *testing.T) {
 		}, "0/0"},
 		{"operator still rolling", func(_ *appsv1.DaemonSet, op *appsv1.Deployment) {
 			op.Status.UpdatedReplicas, op.Status.AvailableReplicas = 1, 2
-		}, "3/3, operator 1/2"},
+		}, "3/3, operator 1/2, 1 old operator pod(s) not yet replaced"},
 		{"operator's old pod not gone", func(_ *appsv1.DaemonSet, op *appsv1.Deployment) {
 			op.Status.Replicas = 3
-		}, "3/3, operator 2/2"},
+		}, "3/3, operator 2/2, 1 old operator pod(s) not yet replaced"},
 		{"operator at the old version", func(_ *appsv1.DaemonSet, op *appsv1.Deployment) {
 			op.Spec.Template.Spec.Containers[1].Image = "quay.io/cilium/operator-generic:v1.19.1"
 		}, "3/3, operator at v1.19.1, want v1.19.11"},
@@ -111,9 +112,9 @@ func TestCiliumRolledOut(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ds, op := ciliumAt("1.19.11")
 			tc.mutate(ds, op)
-			done, why := CiliumRolledOut(ds, op, "1.19.11")
-			if done != (tc.want == "") || why != tc.want {
-				t.Errorf("done=%v why=%q, want %q", done, why, tc.want)
+			r := CiliumRolledOut(ds, op, "1.19.11")
+			if r.Done != (tc.want == "") || r.Why != tc.want {
+				t.Errorf("%+v, want %q", r, tc.want)
 			}
 		})
 	}
@@ -131,7 +132,7 @@ func TestReadyReleaseWithAgentsRollingOut(t *testing.T) {
 	}}})
 	cl.SetLabels(map[string]string{"cni.hydra.io/cilium": "c"})
 	kcp := obj(kcpGVK, "ns", "c-cp", map[string]any{"spec": map[string]any{"replicas": int64(1)}, "status": map[string]any{"replicas": int64(1), "readyReplicas": int64(1), "upToDateReplicas": int64(1)}})
-	objs := append([]client.Object{cl, kcp, cniProxy("1.19.1"), cniRelease("c", "True", 1)}, workloadOf(t, "c", ds, op)...)
+	objs := append([]client.Object{cl, kcp, cniProxy("1.19.1"), cniRelease("c", "True", 1)}, workloadOf(t, ds, op)...)
 	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(objs...).Build()
 	var out bytes.Buffer
 	m := &Manager{C: c, Out: &out, Poll: time.Millisecond, Workload: sameClient(c)}
@@ -146,7 +147,7 @@ func TestReadyReleaseWithAgentsRollingOut(t *testing.T) {
 	if !strings.HasSuffix(s.Line(), "CNI rolling out (1/3)") {
 		t.Errorf("line %q", s.Line())
 	}
-	if err := m.WaitAvailable(ctx, "ns", "c", 30*time.Millisecond); !errors.Is(err, ErrTimeout) {
+	if _, err := m.WaitAvailable(ctx, "ns", "c", 30*time.Millisecond); !errors.Is(err, ErrTimeout) {
 		t.Fatalf("the wait must hold while the agents roll out, got %v", err)
 	}
 
@@ -155,7 +156,7 @@ func TestReadyReleaseWithAgentsRollingOut(t *testing.T) {
 	if err := c.Status().Update(ctx, ds); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.WaitAvailable(ctx, "ns", "c", time.Second); err != nil {
+	if _, err := m.WaitAvailable(ctx, "ns", "c", time.Second); err != nil {
 		t.Fatalf("%v\n%s", err, out.String())
 	}
 	if !strings.Contains(out.String(), "CNI rolling out (1/3)") || !strings.Contains(out.String(), "CNI ready") {
@@ -170,7 +171,7 @@ func TestReadyReleaseWithAgentsRollingOut(t *testing.T) {
 func TestCNIRolloutUnreadable(t *testing.T) {
 	ctx := context.Background()
 	ds, op := ciliumAt("1.19.1")
-	base := append([]client.Object{cniProxy("1.19.1"), cniRelease("c", "True", 1)}, workloadOf(t, "c", ds, op)...)
+	base := append([]client.Object{cniProxy("1.19.1"), cniRelease("c", "True", 1)}, workloadOf(t, ds, op)...)
 	refused := func([]byte) (client.Client, error) {
 		return nil, errors.New("dial tcp 10.0.0.5:6443:\n  connect: connection refused")
 	}
@@ -292,14 +293,14 @@ func TestWaitAvailableUnreadableWorkload(t *testing.T) {
 	}}})
 	cl.SetLabels(map[string]string{"cni.hydra.io/cilium": "c"})
 	kcp := obj(kcpGVK, "ns", "c-cp", map[string]any{"spec": map[string]any{"replicas": int64(1)}, "status": map[string]any{"replicas": int64(1), "readyReplicas": int64(1), "upToDateReplicas": int64(1)}})
-	objs := append([]client.Object{cl, kcp, cniProxy("1.19.1"), cniRelease("c", "True", 1)}, workloadOf(t, "c", ds, op)...)
+	objs := append([]client.Object{cl, kcp, cniProxy("1.19.1"), cniRelease("c", "True", 1)}, workloadOf(t, ds, op)...)
 	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(objs...).Build()
 	refused := func([]byte) (client.Client, error) { return nil, errors.New("connection refused") }
 
 	var out bytes.Buffer
 	strict := &Manager{C: c, Out: &out, Poll: time.Millisecond, Workload: refused, RequireCNIRollout: true, UnreadableGrace: 20 * time.Millisecond}
 	start := time.Now()
-	err := strict.WaitAvailable(ctx, "ns", "c", time.Minute)
+	_, err := strict.WaitAvailable(ctx, "ns", "c", time.Minute)
 	if !errors.Is(err, ErrCNIRolloutUnknown) || !strings.Contains(err.Error(), "connection refused") {
 		t.Fatalf("got %v", err)
 	}
@@ -312,7 +313,7 @@ func TestWaitAvailableUnreadableWorkload(t *testing.T) {
 
 	out.Reset()
 	lenient := &Manager{C: c, Out: &out, Poll: time.Millisecond, Workload: refused}
-	if err := lenient.WaitAvailable(ctx, "ns", "c", time.Second); err != nil {
+	if _, err := lenient.WaitAvailable(ctx, "ns", "c", time.Second); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), "CNI ready (rollout unverified: connecting to the workload cluster: connection refused)") {
@@ -326,7 +327,7 @@ func TestWaitAvailableUnreadableWorkload(t *testing.T) {
 	}
 	for _, required := range []bool{false, true} {
 		m := &Manager{C: c, Out: &bytes.Buffer{}, Poll: time.Millisecond, Workload: sameClient(c), RequireCNIRollout: required, UnreadableGrace: time.Millisecond}
-		if err := m.WaitAvailable(ctx, "ns", "c", 50*time.Millisecond); !errors.Is(err, ErrTimeout) {
+		if _, err := m.WaitAvailable(ctx, "ns", "c", 50*time.Millisecond); !errors.Is(err, ErrTimeout) {
 			t.Errorf("required=%v: a rollout in progress must hold the wait, got %v", required, err)
 		}
 	}
@@ -360,7 +361,7 @@ func TestTerminatingClusterNotRead(t *testing.T) {
 	now := metav1.Now()
 	cl.SetDeletionTimestamp(&now)
 	cl.SetFinalizers([]string{"cluster.cluster.x-k8s.io"})
-	objs := append([]client.Object{cl, cniProxy("1.19.1"), cniRelease("c", "True", 1)}, rolledOutWorkload(t, "c", "1.19.1")...)
+	objs := append([]client.Object{cl, cniProxy("1.19.1"), cniRelease("c", "True", 1)}, rolledOutWorkload(t)...)
 	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(objs...).Build()
 	m := &Manager{C: c, Workload: func([]byte) (client.Client, error) {
 		t.Error("a cluster being deleted must not be read")
@@ -368,5 +369,162 @@ func TestTerminatingClusterNotRead(t *testing.T) {
 	}}
 	if _, err := m.Status(context.Background(), "ns", "c"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// settledCluster is Available, rolled out, with hydra's CNI applied at
+// 1.19.1 and the workload objects given.
+func settledCluster(t *testing.T, ds *appsv1.DaemonSet, op *appsv1.Deployment, hcpAnnotations map[string]string) []client.Object {
+	t.Helper()
+	cl := obj(clusterGVK, "ns", "c", map[string]any{"status": map[string]any{"conditions": []any{
+		map[string]any{"type": "Available", "status": "True"},
+	}}})
+	cl.SetLabels(map[string]string{"cni.hydra.io/cilium": "c"})
+	kcp := obj(kcpGVK, "ns", "c-cp", map[string]any{"spec": map[string]any{"replicas": int64(1)}, "status": map[string]any{"replicas": int64(1), "readyReplicas": int64(1), "upToDateReplicas": int64(1)}})
+	hcp := cniProxy("1.19.1")
+	hcp.SetAnnotations(hcpAnnotations)
+	return append([]client.Object{cl, kcp, hcp, cniRelease("c", "True", 1)}, workloadOf(t, ds, op)...)
+}
+
+// The wait's own context ending during the workload read is an interrupt,
+// never an unreadable cluster counted ready: a lenient wait must not succeed
+// on Ctrl-C (review, PR #36).
+func TestWaitInterruptedDuringWorkloadRead(t *testing.T) {
+	ds, op := ciliumAt("1.19.1")
+	ds.Status.UpdatedNumberScheduled = 1 // rolling: the wait would hold
+	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(settledCluster(t, ds, op, nil)...).Build()
+	ctx, cancel := context.WithCancel(context.Background())
+	var out bytes.Buffer
+	m := &Manager{C: c, Out: &out, Poll: time.Millisecond, Workload: func([]byte) (client.Client, error) {
+		cancel() // Ctrl-C while dialling
+		return nil, context.Canceled
+	}}
+	if _, err := m.WaitAvailable(ctx, "ns", "c", time.Minute); !errors.Is(err, ErrInterrupted) {
+		t.Fatalf("want ErrInterrupted, got %v", err)
+	}
+	if strings.Contains(out.String(), "rollout unverified") || strings.Contains(out.String(), "cannot read status") {
+		t.Errorf("an interrupt is not a status:\n%s", out.String())
+	}
+}
+
+// An operator rollout past its progress deadline is shown, but holds the wait
+// rather than failing it: the deployment controller keeps trying, and the
+// condition clears once it progresses (review, PR #36).
+func TestStuckOperatorHoldsTheWait(t *testing.T) {
+	ds, op := ciliumAt("1.19.1")
+	op.Status.UpdatedReplicas = 1
+	op.Status.Conditions = []appsv1.DeploymentCondition{{Type: appsv1.DeploymentProgressing, Status: corev1.ConditionFalse, Reason: "ProgressDeadlineExceeded"}}
+	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(settledCluster(t, ds, op, nil)...).Build()
+	var out bytes.Buffer
+	m := &Manager{C: c, Out: &out, Poll: time.Millisecond, Workload: sameClient(c)}
+	if _, err := m.WaitAvailable(context.Background(), "ns", "c", 30*time.Millisecond); !errors.Is(err, ErrTimeout) {
+		t.Fatalf("got %v", err)
+	}
+	if !strings.Contains(out.String(), "CNI rolling out (3/3, operator 1/2, 1 old operator pod(s) not yet replaced (ProgressDeadlineExceeded))") {
+		t.Errorf("the deadline must be shown:\n%s", out.String())
+	}
+}
+
+// A CNI change no one has seen roll out is recorded on the cluster, so the
+// rollout is required from any process, not only the one that made the change
+// (review, PR #36). A wait that reads it complete removes the record, but
+// only the record it read.
+func TestCNIRolloutPendingAnnotation(t *testing.T) {
+	ctx := context.Background()
+	ds, op := ciliumAt("1.19.1")
+	pending := map[string]string{CNIRolloutPendingAnnotation: "1"}
+	refused := func([]byte) (client.Client, error) { return nil, errors.New("connection refused") }
+
+	// Unreadable, recorded: strict even though this Manager changed nothing.
+	c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(settledCluster(t, ds, op, pending)...).Build()
+	var out bytes.Buffer
+	m := &Manager{C: c, Out: &out, Poll: time.Millisecond, Workload: refused, UnreadableGrace: 10 * time.Millisecond}
+	s, err := m.Status(ctx, "ns", "c")
+	if err != nil || !s.CNIRolloutRequired || s.CNIReady() || !strings.HasSuffix(s.Line(), "CNI rollout unknown, change pending verification since generation 1: connecting to the workload cluster: connection refused") {
+		t.Fatalf("status %q required=%v err=%v", s.Line(), s.CNIRolloutRequired, err)
+	}
+	if _, err := m.WaitAvailable(ctx, "ns", "c", time.Minute); !errors.Is(err, ErrCNIRolloutUnknown) {
+		t.Fatalf("a recorded change must keep a rerun strict, got %v", err)
+	}
+
+	// Readable and rolled out: the wait passes and removes the record.
+	m = &Manager{C: c, Out: &out, Poll: time.Millisecond, Workload: sameClient(c)}
+	if _, err := m.WaitAvailable(ctx, "ns", "c", time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if g := proxyAnnotations(t, c)[CNIRolloutPendingAnnotation]; g != "" {
+		t.Errorf("the record must be removed once the rollout is seen, still %q", g)
+	}
+
+	// Marking sets it; a removal that read an older value leaves a newer one.
+	if err := m.MarkCNIRolloutPending(ctx, "ns", "c", 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.clearCNIRolloutPending(ctx, "ns", "c", "1"); err == nil {
+		t.Error("removing a record that changed since it was read must fail")
+	}
+	if g := proxyAnnotations(t, c)[CNIRolloutPendingAnnotation]; g != "2" {
+		t.Errorf("want the newer record kept, got %q", g)
+	}
+	if err := m.clearCNIRolloutPending(ctx, "ns", "c", "2"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func proxyAnnotations(t *testing.T, c client.Client) map[string]string {
+	t.Helper()
+	hcp := cniProxy("")
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: "ns", Name: "c-cilium"}, hcp); err != nil {
+		t.Fatal(err)
+	}
+	return hcp.GetAnnotations()
+}
+
+// A release counts only once CAAPH has carried the proxy's current spec into
+// it: a values-only change keeps the version, and the old release would read
+// Ready and current (review, PR #36).
+func TestCNIProxyBehind(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name   string
+		mutate func(*unstructured.Unstructured)
+		want   string // "" when the release is trusted
+	}{
+		{"reconciled", func(*unstructured.Unstructured) {}, ""},
+		{"spec changed, not yet observed", func(h *unstructured.Unstructured) { h.SetGeneration(3) },
+			proxyNotReconciled},
+		{"no condition", func(h *unstructured.Unstructured) { unstructured.RemoveNestedField(h.Object, "status", "conditions") },
+			proxyNotReconciled},
+		{"updating the release failed", func(h *unstructured.Unstructured) {
+			_ = unstructured.SetNestedSlice(h.Object, []any{map[string]any{"type": "HelmReleaseProxySpecsUpToDate", "status": "False",
+				"reason": "HelmReleaseProxyCreationFailed", "message": "conflict\n  on update", "observedGeneration": int64(2)}}, "status", "conditions")
+		}, "HelmReleaseProxyCreationFailed: conflict on update"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hcp := cniProxy("1.19.1")
+			tc.mutate(hcp)
+			objs := append([]client.Object{hcp, cniRelease("c", "True", 1)}, rolledOutWorkload(t)...)
+			c := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(objs...).Build()
+			var s Summary
+			if err := (&Manager{C: c, Workload: sameClient(c)}).cniStatus(ctx, "ns", "c", &s); err != nil {
+				t.Fatal(err)
+			}
+			if s.CNIApplied != (tc.want == "") || s.CNIWhy != tc.want {
+				t.Errorf("applied=%v why=%q, want %q", s.CNIApplied, s.CNIWhy, tc.want)
+			}
+		})
+	}
+}
+
+// The record is hydra's, not hydra.yaml's: plan never shows it as a change.
+func TestComparableIgnoresThePendingRecord(t *testing.T) {
+	a, b := cniProxy("1.19.1"), cniProxy("1.19.1")
+	b.SetAnnotations(map[string]string{CNIRolloutPendingAnnotation: "2"})
+	if comparable(a) != comparable(b) {
+		t.Errorf("differs:\n%s\n%s", comparable(a), comparable(b))
+	}
+	b.SetAnnotations(map[string]string{CNIRolloutPendingAnnotation: "2", "other": "x"})
+	if !strings.Contains(comparable(b), "other: x") || strings.Contains(comparable(b), CNIRolloutPendingAnnotation) {
+		t.Errorf("only the record is dropped:\n%s", comparable(b))
 	}
 }

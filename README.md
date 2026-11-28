@@ -172,11 +172,23 @@ management cluster needs CAAPH: `hydra bootstrap` installs it, and `create` refu
   hydra cannot reach it:
   - a `create` or `apply` that **changed the CNI** (created its proxy, or changed `ciliumVersion`
     or its values) fails after a short retry with `CNI rollout unknown`, once everything else is
-    done: hydra cannot prove Cilium rolled out. Rerun it, or `status`, from where the API is
-    reachable. The change itself is applied;
+    done: hydra cannot prove Cilium rolled out. The change itself is applied. hydra records it on
+    the proxy (annotation `hydra.io/cni-rollout-pending`), so **every later `create`, `apply`,
+    pivot and `status` stays strict**, unrelated changes included, until a `create` or `apply`
+    run from where the API is reachable sees the rollout complete and removes the record
+    (`status` only reads it, and shows `CNI rollout unknown, change pending verification since
+    generation N`). `--bastion` forwards only the management API, so for a cluster that does
+    not manage itself that apply must run on a host that routes to the API address in the
+    cluster's kubeconfig Secret. Someone who has checked the rollout another way can remove the
+    record by hand on the management cluster:
+    `kubectl -n <namespace> annotate helmchartproxy <cluster>-cilium hydra.io/cni-rollout-pending-`. An apply
+    interrupted between writing the proxy and recording the change leaves no record;
   - any other `create` or `apply`, and `status`, count the CNI ready on its release alone and say
     so: `CNI ready (rollout unverified: <error>)`;
   - a pivot refuses: it is run by hand, from where the cluster is reachable.
+- hydra trusts the release only once CAAPH has carried the proxy's latest spec into it (the proxy's
+  `observedGeneration` and its `HelmReleaseProxySpecsUpToDate` condition), so a change to Cilium's
+  values alone is not reported done by the old release.
 - **Pin `ciliumVersion`.** Without it a cluster takes the catalogue's default, so a hydra release
   that moves the default upgrades Cilium on your next `apply` (`plan` shows it first), and `upgrade`
   refuses until that has been applied.

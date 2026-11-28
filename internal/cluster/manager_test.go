@@ -415,7 +415,7 @@ func TestWaitShowsReadErrorsAndStopsOnInterrupt(t *testing.T) {
 	m := &Manager{C: c, Out: &out, Poll: time.Hour}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := m.WaitAvailable(ctx, "ns", "c", time.Hour); !errors.Is(err, ErrInterrupted) {
+	if _, err := m.WaitAvailable(ctx, "ns", "c", time.Hour); !errors.Is(err, ErrInterrupted) {
 		t.Errorf("want ErrInterrupted, got %v", err)
 	}
 	if !strings.Contains(out.String(), "cannot read status: token expired") {

@@ -377,6 +377,9 @@ func cniInstalled(ns, name string) []client.Object {
 	hcp.SetName(name + "-cilium")
 	hcp.SetLabels(map[string]string{"hydra.io/cluster": name, "hydra.io/addon": "cilium"})
 	_ = unstructured.SetNestedField(hcp.Object, "1.19.1", "spec", "version")
+	hcp.SetGeneration(1)
+	_ = unstructured.SetNestedField(hcp.Object, int64(1), lcStatus, "observedGeneration")
+	_ = unstructured.SetNestedSlice(hcp.Object, []any{map[string]any{"type": "HelmReleaseProxySpecsUpToDate", lcStatus: "True", "observedGeneration": int64(1)}}, lcStatus, "conditions")
 	hrp := &unstructured.Unstructured{Object: map[string]any{}}
 	hrp.SetAPIVersion("addons.cluster.x-k8s.io/v1alpha1")
 	hrp.SetKind("HelmReleaseProxy")
@@ -1385,37 +1388,72 @@ func TestCluBastionInterruptStopsTheTunnel(t *testing.T) {
 }
 
 // A run that changes the CNI (its proxy's generation moved across the
-// apply) requires the rollout: an unreadable workload cluster fails the
-// wait quickly. One that does not change it passes, unverified.
+// apply) requires the rollout: an unreadable workload cluster fails the wait
+// quickly. It records the change on the proxy, so a rerun of the same spec,
+// which moves nothing, is still strict (review, PR #36). A run with no
+// change, and none recorded, passes unverified.
 func TestCluRunCreateCNIChangeDecidesTheRolloutWait(t *testing.T) {
 	cfg, objs := cluLoad(t, "../../examples/hydra-mgmt.yaml")
-	for _, changed := range []bool{true, false} {
-		applied := false
-		bump := interceptor.Funcs{Apply: func(context.Context, client.WithWatch, runtime.ApplyConfiguration, ...client.ApplyOption) error {
-			applied = true
-			return nil
-		}, Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, o client.Object, opts ...client.GetOption) error {
-			if err := c.Get(ctx, key, o, opts...); err != nil {
-				return err
-			}
-			if u, ok := o.(*unstructured.Unstructured); ok && u.GetKind() == "HelmChartProxy" && key.Name == "hydra-mgmt-cilium" {
-				if changed && applied {
-					u.SetGeneration(2)
-				}
-			}
-			return nil
-		}}
-		tg, log := cluTarget(t, true, &cluApplies{}, bump, cluAvailable(cfg.Spec.KubernetesVersion, []byte("admin"))...)
-		tg.m.Workload = func([]byte) (client.Client, error) { return nil, errors.New("connection refused") }
-		tg.m.UnreadableGrace = 10 * time.Millisecond
+	bumpOnApply := true
+	applied := false
+	funcs := interceptor.Funcs{Apply: func(context.Context, client.WithWatch, runtime.ApplyConfiguration, ...client.ApplyOption) error {
+		applied = true
+		return nil
+	}, Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, o client.Object, opts ...client.GetOption) error {
+		if err := c.Get(ctx, key, o, opts...); err != nil {
+			return err
+		}
+		if u, ok := o.(*unstructured.Unstructured); ok && u.GetKind() == "HelmChartProxy" && key.Name == "hydra-mgmt-cilium" && bumpOnApply && applied {
+			// The apply moved the spec, and CAAPH has reconciled it.
+			u.SetGeneration(2)
+			_ = unstructured.SetNestedField(u.Object, int64(2), lcStatus, "observedGeneration")
+			_ = unstructured.SetNestedSlice(u.Object, []any{map[string]any{"type": "HelmReleaseProxySpecsUpToDate", lcStatus: "True", "observedGeneration": int64(2)}}, lcStatus, "conditions")
+		}
+		return nil
+	}}
+	run := func(tg *target) (string, error) {
+		applied = false
 		cmd, errOut := cluCmd()
 		_, err := runCreate(t.Context(), cmd, tg, cfg, objs, createOptions{kubeconfigOut: filepath.Join(t.TempDir(), "k"), wait: true, timeout: 5 * time.Second})
-		if changed {
-			if !errors.Is(err, cluster.ErrCNIRolloutUnknown) || !strings.Contains(errOut.String(), "this run changes the CNI") || !strings.Contains(log.String(), "CNI rollout unknown") {
-				t.Errorf("changed: got %v\n%s\n%s", err, errOut.String(), log.String())
-			}
-		} else if err != nil || !strings.Contains(log.String(), "CNI ready (rollout unverified: connecting to the workload cluster: connection refused)") {
-			t.Errorf("unchanged: got %v\n%s", err, log.String())
+		return errOut.String(), err
+	}
+	newTarget := func() (*target, *bytes.Buffer) {
+		tg, log := cluTarget(t, true, &cluApplies{}, funcs, cluAvailable(cfg.Spec.KubernetesVersion, []byte("admin"))...)
+		tg.m.Workload = func([]byte) (client.Client, error) { return nil, errors.New("connection refused") }
+		tg.m.UnreadableGrace = 10 * time.Millisecond
+		return tg, log
+	}
+	annotation := func(tg *target) string {
+		hcp := &unstructured.Unstructured{}
+		hcp.SetAPIVersion("addons.cluster.x-k8s.io/v1alpha1")
+		hcp.SetKind("HelmChartProxy")
+		if err := tg.m.C.Get(t.Context(), client.ObjectKey{Namespace: "default", Name: "hydra-mgmt-cilium"}, hcp); err != nil {
+			t.Fatal(err)
 		}
+		return hcp.GetAnnotations()[cluster.CNIRolloutPendingAnnotation]
+	}
+
+	tg, log := newTarget()
+	errOut, err := run(tg)
+	if !errors.Is(err, cluster.ErrCNIRolloutUnknown) || !strings.Contains(errOut, "this run changes the CNI") || !strings.Contains(log.String(), "CNI rollout unknown") {
+		t.Fatalf("changed: got %v\n%s\n%s", err, errOut, log.String())
+	}
+	if got := annotation(tg); got != "2" {
+		t.Fatalf("the change must be recorded on the proxy, got %q", got)
+	}
+
+	// The rerun moves no generation, in a new process (a new Manager).
+	bumpOnApply = false
+	rerun := &target{m: &cluster.Manager{C: tg.m.C, Out: log, Poll: time.Millisecond, Workload: tg.m.Workload, UnreadableGrace: 10 * time.Millisecond}, source: "test-mgmt", bootstrapKind: true}
+	if _, err := run(rerun); !errors.Is(err, cluster.ErrCNIRolloutUnknown) {
+		t.Fatalf("a rerun with the change recorded must stay strict, got %v", err)
+	}
+
+	tg, log = newTarget()
+	if _, err := run(tg); err != nil || !strings.Contains(log.String(), "CNI ready (rollout unverified: connecting to the workload cluster: connection refused)") {
+		t.Errorf("unchanged: got %v\n%s", err, log.String())
+	}
+	if got := annotation(tg); got != "" {
+		t.Errorf("nothing changed, nothing recorded: %q", got)
 	}
 }

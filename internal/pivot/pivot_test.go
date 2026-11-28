@@ -49,7 +49,11 @@ var (
 // cniObjects are cluster name's CNI HelmChartProxy and the HelmReleaseProxy
 // CAAPH made from it, Ready.
 func cniObjects() (*unstructured.Unstructured, *unstructured.Unstructured) {
-	hcp := u(hcpGVK, ns, name+"-cilium", map[string]any{"spec": map[string]any{"version": "1.19.1"}})
+	hcp := u(hcpGVK, ns, name+"-cilium", map[string]any{"spec": map[string]any{"version": "1.19.1"},
+		"status": map[string]any{"observedGeneration": int64(1), "conditions": []any{map[string]any{
+			"type": "HelmReleaseProxySpecsUpToDate", "status": "True", "observedGeneration": int64(1),
+		}}}})
+	hcp.SetGeneration(1)
 	hcp.SetLabels(map[string]string{"hydra.io/cluster": name, "hydra.io/addon": "cilium"})
 	hrp := u(hrpGVK, ns, name+"-cilium-abc", map[string]any{
 		"spec":   map[string]any{"version": "1.19.1"},

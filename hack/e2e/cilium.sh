@@ -212,24 +212,34 @@ release_ready() {
   [ "$(kubectl get helmreleaseproxy -l "$sel" -o 'jsonpath={range .items[*]}{.spec.version} {.status.revision} {.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}')" = "$1 $2 True" ]
 }
 
-# rolled_out VERSION: the cilium DaemonSet runs VERSION's agent image and has
-# finished rolling out, as `kubectl rollout status` reads it: its controller
-# observed the latest spec, and every desired pod is updated and available.
-# Read now, so it says what was true when hydra spoke, or after.
+# rolled_out VERSION: the cilium DaemonSet and the cilium-operator
+# Deployment run VERSION's images and have finished rolling out, as `kubectl
+# rollout status` reads them: each controller observed the latest spec, and
+# every desired pod is updated and available, with no old operator pod left.
+# Read just after hydra spoke, so a rollout that completes in between can
+# pass; agents take tens of seconds to restart, far longer than that read.
 rolled_out() {
   ds=$(wlk -n kube-system get daemonset cilium -o 'jsonpath={.metadata.generation} {.status.observedGeneration} {.status.desiredNumberScheduled} {.status.updatedNumberScheduled} {.status.numberAvailable}|{.spec.template.spec.containers[?(@.name=="cilium-agent")].image}' 2>/dev/null) || return 1
-  image=${ds#*|}
-  case $image in *":v$1@"* | *":v$1") ;; *) return 1 ;; esac
+  op=$(wlk -n kube-system get deployment cilium-operator -o 'jsonpath={.metadata.generation} {.status.observedGeneration} {.spec.replicas} {.status.updatedReplicas} {.status.availableReplicas} {.status.replicas}|{.spec.template.spec.containers[?(@.name=="cilium-operator")].image}' 2>/dev/null) || return 1
+  for image in "${ds#*|}" "${op#*|}"; do
+    case $image in *":v$1@"* | *":v$1") ;; *) return 1 ;; esac
+  done
   # shellcheck disable=SC2086 # five numbers; an absent one is read as 0
   set -- ${ds%%|*}
-  [ "${2:-0}" -ge "${1:-1}" ] && [ "${3:-0}" -gt 0 ] && [ "${4:-0}" -ge "$3" ] && [ "${5:-0}" -ge "$3" ]
+  [ "${2:-0}" -ge "${1:-1}" ] && [ "${3:-0}" -gt 0 ] && [ "${4:-0}" -ge "$3" ] && [ "${5:-0}" -ge "$3" ] || return 1
+  # shellcheck disable=SC2086 # six numbers; an absent one is read as 0
+  set -- ${op%%|*}
+  [ "${2:-0}" -ge "${1:-1}" ] && [ "${3:-0}" -gt 0 ] && [ "${4:-0}" -ge "$3" ] && [ "${5:-0}" -ge "$3" ] && [ "${6:-0}" -le "${4:-0}" ]
 }
 
-# wait_cilium VERSION REVISION: the release is at VERSION, Ready for the
-# current generation, at REVISION, hydra says CNI ready, and every node is
-# Ready. hydra must never say CNI ready while the DaemonSet is still rolling
-# out; gap counts the polls where CAAPH already reported the release Ready
-# but the agents had not rolled out, and hydra rightly did not say ready.
+# wait_cilium VERSION REVISION [MIN_GAP]: the release is at VERSION, Ready
+# for the current generation, at REVISION, hydra says CNI ready, and every
+# node is Ready. hydra must never say CNI ready while the agents or the
+# operator are still rolling out; gap counts the polls where CAAPH already
+# reported the release Ready but they had not rolled out, and hydra rightly
+# did not say ready. At least MIN_GAP such polls are required: on an upgrade
+# the agents restart for tens of seconds after Helm applies the chart, so a
+# zero gap means the test never saw the window it exists to check.
 wait_cilium() {
   i=0 gap=0
   while :; do
@@ -244,14 +254,15 @@ wait_cilium() {
       rolled_out "$1" || {
         cat "$work/status" >&2
         wlk -n kube-system get daemonset cilium -o wide >&2 || true
-        fail "hydra reported CNI ready before the cilium DaemonSet rolled out at $1"
+        wlk -n kube-system get deployment cilium-operator -o wide >&2 || true
+        fail "hydra reported CNI ready before Cilium's agents and operator rolled out at $1"
       }
       release_ready "$1" "$2" || fail "hydra reported CNI ready but the release is not Ready at $1 (revision $2)"
       break
     fi
     if release_ready "$1" "$2" && ! rolled_out "$1"; then
       gap=$((gap + 1))
-      echo "    release Ready, DaemonSet still rolling out; hydra: $(grep -o 'CNI [^·]*' "$work/status" | head -1)"
+      echo "    release Ready, Cilium still rolling out; hydra: $(grep -o 'CNI [^·]*' "$work/status" | head -1)"
     fi
     i=$((i + 1))
     if [ "$i" -ge 200 ]; then
@@ -261,7 +272,8 @@ wait_cilium() {
     fi
     sleep 2
   done
-  echo "    hydra said CNI ready only after the DaemonSet rolled out ($gap polls with the release Ready while it was still rolling)"
+  echo "    hydra said CNI ready only after Cilium rolled out ($gap polls with the release Ready while it was still rolling)"
+  [ "$gap" -ge "${3:-0}" ] || fail "only $gap polls saw the release Ready before Cilium rolled out, want at least ${3:-0}: the check never saw the window"
   sel="cluster.x-k8s.io/cluster-name=$wl,helmreleaseproxy.addons.cluster.x-k8s.io/helmchartproxy-name=$wl-cilium"
   [ "$(kubectl get helmreleaseproxy -l "$sel" --no-headers | wc -l | tr -d ' ')" = 1 ] || fail "not exactly one HelmReleaseProxy for $wl-cilium"
   kubectl --kubeconfig "$work/wl.kubeconfig" wait nodes --all --for=condition=Ready --timeout=5m || fail "the nodes did not go Ready on Cilium $1"
@@ -281,6 +293,6 @@ hydra_cni | sed 's/^/    /'
 echo "--- raising ciliumVersion to $TO_VERSION upgrades the same release"
 render_cni "$TO_VERSION"
 kubectl apply --server-side --field-manager=hydra-e2e -f "$work/cni.yaml"
-wait_cilium "$TO_VERSION" 2
+wait_cilium "$TO_VERSION" 2 1
 
 echo "--- cilium e2e passed"
