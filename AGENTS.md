@@ -31,6 +31,7 @@ Commands, in delivery order (Linear project *Hydra — Reliability & Productizat
 | `spec.addons` (CAAPH, catalogue in `internal/addons`) | PET-98 | implemented |
 | `hydra cluster apply` (create + scoped pruning) | PET-99 | implemented, kind e2e (hardware proof pending) |
 | `cni: hydra` through CAAPH (`spec.network.ciliumVersion`) | PET-100 | implemented, kind and CAPD e2e (hardware proof pending) |
+| `--bastion` (management API through an SSH jump host) | PET-102 | implemented; tunnel and TLS proven on hardware through `cp` |
 
 ## Layout
 
@@ -43,6 +44,7 @@ Commands, in delivery order (Linear project *Hydra — Reliability & Productizat
 | `internal/addons/` | the **curated addon catalogue** (ADR-002): chart, allowed versions, params and how they map to Helm values. Adding an addon, version or param is a reviewed change, like any pin |
 | `internal/cluster/` | create/plan/status/delete against a management cluster: SSA apply, live dry-run diff, controller-reported status, label-scoped teardown, safety checks |
 | `internal/bootstrap/` | the temporary kind management cluster: kind and clusterctl as Go libraries behind small interfaces, faked in tests |
+| `internal/bastion/` | `--bastion`: the system `ssh -N -L` to the management API and a kubeconfig pointed at it, still verifying TLS for the real server name (insecure and proxy-url kubeconfigs are refused). No ssh connection sharing; WaitDelay bounds Close when a ProxyCommand child holds stderr; Linux Pdeathsig. Identity checks keep using the kubeconfig as given. Tests make the test binary a fake ssh that forwards for real |
 | `internal/validate/` | read-only host and hypervisor checks behind small interfaces (libvirt over TLS, TCP probes from this host or the kind node), faked in tests |
 | `internal/pivot/` | moving a cluster's management onto itself and back for teardown: locate, preflight, `clusterctl move`, verify, split evidence; a teardown record in kind (never moves back or unpauses on its own after a pivot) |
 | `internal/addons/cilium-values.yaml` | the **canonical Cilium values** for every Hydra cluster (PET-94), embedded and rendered into each `cni: hydra` cluster's Cilium HelmChartProxy (PET-100); Argo CD or a Helm release must use the same set. Per-cluster values are sentinels listed in its header. `hack/check-cilium.sh` renders the chart with them at every allowed version |

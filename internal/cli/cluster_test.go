@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1079,5 +1082,283 @@ func TestCluApplyFailsWhenAPruneIsSkipped(t *testing.T) {
 	_, err := runCreate(t.Context(), cmd, tg, cfg, objs, createOptions{prune: &cluster.PruneOptions{}, wait: false})
 	if err == nil || !strings.Contains(err.Error(), "changed while apply ran") {
 		t.Fatalf("got %v", err)
+	}
+}
+
+type fakeTunnel struct {
+	closed int
+	done   chan struct{}
+	said   string
+}
+
+func (f *fakeTunnel) Close() error {
+	f.closed++
+	if f.done != nil {
+		select {
+		case <-f.done:
+		default:
+			close(f.done)
+		}
+	}
+	return nil
+}
+func (f *fakeTunnel) Done() <-chan struct{} { return f.done }
+func (f *fakeTunnel) Diagnose() string      { return f.said }
+
+// --bastion opens the tunnel before connecting, connects with the kubeconfig
+// it returns, and closes it when the command ends.
+func TestCluBastion(t *testing.T) {
+	withFakeManagement(t)
+	connected := withFakeManagementConn(t)
+	orig := openBastion
+	t.Cleanup(func() { openBastion = orig })
+	tun := &fakeTunnel{}
+	var gotDest string
+	var gotKC []byte
+	openBastion = func(_ context.Context, dest string, kc []byte, _ time.Duration) (tunnel, string, []byte, error) {
+		gotDest, gotKC = dest, kc
+		return tun, "127.0.0.1:5555", []byte("tunnelled"), nil
+	}
+	kcPath := filepath.Join(t.TempDir(), "m.kubeconfig")
+	if err := os.WriteFile(kcPath, []byte(testKubeconfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("needs a management kubeconfig", func(t *testing.T) {
+		_, _, err := run(t, "cluster", lcStatus, "-f", "../../examples/hydra-mgmt.yaml", "--bastion", "ci@cp")
+		if err == nil || !strings.Contains(err.Error(), "--bastion needs --management-kubeconfig") {
+			t.Fatalf("got %v", err)
+		}
+		if gotDest != "" {
+			t.Error("tunnel opened without a management kubeconfig")
+		}
+	})
+	t.Run("tunnels, then closes", func(t *testing.T) {
+		_, errOut, err := run(t, "cluster", lcStatus, "-f", "../../examples/hydra-mgmt.yaml",
+			"--management-kubeconfig", kcPath, "--bastion", "ci@cp:2222")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gotDest != "ci@cp:2222" || string(gotKC) != testKubeconfig {
+			t.Errorf("opened %q with %q", gotDest, gotKC)
+		}
+		if string(*connected) != "tunnelled" {
+			t.Errorf("connected with %q, not the tunnelled kubeconfig", *connected)
+		}
+		if tun.closed != 1 {
+			t.Errorf("tunnel closed %d times", tun.closed)
+		}
+		if !strings.Contains(errOut, "via bastion ci@cp:2222, tunnel 127.0.0.1:5555") {
+			t.Errorf("stderr %q", errOut)
+		}
+	})
+	t.Run("identity stays the given kubeconfig", func(t *testing.T) {
+		c := &cobra.Command{}
+		addBastionFlag(c)
+		_ = c.Flags().Set(bastionFlag, "cp")
+		tg, err := manager(c, kcPath, "hydra-mgmt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tg.Close()
+		// The self-hosted check compares this server with the cluster's
+		// endpoint; the tunnel's 127.0.0.1 would never match.
+		if string(tg.kubeconfig) != testKubeconfig || tg.server != "https://mgmt.example:6443" {
+			t.Errorf("identity %q server %q", tg.kubeconfig, tg.server)
+		}
+	})
+	t.Run("closed when connecting fails", func(t *testing.T) {
+		tun.closed = 0
+		connectManagement = func([]byte) (client.Client, error) { return nil, errors.New("boom") }
+		if _, _, err := run(t, "cluster", lcStatus, "-f", "../../examples/hydra-mgmt.yaml",
+			"--management-kubeconfig", kcPath, "--bastion", "cp"); err == nil {
+			t.Fatal("want an error")
+		}
+		if tun.closed != 1 {
+			t.Errorf("tunnel closed %d times", tun.closed)
+		}
+	})
+	t.Run("refused where it cannot apply", func(t *testing.T) {
+		gotDest = ""
+		for _, args := range [][]string{
+			{"cluster", lcCreate, "--self-hosted", "--bastion", "cp"},
+			{"cluster", lcDelete, "--self-hosted", "--bastion", "cp"},
+		} {
+			args = append(args, "-f", "../../examples/hydra-mgmt.yaml")
+			if _, _, err := run(t, args...); err == nil || !strings.Contains(err.Error(), "cannot go through --bastion") {
+				t.Errorf("%v: got %v", args, err)
+			}
+		}
+		// An empty value is a mistake, never "no bastion".
+		if _, _, err := run(t, "cluster", lcStatus, "-f", "../../examples/hydra-mgmt.yaml",
+			"--management-kubeconfig", kcPath, "--bastion", ""); err == nil || !strings.Contains(err.Error(), "--bastion is empty") {
+			t.Error("--bastion \"\" must be an error")
+		}
+		if gotDest != "" {
+			t.Errorf("opened a tunnel to %q", gotDest)
+		}
+	})
+	t.Run("connect failure carries ssh's reason", func(t *testing.T) {
+		tun.closed, tun.said = 0, "ssh to bastion cp said: channel 2: open failed: connect failed: No route to host"
+		defer func() { tun.said = "" }()
+		connectManagement = func([]byte) (client.Client, error) { return nil, errors.New("EOF") }
+		_, _, err := run(t, "cluster", lcStatus, "-f", "../../examples/hydra-mgmt.yaml",
+			"--management-kubeconfig", kcPath, "--bastion", "cp")
+		if err == nil || !strings.Contains(err.Error(), "No route to host") || tun.closed != 1 {
+			t.Fatalf("got %v, closed %d", err, tun.closed)
+		}
+	})
+	t.Run("tunnel failure", func(t *testing.T) {
+		openBastion = func(context.Context, string, []byte, time.Duration) (tunnel, string, []byte, error) {
+			return nil, "", nil, errors.New("ssh to bastion cp exited")
+		}
+		if _, _, err := run(t, "cluster", lcStatus, "-f", "../../examples/hydra-mgmt.yaml",
+			"--management-kubeconfig", kcPath, "--bastion", "cp"); err == nil || !strings.Contains(err.Error(), "exited") {
+			t.Fatalf("got %v", err)
+		}
+	})
+}
+
+// Every command that reaches the management cluster takes --bastion.
+func TestCluBastionFlagOnEveryManagementCommand(t *testing.T) {
+	root := NewRootCommand(io.Discard, io.Discard)
+	for _, path := range [][]string{
+		{lcCluster, lcCreate}, {lcCluster, lcApply}, {lcCluster, lcPlan},
+		{lcCluster, lcStatus}, {lcCluster, lcDelete}, {lcCluster, lcUpgrade},
+	} {
+		c, _, err := root.Find(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.Flags().Lookup(bastionFlag) == nil || c.Flags().Lookup("management-kubeconfig") == nil {
+			t.Errorf("%v: no --bastion", path)
+		}
+	}
+}
+
+// withFakeManagementConn records the kubeconfig the commands connect with.
+func withFakeManagementConn(t *testing.T) *[]byte {
+	t.Helper()
+	var got []byte
+	inner := connectManagement
+	connectManagement = func(kc []byte) (client.Client, error) { got = kc; return inner(kc) }
+	return &got
+}
+
+// A tunnel that drops mid-command is reported as it happens, with ssh's
+// reason, once (Close does not repeat it), and the signal watch ends with it.
+func TestCluBastionTunnelDropIsReported(t *testing.T) {
+	dying := &fakeTunnel{done: make(chan struct{}), said: "the ssh tunnel exited: Timeout, server cp not responding."}
+	var out strings.Builder
+	w := &lockedWriter{w: &out}
+	read := func() string { w.mu.Lock(); defer w.mu.Unlock(); return out.String() }
+	tg := &target{tunnel: dying, out: w}
+	tg.stopSignals = watchTunnel(dying, w, &tg.reported, notifyTermination())
+	close(dying.done)
+	deadline := time.Now().Add(2 * time.Second)
+	for !strings.Contains(read(), "unreachable until hydra is run again") {
+		if time.Now().After(deadline) {
+			t.Fatalf("reported %q", read())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	tg.Close()
+	if got := read(); strings.Count(got, "server cp not responding") != 1 {
+		t.Errorf("reported %q", got)
+	}
+}
+
+// Close after a normal command shows what ssh said, and the watch does not
+// mistake the stop for a drop.
+func TestCluBastionCloseIsNotADrop(t *testing.T) {
+	for range 50 {
+		tun := &fakeTunnel{done: make(chan struct{}), said: "ssh to bastion cp said: Warning: added host key"}
+		var out strings.Builder
+		w := &lockedWriter{w: &out}
+		tg := &target{tunnel: tun, out: w}
+		tg.stopSignals = watchTunnel(tun, w, &tg.reported, notifyTermination())
+		tg.Close()
+		time.Sleep(time.Millisecond) // let a wrongly woken watch write
+		w.mu.Lock()
+		got := out.String()
+		w.mu.Unlock()
+		if strings.Count(got, "added host key") != 1 || strings.Contains(got, "unreachable") {
+			t.Fatalf("reported %q", got)
+		}
+	}
+}
+
+// SIGTERM while the tunnel is still opening cancels the open, which stops
+// ssh, instead of ending hydra with ssh left running (outside Linux nothing
+// else would stop it).
+func TestCluBastionSignalDuringOpen(t *testing.T) {
+	sig := make(chan os.Signal, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var openErr error
+	caught := openGuarded(sig, cancel, func() {
+		sig <- syscall.SIGTERM
+		select { // an Open that waits for the forward until its ssh is stopped
+		case <-ctx.Done():
+			openErr = ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
+	})
+	if caught != syscall.SIGTERM || openErr == nil {
+		t.Fatalf("caught %v, open returned %v", caught, openErr)
+	}
+	if signalExitCode(caught) != 143 || signalExitCode(syscall.SIGHUP) != 129 || signalExitCode(os.Interrupt) != 130 {
+		t.Errorf("exit codes %d %d %d", signalExitCode(caught), signalExitCode(syscall.SIGHUP), signalExitCode(os.Interrupt))
+	}
+	// Without a signal, the open runs to the end and the context lives on:
+	// ssh runs under it for the whole command.
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	if got := openGuarded(make(chan os.Signal, 1), cancel2, func() {}); got != nil || ctx2.Err() != nil {
+		t.Errorf("caught %v, context %v", got, ctx2.Err())
+	}
+}
+
+// SIGINT sent to hydra alone stops ssh. A command that handles the interrupt
+// then finishes and closes the target, which ends the watch without exiting;
+// one that does not is ended after the grace period.
+func TestCluBastionInterruptStopsTheTunnel(t *testing.T) {
+	origExit, origGrace := exitProcess, interruptGrace
+	t.Cleanup(func() { exitProcess, interruptGrace = origExit, origGrace })
+	exited := make(chan int, 1)
+	exitProcess = func(code int) { exited <- code }
+	interruptGrace = 200 * time.Millisecond
+
+	// A command that handles it: Close comes before the grace runs out.
+	tun := &fakeTunnel{done: make(chan struct{})}
+	tg := &target{tunnel: tun, out: io.Discard}
+	sig := make(chan os.Signal, 1)
+	tg.stopSignals = watchTunnel(tun, io.Discard, &tg.reported, sig)
+	sig <- os.Interrupt
+	select {
+	case <-tun.done: // ssh stopped
+	case <-time.After(2 * time.Second):
+		t.Fatal("SIGINT did not stop ssh")
+	}
+	tg.Close()
+	select {
+	case code := <-exited:
+		t.Fatalf("exited %d although the command finished", code)
+	case <-time.After(400 * time.Millisecond):
+	}
+
+	// A command that does not: hydra exits 130 after the grace.
+	tun2 := &fakeTunnel{done: make(chan struct{})}
+	sig2 := make(chan os.Signal, 1)
+	stop := watchTunnel(tun2, io.Discard, new(atomic.Bool), sig2)
+	defer stop()
+	sig2 <- os.Interrupt
+	select {
+	case code := <-exited:
+		if code != 130 {
+			t.Errorf("exit %d", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no exit after the grace period")
 	}
 }

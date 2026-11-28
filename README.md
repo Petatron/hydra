@@ -345,6 +345,42 @@ hydra cluster delete -f hydra.yaml   # asks for the cluster name; --yes skips th
 These act on `--management-kubeconfig`, or else on the cluster's bootstrap kind cluster; your
 current kubectl context is never used.
 
+### A management cluster behind a jump host: `--bastion`
+
+When the management cluster's API is reachable only from inside its network, as with a private EKS
+or GKE cluster, go through an SSH jump host:
+
+```bash
+hydra cluster plan -f hydra.yaml --management-kubeconfig ./mgmt.kubeconfig --bastion ops@jump.example.com
+```
+
+`--bastion user@host[:port]` works on `create`, `apply`, `plan`, `status`, `delete` and `upgrade`,
+and needs `--management-kubeconfig`. It does the following:
+
+- hydra starts the system `ssh -N -L` to the API server in the kubeconfig's current context, talks to
+  the API through a local port, and stops ssh when the command ends, or when hydra gets SIGTERM,
+  SIGHUP or SIGINT, even one sent to hydra alone (on Linux, also if hydra is killed outright). ssh's connection sharing (`ControlMaster`) is
+  turned off for the tunnel, so no shared master keeps the forward open afterwards. Your agent is
+  never forwarded to the bastion (`ForwardAgent=no`), and a bastion whose `~/.ssh/config` entry has
+  a `LocalForward`, `RemoteForward` or `DynamicForward` is refused, since those would stay open
+  beside the tunnel; give `--bastion` a `Host` entry without them;
+- TLS is still verified against the API server's own name (the kubeconfig's `tls-server-name`, or
+  else the server's host), so the jump host only relays encrypted traffic. A kubeconfig with
+  `insecure-skip-tls-verify` or `proxy-url` is refused;
+- if the tunnel drops while a command runs, hydra says so with ssh's reason. The command then fails
+  or times out as for any unreachable API; run it again, which is always safe;
+- because it is your own `ssh`, `~/.ssh/config` applies: keys, agent, `known_hosts`, `ProxyJump`,
+  and a `ProxyCommand` through Tailscale, Cloudflare Access, AWS SSM or GCP IAP;
+- ssh runs with `BatchMode=yes` and never prompts, so a missing key or an unknown host key fails fast
+  with ssh's own message (accept the host key once by hand, or pin it in `known_hosts`);
+- safety checks that ask which cluster the kubeconfig belongs to (such as `delete` refusing a
+  self-hosted cluster) still use the kubeconfig as given, never the tunnel's `127.0.0.1`.
+
+Only the management API goes through the tunnel; hydra does not contact the workload cluster's API.
+`create --self-hosted` and `delete --self-hosted` refuse it, and `pivot` does not take it. The
+`kubectl --kubeconfig …` commands hydra suggests in its messages do not go through the tunnel; run
+them from a host that reaches the API, or through your own `ssh -L`.
+
 - `create` server-side applies the rendered objects (field manager `hydra`) and reports the
   controllers' own conditions until the cluster is Available, its CNI applied (or, with
   `cni: external`, its nodes Ready), and any rollout finished. `--timeout` ends the wait, not the creation; rerunning is always safe.

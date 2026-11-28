@@ -11,6 +11,9 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -18,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/tools/clientcmd"
 
+	"github.com/Petatron/hydra/internal/bastion"
 	"github.com/Petatron/hydra/internal/bootstrap"
 	"github.com/Petatron/hydra/internal/cluster"
 	"github.com/Petatron/hydra/internal/config"
@@ -67,8 +71,164 @@ type target struct {
 	bootstrapKind bool
 	// path is the --management-kubeconfig path, "" for the kind cluster.
 	path string
-	// kubeconfig is the management kubeconfig, for identity checks.
+	// kubeconfig is the management kubeconfig as given, for identity checks
+	// (which cluster it is). Never the --bastion copy pointed at 127.0.0.1:
+	// the self-hosted check compares its server with the cluster's endpoint.
 	kubeconfig []byte
+	// tunnel is the --bastion tunnel, closed by Close.
+	tunnel tunnel
+	// out is where the tunnel's own messages go.
+	out io.Writer
+	// stopSignals ends the tunnel's signal watch.
+	stopSignals func()
+	// cancelOpen cancels the context the tunnel's ssh was started with; Close
+	// calls it after stopping ssh (cancelling first would kill ssh, and the
+	// kill would read as a drop).
+	cancelOpen context.CancelFunc
+	// reported is set once ssh's reason for a dropped tunnel was shown, so it
+	// is shown once.
+	reported atomic.Bool
+}
+
+// tunnel is what the CLI needs of a bastion.Tunnel; tests fake it.
+type tunnel interface {
+	Close() error
+	Done() <-chan struct{}
+	// Diagnose is ssh's reason for exiting, or its recent messages.
+	Diagnose() string
+}
+
+// Close stops the --bastion tunnel, if there is one, first showing anything
+// ssh said (such as the bastion failing to reach the API server). Safe on
+// any target.
+func (t *target) Close() {
+	if t == nil || t.tunnel == nil {
+		return
+	}
+	if t.stopSignals != nil {
+		t.stopSignals()
+	}
+	if d := t.tunnel.Diagnose(); d != "" && t.out != nil && t.reported.CompareAndSwap(false, true) {
+		_, _ = fmt.Fprintf(t.out, "bastion: %s\n", d)
+	}
+	_ = t.tunnel.Close()
+	if t.cancelOpen != nil {
+		t.cancelOpen()
+	}
+}
+
+// watchTunnel reports, as it happens, a tunnel that ends while the command
+// still needs it, and stops ssh if hydra is terminated, loses its terminal or
+// is interrupted (SIGTERM, SIGHUP, SIGINT), which would otherwise skip the
+// deferred Close and leave ssh forwarding: a signal sent to hydra alone, by a
+// supervisor rather than a terminal, never reaches ssh. On SIGTERM or SIGHUP
+// hydra exits at once. On SIGINT it stops ssh and lets a command that handles
+// the interrupt finish (its Close ends the watch); one that does not fails as
+// the API goes, and hydra exits after interruptGrace regardless. Once the
+// tunnel is gone the signals are released at once, so they act the usual way.
+// reported is set when the drop was shown. out must be safe for concurrent
+// writes. It returns the function that ends the watch. sig is
+// notifyTermination's channel, set up before the tunnel was opened.
+func watchTunnel(tun tunnel, out io.Writer, reported *atomic.Bool, sig chan os.Signal) func() {
+	stop := make(chan struct{})
+	go func() {
+		defer signal.Stop(sig)
+		select {
+		case s := <-sig:
+			_ = tun.Close()
+			if s == os.Interrupt {
+				select {
+				case <-stop:
+					return
+				case <-time.After(interruptGrace):
+				}
+			}
+			exitProcess(signalExitCode(s))
+		case <-tun.Done():
+			select {
+			case <-stop: // Close ended the watch, then stopped ssh: not a drop
+				return
+			default:
+			}
+			if d := tun.Diagnose(); d != "" && reported.CompareAndSwap(false, true) {
+				_, _ = fmt.Fprintf(out, "bastion: %s; the management cluster is unreachable until hydra is run again\n", d)
+			}
+		case <-stop:
+		}
+	}()
+	var once sync.Once
+	return func() { once.Do(func() { signal.Stop(sig); close(stop) }) }
+}
+
+// lockedWriter serializes writes to w.
+type lockedWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
+}
+
+// notifyTermination starts catching SIGTERM, SIGHUP and SIGINT, before the
+// tunnel is opened, so that no moment exists where they would end hydra and
+// leave ssh running (outside Linux, nothing else stops it).
+func notifyTermination() chan os.Signal {
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGTERM, syscall.SIGHUP, os.Interrupt)
+	return sig
+}
+
+// interruptGrace is how long hydra waits, after SIGINT has stopped the
+// tunnel, for the command to finish before exiting.
+var interruptGrace = 10 * time.Second
+
+// exitProcess is os.Exit; tests replace it.
+var exitProcess = os.Exit
+
+// openGuarded runs open, cancelling its context if hydra gets SIGTERM, SIGHUP
+// or SIGINT meanwhile; ssh, started with that context, is then stopped. It
+// returns the signal caught, if any, once open has returned.
+func openGuarded(sig chan os.Signal, cancel context.CancelFunc, open func()) os.Signal {
+	opened, guarded := make(chan struct{}), make(chan struct{})
+	var caught os.Signal
+	go func() {
+		defer close(guarded)
+		select {
+		case caught = <-sig:
+			cancel()
+		case <-opened:
+		}
+	}()
+	open()
+	close(opened)
+	<-guarded
+	return caught
+}
+
+func signalExitCode(s os.Signal) int {
+	switch s {
+	case syscall.SIGHUP:
+		return 128 + 1
+	case os.Interrupt:
+		return 128 + 2
+	}
+	return 128 + 15
+}
+
+// bastionFlag is --bastion: the management API through an SSH jump host.
+const bastionFlag = "bastion"
+
+// bastionTimeout is how long --bastion waits for its tunnel to forward.
+const bastionTimeout = 30 * time.Second
+
+// addBastionFlag adds --bastion to a command that takes
+// --management-kubeconfig; manager reads it from the command.
+func addBastionFlag(c *cobra.Command) {
+	c.Flags().String(bastionFlag, "", "reach the management cluster's API through this SSH jump host (user@host[:port]), "+
+		"with the system ssh and ~/.ssh/config; TLS is still verified against the API server's own name")
 }
 
 // defaultConfigFile is --file's default, for commands printed in messages.
@@ -100,13 +260,81 @@ func manager(cmd *cobra.Command, kubeconfigPath, clusterName string) (*target, e
 	if rc, err := clientcmd.RESTConfigFromKubeConfig(kc); err == nil {
 		server = rc.Host
 	}
-	c, err := connectManagement(kc)
+	var tun tunnel
+	var sig chan os.Signal
+	cancelOpen := context.CancelFunc(func() {})
+	via, connectWith := "", kc
+	if bastionSet(cmd) {
+		dest := cmd.Flags().Lookup(bastionFlag).Value.String()
+		if strings.TrimSpace(dest) == "" {
+			return nil, fmt.Errorf("--bastion is empty: want user@host or user@host:port")
+		}
+		if kubeconfigPath == "" {
+			return nil, fmt.Errorf("--bastion needs --management-kubeconfig: the bootstrap kind cluster is local")
+		}
+		var local string
+		sig = notifyTermination()
+		var openCtx context.Context
+		openCtx, cancelOpen = context.WithCancel(contextOf(cmd))
+		caught := openGuarded(sig, cancelOpen, func() {
+			tun, local, connectWith, err = openBastion(openCtx, dest, kc, bastionTimeout)
+		})
+		if caught != nil {
+			if tun != nil {
+				_ = tun.Close()
+			}
+			exitProcess(signalExitCode(caught))
+		}
+		if err != nil {
+			signal.Stop(sig)
+			cancelOpen()
+			return nil, err
+		}
+		via = fmt.Sprintf(" via bastion %s, tunnel %s", dest, local)
+	}
+	c, err := connectManagement(connectWith)
 	if err != nil {
+		if tun != nil {
+			signal.Stop(sig)
+			d := tun.Diagnose()
+			_ = tun.Close()
+			cancelOpen()
+			if d != "" {
+				return nil, fmt.Errorf("connecting to %s: %w (bastion: %s)", source, err, d)
+			}
+		}
 		return nil, fmt.Errorf("connecting to %s: %w", source, err)
 	}
-	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "management cluster: %s (%s)\n", source, server)
-	return &target{m: &cluster.Manager{C: c, Out: cmd.ErrOrStderr()}, source: source, server: server,
-		bootstrapKind: kubeconfigPath == "", kubeconfig: kc, path: kubeconfigPath}, nil
+	if tun != nil {
+		// The tunnel's watch writes from its own goroutine: serialize every
+		// write to the command's stderr.
+		cmd.SetErr(&lockedWriter{w: cmd.ErrOrStderr()})
+	}
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "management cluster: %s (%s%s)\n", source, server, via)
+	t := &target{m: &cluster.Manager{C: c, Out: cmd.ErrOrStderr()}, source: source, server: server,
+		bootstrapKind: kubeconfigPath == "", kubeconfig: kc, path: kubeconfigPath, tunnel: tun, out: cmd.ErrOrStderr()}
+	if tun != nil {
+		t.stopSignals = watchTunnel(tun, cmd.ErrOrStderr(), &t.reported, sig)
+		t.cancelOpen = cancelOpen
+	}
+	return t, nil
+}
+
+// bastionSet reports whether the command was given --bastion. An explicit
+// empty value counts: it is a mistake, not "no bastion".
+func bastionSet(cmd *cobra.Command) bool {
+	f := cmd.Flags().Lookup(bastionFlag)
+	return f != nil && f.Changed
+}
+
+// openBastion opens the --bastion tunnel and returns it, its local address
+// and the kubeconfig pointed at it; tests replace it.
+var openBastion = func(ctx context.Context, dest string, kc []byte, timeout time.Duration) (tunnel, string, []byte, error) {
+	t, rewritten, err := bastion.Open(ctx, dest, kc, timeout)
+	if err != nil {
+		return nil, "", nil, err // never a typed nil in the interface
+	}
+	return t, t.Local, rewritten, nil
 }
 
 func interruptible(cmd *cobra.Command) (context.Context, func()) {
@@ -164,6 +392,9 @@ used.`,
 				if mgmt != "" {
 					return fmt.Errorf("--self-hosted builds its own bootstrap cluster; it cannot be combined with --management-kubeconfig (use pivot for that)")
 				}
+				if bastionSet(cmd) {
+					return fmt.Errorf("--self-hosted cannot go through --bastion: it reaches a local bootstrap cluster and the new cluster directly")
+				}
 				if !wait {
 					return fmt.Errorf("--self-hosted needs to wait for the cluster before moving it; drop --wait=false")
 				}
@@ -178,12 +409,14 @@ used.`,
 			if err != nil {
 				return err
 			}
+			defer t.Close()
 			_, err = runCreate(ctx, cmd, t, cfg, objs, co)
 			return err
 		},
 	}
 	c.Flags().StringVarP(&file, "file", "f", "hydra.yaml", "path to hydra.yaml")
 	c.Flags().StringVar(&mgmt, "management-kubeconfig", "", "kubeconfig of the management cluster (default: the cluster's bootstrap kind cluster)")
+	addBastionFlag(c)
 	c.Flags().StringVar(&kubeconfigOut, "kubeconfig-out", "", "where to write the new cluster's kubeconfig (default ./<name>.kubeconfig)")
 	c.Flags().DurationVar(&timeout, "timeout", 30*time.Minute, "how long to wait for the cluster to be Available")
 	c.Flags().BoolVar(&wait, "wait", true, "wait for the cluster to be Available")
@@ -244,6 +477,7 @@ interrupted apply is finished by running it again.`,
 			if err != nil {
 				return err
 			}
+			defer t.Close()
 			p := prune
 			_, err = runCreate(ctx, cmd, t, cfg, objs, createOptions{prune: &p, kubeconfigOut: kubeconfigOut, configFile: file, timeout: timeout, wait: wait, adopt: adopt, adoptCNI: adoptCNI, forceConflicts: forceConflicts})
 			return err
@@ -251,6 +485,7 @@ interrupted apply is finished by running it again.`,
 	}
 	c.Flags().StringVarP(&file, "file", "f", "hydra.yaml", "path to hydra.yaml")
 	c.Flags().StringVar(&mgmt, "management-kubeconfig", "", "kubeconfig of the management cluster (default: the cluster's bootstrap kind cluster)")
+	addBastionFlag(c)
 	c.Flags().StringVar(&kubeconfigOut, "kubeconfig-out", "", "where to write the cluster's kubeconfig (default ./<name>.kubeconfig)")
 	c.Flags().DurationVar(&timeout, "timeout", 30*time.Minute, "how long to wait for the cluster to be Available")
 	c.Flags().BoolVar(&wait, "wait", true, "wait for the cluster to be Available")
@@ -487,6 +722,7 @@ them would do. Templates still in use are re-checked by apply after it applies.`
 			if err != nil {
 				return err
 			}
+			defer t.Close()
 			changes, err := t.m.Plan(contextOf(cmd), objs, cfg.Metadata.Name, forceConflicts)
 			if err != nil {
 				return err
@@ -527,6 +763,7 @@ them would do. Templates still in use are re-checked by apply after it applies.`
 	}
 	c.Flags().StringVarP(&file, "file", "f", "hydra.yaml", "path to hydra.yaml")
 	c.Flags().StringVar(&mgmt, "management-kubeconfig", "", "kubeconfig of the management cluster (default: the cluster's bootstrap kind cluster)")
+	addBastionFlag(c)
 	c.Flags().BoolVar(&forceConflicts, "force-conflicts", false, "plan as create --force-conflicts would apply")
 	addPruneFlags(c, &prune)
 	c.Flags().BoolVar(&adoptCNI, "adopt-cni", false, adoptCNIUsage)
@@ -616,6 +853,7 @@ func newStatusCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			defer t.Close()
 			s, err := t.m.Status(contextOf(cmd), md.Namespace, md.Name)
 			if err != nil {
 				return err
@@ -640,6 +878,7 @@ func newStatusCommand() *cobra.Command {
 	}
 	c.Flags().StringVarP(&file, "file", "f", "hydra.yaml", "path to hydra.yaml")
 	c.Flags().StringVar(&mgmt, "management-kubeconfig", "", "kubeconfig of the management cluster (default: the cluster's bootstrap kind cluster)")
+	addBastionFlag(c)
 	return c
 }
 
@@ -681,6 +920,9 @@ with --finish-split.`,
 				if mgmt != "" {
 					return fmt.Errorf("--self-hosted reaches the cluster with its own kubeconfig (--cluster-kubeconfig); it cannot be combined with --management-kubeconfig")
 				}
+				if bastionSet(cmd) {
+					return fmt.Errorf("--self-hosted cannot go through --bastion: it reaches the cluster and a local bootstrap cluster directly")
+				}
 				cfg, err := config.Load(file)
 				if err != nil {
 					return err
@@ -700,6 +942,7 @@ with --finish-split.`,
 			if err != nil {
 				return err
 			}
+			defer t.Close()
 			ctx, stop := interruptible(cmd)
 			defer stop()
 			st, err := t.m.State(ctx, md.Namespace, md.Name)
@@ -743,6 +986,7 @@ with --finish-split.`,
 	}
 	c.Flags().StringVarP(&file, "file", "f", "hydra.yaml", "path to hydra.yaml")
 	c.Flags().StringVar(&mgmt, "management-kubeconfig", "", "kubeconfig of the management cluster (default: the cluster's bootstrap kind cluster)")
+	addBastionFlag(c)
 	c.Flags().BoolVar(&yes, "yes", false, "do not ask for confirmation")
 	c.Flags().BoolVar(&adopt, "adopt", false, "delete a Cluster hydra did not make (unlabelled); one labelled for another cluster is always refused")
 	c.Flags().DurationVar(&timeout, "timeout", 20*time.Minute, "how long to wait for the teardown")
