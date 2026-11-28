@@ -35,7 +35,14 @@ MTU: 65000 # sentinel: spec.network.mtu (1500 by default)
 kubeProxyReplacement: false
 routingMode: tunnel
 tunnelProtocol: vxlan
+# Restart the agents and the operator when cilium-config changes (PET-105):
+# the chart stamps the ConfigMap's checksum on both pod templates. Without
+# it a change to the values alone (MTU, pod CIDR) rewrites the ConfigMap but
+# restarts nothing, so the pods keep the old config and their rollout reads
+# complete at once, which is what hydra's CNI readiness checks (PET-103).
+rollOutCiliumPods: true
 operator:
+  rollOutPods: true
   # sentinel: hydra sets 2 when the cluster always has at least 2 nodes, and
   # 1 otherwise (render.OperatorReplicas). Set the
   # integer directly elsewhere: 2 for hydra-mgmt and hydra-wl0 (3 control-plane

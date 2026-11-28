@@ -46,6 +46,21 @@ while read -r v; do
         status=1
       fi
     done
+    # A change to the values alone must restart the agents and the operator
+    # (PET-105): both pod templates carry cilium-config's checksum, and a
+    # different MTU changes it on both.
+    sums() { grep -c 'cilium.io/cilium-configmap-checksum:' "$1" || true; }
+    if [ "$(sums "$work/out.yaml")" != 2 ]; then
+      echo "FAIL: $label: want cilium-config's checksum on the agent and operator pod templates, found $(sums "$work/out.yaml")" >&2
+      status=1
+    fi
+    "$HELM" template cilium cilium --repo https://helm.cilium.io --version "$v" \
+      --kube-version "$KUBE_VERSION" --namespace kube-system -f "$values" --set "MTU=$((mtu - 1))" >"$work/mtu.yaml"
+    changed=$(diff "$work/out.yaml" "$work/mtu.yaml" | grep -c '^>.*cilium.io/cilium-configmap-checksum:' || true)
+    if [ "$changed" != 2 ]; then
+      echo "FAIL: $label: a different MTU changed the checksum on $changed pod templates, want 2 (agents and operator)" >&2
+      status=1
+    fi
     # The other operator replica count must change only what the chart
     # derives from it; anything more would differ from the canonical values.
     other=$((3 - replicas))

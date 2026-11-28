@@ -427,6 +427,8 @@ spec:
     kubeProxyReplacement: false
     operator:
       replicas: 2
+      rollOutPods: true
+    rollOutCiliumPods: true
     routingMode: tunnel
     tunnelProtocol: vxlan
   version: 1.19.1

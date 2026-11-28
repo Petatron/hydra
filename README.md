@@ -186,6 +186,11 @@ management cluster needs CAAPH: `hydra bootstrap` installs it, and `create` refu
   - any other `create` or `apply`, and `status`, count the CNI ready on its release alone and say
     so: `CNI ready (rollout unverified: <error>)`;
   - a pivot refuses: it is run by hand, from where the cluster is reachable.
+- **A change to Cilium's values alone (MTU, pod CIDR) restarts the agents and the operator:**
+  hydra's values set `rollOutCiliumPods` and `operator.rollOutPods`, so the pods roll when
+  `cilium-config` changes, and the CNI is ready only once they are back (PET-105). Turning these on
+  is itself such a change: the first `apply` with a hydra that has them restarts every Cilium agent
+  and operator of an existing cluster once.
 - hydra trusts the release only once CAAPH has carried the proxy's latest spec into it (the proxy's
   `observedGeneration` and its `HelmReleaseProxySpecsUpToDate` condition), so a change to Cilium's
   values alone is not reported done by the old release.
